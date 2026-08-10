@@ -69,8 +69,8 @@ mv "$manifest_tmp" "$transaction_repo/Cargo.toml"
 printf '[registries.rss-candidate]\nindex = "file://%s"\n' "$registry_index" > "$transaction_repo/.cargo/config.toml"
 (
     cd "$transaction_repo"
-    cargo generate-lockfile
-    cargo fetch --locked
+    cargo generate-lockfile --offline
+    cargo fetch --locked --offline
 )
 
 mkdir -p .cargo
