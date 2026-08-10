@@ -4,7 +4,7 @@ use rss_diag_context::correlation;
 use rss_standalone_consumer::ObservationLayer;
 use rss_trace_context::capture_current;
 use tower::{ServiceBuilder, ServiceExt, service_fn};
-use tracing::Instrument as _;
+use tracing::instrument::WithSubscriber as _;
 use tracing_subscriber::prelude::*;
 
 const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
