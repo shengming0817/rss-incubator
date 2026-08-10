@@ -33,7 +33,11 @@ async fn valid_headers_bind_scope_and_restore_remote_parent() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(correlation.as_deref(), Some("request-42"));
     assert_eq!(
-        trace_id(traceparent.as_deref()),
+        trace_id(
+            traceparent
+                .as_ref()
+                .map(rss_trace_context::TraceParent::as_str)
+        ),
         trace_id(Some(TRACEPARENT))
     );
     provider.shutdown().expect("provider shutdown");
