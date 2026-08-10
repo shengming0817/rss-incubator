@@ -44,11 +44,7 @@ where
     fn call(&mut self, request: Request<B>) -> Self::Future {
         let diagnostic = diagnostic_context(&request);
         let traceparent = traceparent(&request);
-        let tracestate = request
-            .headers()
-            .get("tracestate")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
+        let tracestate = single_header(&request, "tracestate").map(str::to_owned);
         let span = tracing::info_span!(parent: None, "plain_rust_request");
         if let Some(parent) = traceparent.as_ref() {
             let _ = restore_remote_parent(&span, parent, tracestate.as_deref());
@@ -64,18 +60,20 @@ where
 }
 
 fn diagnostic_context<B>(request: &Request<B>) -> Option<DiagnosticCtx> {
-    request
-        .headers()
-        .get("x-correlation-id")
-        .and_then(|value| value.to_str().ok())
+    single_header(request, "x-correlation-id")
         .and_then(|value| CorrelationId::parse(value).ok())
         .map(DiagnosticCtx::new)
 }
 
 fn traceparent<B>(request: &Request<B>) -> Option<TraceParent> {
-    request
-        .headers()
-        .get("traceparent")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| TraceParent::parse(value).ok())
+    single_header(request, "traceparent").and_then(|value| TraceParent::parse(value).ok())
+}
+
+fn single_header<'a, B>(request: &'a Request<B>, name: &'static str) -> Option<&'a str> {
+    let mut values = request.headers().get_all(name).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    value.to_str().ok()
 }

@@ -10,6 +10,10 @@ injects same-revision `.crate` artifacts through an ephemeral local registry, ca
 checks with `--locked --offline`. A successful proof means candidate consumption works; it is not an
 RC, registry upload, or release approval.
 
+The RSS proof also owns the structured dependency/lock policy. This repository deliberately does
+not commit a lock bound to the proof's ephemeral `file://` registry and does not implement a second
+registry, metadata scanner, or receipt store.
+
 ## Ownership
 
 Repository custody: `ghbvf`. Maintenance: `github:shengming0817:rss-maintainers`.

@@ -7,13 +7,15 @@ publish = false
 
 [dependencies]
 http = "1"
-opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
-opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "testing"] }
 rss_diag_context = { package = "rss-diag-context", version = "=0.1.0", registry = "rss-candidate" }
 rss_trace_context = { package = "rss-trace-context", version = "=0.1.0", registry = "rss-candidate" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
+
+[dev-dependencies]
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "testing"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
 

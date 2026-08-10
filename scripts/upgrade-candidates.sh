@@ -1,6 +1,10 @@
 #!/bin/sh
 set -eu
 
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd -P)
+cd "$repo_root"
+
 registry_index=""
 diag_version=""
 trace_version=""
@@ -17,13 +21,14 @@ case "$registry_index" in
     /*) ;;
     *) echo "registry index must be absolute" >&2; exit 64 ;;
 esac
-case "$registry_index" in
-    *[\ \"\\]*) echo "registry index contains unsupported URL characters" >&2; exit 64 ;;
-esac
 [ -f "$registry_index/config.json" ] || {
     echo "registry index is missing config.json" >&2
     exit 64
 }
+registry_index=$(CDPATH= cd -- "$registry_index" && pwd -P)
+case "$registry_index" in
+    *[!A-Za-z0-9/._-]*) echo "registry index contains unsupported URL characters" >&2; exit 64 ;;
+esac
 for version in "$diag_version" "$trace_version"; do
     printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$' || {
         echo "candidate version must be exact SemVer" >&2
@@ -31,8 +36,14 @@ for version in "$diag_version" "$trace_version"; do
     }
 done
 
-manifest_tmp="Cargo.toml.tmp.$$"
-trap 'rm -f "$manifest_tmp"' EXIT HUP INT TERM
+transaction_root=$(mktemp -d "${TMPDIR:-/tmp}/rss-standalone-upgrade.XXXXXX")
+trap 'rm -rf "$transaction_root"' EXIT HUP INT TERM
+transaction_repo="$transaction_root/repository"
+mkdir -p "$transaction_repo/src" "$transaction_repo/tests" "$transaction_repo/.cargo"
+cp Cargo.toml "$transaction_repo/Cargo.toml"
+cp -R src/. "$transaction_repo/src/"
+cp -R tests/. "$transaction_repo/tests/"
+manifest_tmp="$transaction_repo/Cargo.toml.next"
 awk -v diag="$diag_version" -v trace="$trace_version" '
     BEGIN { diag_count = 0; trace_count = 0 }
     /^rss_diag_context = / {
@@ -49,15 +60,20 @@ awk -v diag="$diag_version" -v trace="$trace_version" '
     END {
         if (diag_count != 1 || trace_count != 1) exit 65
     }
-' Cargo.toml > "$manifest_tmp" || {
+' "$transaction_repo/Cargo.toml" > "$manifest_tmp" || {
     echo "candidate dependency anchors are not exact" >&2
     exit 65
 }
-mv "$manifest_tmp" Cargo.toml
-trap - EXIT HUP INT TERM
+mv "$manifest_tmp" "$transaction_repo/Cargo.toml"
+
+printf '[registries.rss-candidate]\nindex = "file://%s"\n' "$registry_index" > "$transaction_repo/.cargo/config.toml"
+(
+    cd "$transaction_repo"
+    cargo generate-lockfile
+    cargo fetch --locked
+)
 
 mkdir -p .cargo
-printf '[registries.rss-candidate]\nindex = "file://%s"\n' "$registry_index" > .cargo/config.toml
-rm -f Cargo.lock
-cargo generate-lockfile
-cargo fetch --locked
+mv "$transaction_repo/Cargo.toml" Cargo.toml
+mv "$transaction_repo/Cargo.lock" Cargo.lock
+mv "$transaction_repo/.cargo/config.toml" .cargo/config.toml
