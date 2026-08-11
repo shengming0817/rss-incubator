@@ -1,6 +1,6 @@
 use http::Request;
+use rss_consumer_smoke::ObservationLayer;
 use rss_diag_context::{DiagnosticCtx, correlation, current, scope};
-use rss_standalone_consumer::ObservationLayer;
 use tokio::task::yield_now;
 use tower::{ServiceBuilder, ServiceExt, service_fn};
 

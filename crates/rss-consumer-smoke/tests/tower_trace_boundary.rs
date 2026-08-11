@@ -1,7 +1,7 @@
 use http::{HeaderValue, Request, StatusCode};
 use opentelemetry::trace::TracerProvider as _;
+use rss_consumer_smoke::ObservationLayer;
 use rss_diag_context::correlation;
-use rss_standalone_consumer::ObservationLayer;
 use rss_trace_context::capture_current;
 use tower::{ServiceBuilder, ServiceExt, service_fn};
 use tracing::instrument::WithSubscriber as _;
