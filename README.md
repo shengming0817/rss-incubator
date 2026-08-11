@@ -1,20 +1,39 @@
-# RSS standalone consumer
+# rss-incubator
 
-First-party Plain Rust consumer for the experimental `rss-diag-context` and
-`rss-trace-context` candidates. It proves their joint Tokio/Tower/tracing seam without RSS
-Platform, runtime, providers, workspace paths, or publication automation.
+`rss-incubator` is the first-party RSS product-incubation repository, with an independent source,
+workspace, and lifecycle boundary. It is not the RSS source workspace, an RSS Product Surface, an
+official profile, or the owner of production acceptance.
 
-The canonical verification owner is the RSS repository's `cargo xtask package-proof`. That command
-injects same-revision `.crate` artifacts through an ephemeral local registry, calls
-`scripts/upgrade-candidates.sh`, generates this repository's independent lockfile, and then runs all
-checks with `--locked --offline`. A successful proof means candidate consumption works; it is not an
-RC, registry upload, or release approval.
-
-The RSS proof also owns the structured dependency/lock policy. This repository deliberately does
-not commit a lock bound to the proof's ephemeral `file://` registry and does not implement a second
-registry, metadata scanner, or receipt store.
+The current `crates/rss-consumer-smoke` package is a non-publishable Tokio/Tower smoke that jointly
+consumes `rss-diag-context` and `rss-trace-context`. It proves only that this product-consumption seam
+works; it is not an accepted product, an official profile, a maturity claim, or a production gate.
 
 ## Ownership
 
-Repository custody: `ghbvf`. Maintenance: `github:shengming0817:rss-maintainers`.
-Security reports follow the private channel documented by the canonical RSS repository.
+| Boundary | Owner responsibilities |
+| --- | --- |
+| RSS | Release Surface and API, SemVer, package metadata and artifact correctness, plus fix, yank, and release approval |
+| `rss-incubator` | Workspace, source, root lockfile, product build and CI, dependency upgrades and candidate pins, rollback, and product security response |
+
+## Dependency boundary
+
+Products may consume RSS only through immutable released artifacts, or through an exact candidate
+version whose checksum and source revision are pinned by an incubator-owned proof. RSS dependencies
+must not use path, Git, workspace, submodule, vendored, internal, generated, provider-catalog, runtime
+plan, test-fixture, or governance surfaces.
+
+A candidate proof establishes only this repository's product-consumption seam. It does not establish
+RSS release correctness, RC status, maturity, or publish approval. Until Azure PBI 2095 establishes the
+incubator-owned CI and candidate first-green, the ADR-026 legacy carrier remains transitional; this
+change does not perform that cutover.
+
+## Local verification
+
+The committed root `Cargo.lock` is the single dependency resolution for this workspace.
+
+```sh
+cargo fmt --all -- --check
+cargo check --workspace --all-targets --locked
+cargo test --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+```

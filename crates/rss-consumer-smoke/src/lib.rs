@@ -1,4 +1,4 @@
-#![doc = "First-party Plain Rust consumer of RSS standalone observation components."]
+#![doc = "First-party RSS product-incubator smoke for standalone observation components."]
 
 use std::future::Future;
 use std::pin::Pin;

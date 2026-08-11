@@ -1,0 +1,24 @@
+[package]
+name = "rss-consumer-smoke"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+http = "1"
+rss_diag_context = { package = "rss-diag-context", version = "=0.1.0" }
+rss_trace_context = { package = "rss-trace-context", version = "=0.1.0" }
+tower = { version = "0.5", default-features = false }
+tracing = "0.1"
+
+[dev-dependencies]
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+tracing-opentelemetry = "0.33"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
+
+[lints]
+workspace = true
