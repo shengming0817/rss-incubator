@@ -1,7 +1,7 @@
 #![doc = "External Platform vNext contract-authoring and asynchronous-handler consumer."]
 
 use rss_contract::ContractDescriptor;
-use rss_platform::{Contract, Handler, HandlerError, HandlerFuture};
+use rss_platform::{Contract, Handler, HandlerError, HandlerFailureClass, HandlerFuture};
 use rss_request_context::{PrincipalKind, RequestContextView, RowScope};
 
 /// A product-owned request authored without RSS generated or internal crates.
@@ -52,7 +52,9 @@ impl Handler<CreateWidget> for CreateWidgetHandler {
         Box::pin(async move {
             let name = match request {
                 CreateWidgetRequest::Create { name } => name,
-                CreateWidgetRequest::Fail => return Err(HandlerError),
+                CreateWidgetRequest::Fail => {
+                    return Err(HandlerError::new(HandlerFailureClass::Rejected));
+                }
                 CreateWidgetRequest::Wait => std::future::pending().await,
             };
             Ok(CreateWidgetResponse {
