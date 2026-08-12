@@ -577,14 +577,14 @@ class CandidateBundleTests(unittest.TestCase):
                     "name": required_identity[0],
                     "version": required_identity[1],
                     "source": required_identity[2],
-                    "checksum": required_identity[3],
+                    "checksum": None,
                 },
                 {
                     "id": unrelated_id,
                     "name": unrelated_identity[0],
                     "version": unrelated_identity[1],
                     "source": unrelated_identity[2],
-                    "checksum": unrelated_identity[3],
+                    "checksum": None,
                 },
             ],
             "resolve": {

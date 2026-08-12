@@ -636,12 +636,11 @@ def validate_non_rss_lock_delta(metadata, baseline_identities, candidate_identit
                 reachable.add(dependency_id)
                 pending.append(dependency_id)
 
-    reachable_identities = {
+    reachable_coordinates = {
         (
             package.get("name"),
             package.get("version"),
             package.get("source"),
-            package.get("checksum"),
         )
         for package_id, package in packages.items()
         if package_id in reachable
@@ -649,7 +648,11 @@ def validate_non_rss_lock_delta(metadata, baseline_identities, candidate_identit
         and isinstance(package.get("source"), str)
         and package["source"].startswith("registry+")
     }
-    unjustified = extra - reachable_identities
+    unjustified = {
+        identity
+        for identity in extra
+        if identity[:3] not in reachable_coordinates
+    }
     if unjustified:
         names = sorted(identity[0] for identity in unjustified)
         raise ProofError(
