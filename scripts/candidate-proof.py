@@ -81,8 +81,9 @@ def validate_conformance_fixture(repository: Path):
         "publish": False,
     }:
         raise ProofError("rss-conformance fixture package identity differs")
-    dependency = manifest["dependencies"].get(CONFORMANCE_PACKAGE)
-    if dependency != {"version": "=0.1.0", "registry": "rss-candidate"}:
+    if manifest["dependencies"] != {
+        CONFORMANCE_PACKAGE: {"version": "=0.1.0", "registry": "rss-candidate"}
+    }:
         raise ProofError("rss-conformance fixture dependency must be exact and registry-only")
     if manifest["dev-dependencies"] != {"tokio": {"version": "1", "features": ["macros", "rt"]}}:
         raise ProofError("rss-conformance fixture dev dependency exact-set differs")
@@ -391,19 +392,20 @@ def validate_rewritten_dependencies(baseline_dependencies, metadata, bundle, exp
 
 
 def validate_conformance_fixture_dependency(metadata, bundle, candidate, expected_source):
-    matches = [
+    fixture_rss_dependencies = [
         (workspace_package, dependency)
         for workspace_package, dependency in direct_rss_dependencies(
             metadata, {package.name for package in bundle.packages}
         )
         if workspace_package["name"] == "rss-conformance-candidate-fixture"
-        and canonical_package_name(dependency["name"]) == candidate.name
     ]
-    if len(matches) != 1:
+    if len(fixture_rss_dependencies) != 1:
         raise ProofError("materialized fixture must consume rss-conformance exactly once")
-    _workspace, dependency = matches[0]
+    _workspace, dependency = fixture_rss_dependencies[0]
     if (
-        dependency.get("source") != expected_source
+        canonical_package_name(dependency["name"]) != candidate.name
+        or dependency.get("rename") is not None
+        or dependency.get("source") != expected_source
         or dependency.get("req") != f"={candidate.version}"
         or dependency.get("kind") is not None
         or dependency.get("optional")
@@ -450,6 +452,17 @@ def git_status(repository: Path) -> bytes:
         os.environ.copy(),
         "read incubator status",
     )
+
+
+def verify_checkout_unchanged(before_status, before_lock_exists, before_lock, repository):
+    after_status = git_status(repository)
+    lock_path = repository / "Cargo.lock"
+    after_lock_exists = lock_path.exists()
+    after_lock = lock_path.read_bytes() if after_lock_exists else None
+    if after_status != before_status:
+        raise ProofError("candidate proof changed the real incubator checkout")
+    if after_lock_exists != before_lock_exists or after_lock != before_lock:
+        raise ProofError("candidate proof changed the committed incubator Cargo.lock bytes")
 
 
 def materialize_head(repository: Path, destination: Path):
@@ -706,6 +719,9 @@ def main(argv=None):
     if not bundle_root.is_absolute():
         raise ProofError("--bundle must be an absolute path")
     before = git_status(repository)
+    lock_path = repository / "Cargo.lock"
+    lock_existed = lock_path.exists()
+    lock_before = lock_path.read_bytes() if lock_existed else None
     previous_handlers = {}
 
     def interrupted(signum, _frame):
@@ -719,11 +735,9 @@ def main(argv=None):
         summary = execute(repository, bundle_root)
     except Exception as caught:  # preserve cleanup/status evidence before reporting
         error = caught
-    after = git_status(repository)
     for signum, handler in previous_handlers.items():
         signal.signal(signum, handler)
-    if after != before:
-        raise ProofError("candidate proof changed the real incubator checkout")
+    verify_checkout_unchanged(before, lock_existed, lock_before, repository)
     if error is not None:
         if isinstance(error, ProofError):
             raise error

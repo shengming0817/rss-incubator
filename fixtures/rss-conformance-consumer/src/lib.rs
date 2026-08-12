@@ -5,8 +5,8 @@ mod tests {
     use rss_conformance::{
         ConformanceErrorCategory,
         localtx::{
-            ClassifiedError, CommitCase, CommitUnknownCase, RejectedNoWriteCase, RollbackCase,
-            RollbackFailedCase, assert_commit, assert_commit_unknown_no_replay,
+            ClassifiedError, CommitCase, CommitUnknownCase, NoWriteRejection, RejectedNoWriteCase,
+            RollbackCase, RollbackFailedCase, assert_commit, assert_commit_unknown_no_replay,
             assert_rejected_no_write, assert_rollback, assert_rollback_failed_no_replay,
         },
     };
@@ -41,7 +41,7 @@ mod tests {
         .expect("rollback");
         assert_rejected_no_write(RejectedNoWriteCase::new(
             || async { Err::<(), _>(error(ConformanceErrorCategory::Authorization)) },
-            ConformanceErrorCategory::Authorization,
+            NoWriteRejection::Authorization,
             || async { Ok::<_, ClassifiedError<ProviderError>>(0_u8) },
             0,
             || 0,
@@ -54,7 +54,6 @@ mod tests {
                 commit_attempts.set(commit_attempts.get() + 1);
                 Err::<(), _>(error(ConformanceErrorCategory::CommitUnknown))
             },
-            ConformanceErrorCategory::CommitUnknown,
             || commit_attempts.get(),
         ))
         .await
@@ -65,7 +64,6 @@ mod tests {
                 rollback_attempts.set(rollback_attempts.get() + 1);
                 Err::<(), _>(error(ConformanceErrorCategory::RollbackFailed))
             },
-            ConformanceErrorCategory::RollbackFailed,
             || rollback_attempts.get(),
         ))
         .await
