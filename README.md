@@ -40,11 +40,10 @@ python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 ```
 
 The complete workspace matrix requires an exact candidate bundle and runs only through the closed
-proof entrypoint described below. Inside its temporary snapshot, the proof executes the equivalent
-of:
+proof entrypoint described below. After the prerequisite job checks formatting on the real checkout,
+the proof executes the equivalent of the following inside its temporary snapshot:
 
 ```text
-cargo fmt --all -- --check
 cargo check --workspace --all-targets --locked
 cargo test --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
