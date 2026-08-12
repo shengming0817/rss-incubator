@@ -94,7 +94,7 @@ def materialize_conformance_fixture(snapshot: Path, candidate: CandidatePackage)
     validate_conformance_fixture(snapshot)
     source = snapshot / CONFORMANCE_FIXTURE
     destination = snapshot / MATERIALIZED_FIXTURE
-    destination.mkdir(parents=True)
+    (destination / "src").mkdir(parents=True)
     shutil.copy2(source / "src/lib.rs", destination / "src/lib.rs")
     template = (source / "Cargo.toml.in").read_text(encoding="utf-8")
     (destination / "Cargo.toml").write_text(

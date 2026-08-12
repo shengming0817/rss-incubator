@@ -121,6 +121,25 @@ class CandidateBundleTests(unittest.TestCase):
             with self.assertRaises(candidate_proof.ProofError):
                 candidate_proof.validate_conformance_fixture(root)
 
+    def test_materialized_fixture_uses_exact_candidate_without_touching_template(self):
+        repository = SCRIPT.parents[1]
+        candidate = candidate_proof.CandidatePackage(
+            "rss-conformance", "0.1.7", "aa" * 32, Path("unused")
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = Path(directory)
+            source = snapshot / candidate_proof.CONFORMANCE_FIXTURE
+            source.parent.mkdir(parents=True)
+            candidate_proof.shutil.copytree(
+                repository / candidate_proof.CONFORMANCE_FIXTURE, source
+            )
+            before = (source / "Cargo.toml.in").read_bytes()
+            candidate_proof.materialize_conformance_fixture(snapshot, candidate)
+            manifest = (snapshot / candidate_proof.MATERIALIZED_FIXTURE / "Cargo.toml")
+            self.assertIn('version = "=0.1.7"', manifest.read_text(encoding="utf-8"))
+            self.assertTrue((snapshot / candidate_proof.MATERIALIZED_FIXTURE / "src/lib.rs").is_file())
+            self.assertEqual((source / "Cargo.toml.in").read_bytes(), before)
+
     def test_valid_bundle_is_generic_and_sorted(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
