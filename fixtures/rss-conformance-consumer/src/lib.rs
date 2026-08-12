@@ -2,7 +2,6 @@
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
     use rss_conformance::{
         ConformanceErrorCategory,
         localtx::{
@@ -11,6 +10,7 @@ mod tests {
             assert_rejected_no_write, assert_rollback, assert_rollback_failed_no_replay,
         },
     };
+    use std::cell::Cell;
 
     struct ProviderError;
     fn error(category: ConformanceErrorCategory) -> ClassifiedError<ProviderError> {
@@ -21,24 +21,33 @@ mod tests {
     async fn candidate_localtx_surface_runs_all_five_behaviors() {
         let writes = Cell::new(0_u32);
         assert_commit(CommitCase::new(
-            || async { writes.set(1); Ok::<_, ClassifiedError<ProviderError>>(()) },
+            || async {
+                writes.set(1);
+                Ok::<_, ClassifiedError<ProviderError>>(())
+            },
             || async { Ok::<_, ClassifiedError<ProviderError>>(writes.get()) },
             1,
             || writes.get() as usize,
-        )).await.expect("commit");
+        ))
+        .await
+        .expect("commit");
         assert_rollback(RollbackCase::new(
             || async { Err::<(), _>(error(ConformanceErrorCategory::Conflict)) },
             ConformanceErrorCategory::Conflict,
             || async { Ok::<_, ClassifiedError<ProviderError>>(0_u8) },
             0,
-        )).await.expect("rollback");
+        ))
+        .await
+        .expect("rollback");
         assert_rejected_no_write(RejectedNoWriteCase::new(
             || async { Err::<(), _>(error(ConformanceErrorCategory::Authorization)) },
             ConformanceErrorCategory::Authorization,
             || async { Ok::<_, ClassifiedError<ProviderError>>(0_u8) },
             0,
             || 0,
-        )).await.expect("rejected no-write");
+        ))
+        .await
+        .expect("rejected no-write");
         let commit_attempts = Cell::new(0_usize);
         assert_commit_unknown_no_replay(CommitUnknownCase::new(
             || async {
@@ -47,7 +56,9 @@ mod tests {
             },
             ConformanceErrorCategory::CommitUnknown,
             || commit_attempts.get(),
-        )).await.expect("commit unknown");
+        ))
+        .await
+        .expect("commit unknown");
         let rollback_attempts = Cell::new(0_usize);
         assert_rollback_failed_no_replay(RollbackFailedCase::new(
             || async {
@@ -56,6 +67,8 @@ mod tests {
             },
             ConformanceErrorCategory::RollbackFailed,
             || rollback_attempts.get(),
-        )).await.expect("rollback failed");
+        ))
+        .await
+        .expect("rollback failed");
     }
 }
