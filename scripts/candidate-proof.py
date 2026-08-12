@@ -28,6 +28,8 @@ SEMVER = re.compile(
 )
 LOWER_HEX_40 = re.compile(r"[0-9a-f]{40}\Z")
 LOWER_HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
+CANDIDATE_REGISTRY_URL = "https://rss-candidate.invalid/index"
+CANDIDATE_SOURCE = f"registry+{CANDIDATE_REGISTRY_URL}"
 
 
 class ProofError(RuntimeError):
@@ -554,13 +556,39 @@ def rewrite_dependencies(repository: Path, dependencies, packages, _env):
     )
 
 
-def prepare_candidate_lock(repository: Path, env):
+def locked_registry_identities(lock_path: Path, *, include_rss: bool):
+    try:
+        lock = tomllib.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        raise ProofError(f"cannot inspect root lock: {error}") from error
+    identities = set()
+    for package in lock.get("package", []):
+        source = package.get("source")
+        if not isinstance(source, str) or not source.startswith("registry+"):
+            continue
+        if not include_rss and is_rss_package_name(package.get("name")):
+            continue
+        checksum = package.get("checksum")
+        if not isinstance(checksum, str) or LOWER_HEX_64.fullmatch(checksum) is None:
+            raise ProofError(f"lock package `{package.get('name')}` has no registry checksum")
+        identities.add((package.get("name"), package.get("version"), source, checksum))
+    return identities
+
+
+def prepare_candidate_lock(repository: Path, env, baseline_registry_identities):
     run_visible(
-        ["cargo", "generate-lockfile"],
+        ["cargo", "update", "--workspace"],
         repository,
         env,
-        "generate candidate lock",
+        "resolve candidate workspace from baseline lock",
     )
+    candidate_identities = locked_registry_identities(
+        repository / "Cargo.lock", include_rss=False
+    )
+    missing = baseline_registry_identities - candidate_identities
+    if missing:
+        names = sorted(identity[0] for identity in missing)
+        raise ProofError(f"candidate lock changed baseline registry identities: {names}")
     run_visible(
         ["cargo", "fetch", "--locked"],
         repository,
@@ -648,19 +676,26 @@ def execute(repository: Path, bundle_root: Path):
         )
         config = snapshot / ".cargo/config.toml"
         config.parent.mkdir(parents=True, exist_ok=True)
-        registry_url = (registry / "index").resolve().as_uri()
         config.write_text(
-            f'[registries.rss-candidate]\nindex = "{registry_url}"\n', encoding="utf-8"
+            f'[registries.rss-candidate]\nindex = "{CANDIDATE_REGISTRY_URL}"\n'
+            f'[source.rss-candidate]\nregistry = "{CANDIDATE_REGISTRY_URL}"\n'
+            'replace-with = "rss-candidate-local"\n'
+            '[source.rss-candidate-local]\n'
+            f'registry = "{(registry / "index").resolve().as_uri()}"\n',
+            encoding="utf-8",
+        )
+        baseline_registry_identities = locked_registry_identities(
+            snapshot / "Cargo.lock", include_rss=False
         )
         rewrite_dependencies(snapshot, dependencies, bundle.packages, env)
-        prepare_candidate_lock(snapshot, env)
+        prepare_candidate_lock(snapshot, env, baseline_registry_identities)
         rewritten = cargo_metadata(snapshot, env, offline=True, no_deps=True)
         validate_rewritten_dependencies(
-            dependencies, rewritten, bundle, f"registry+{registry_url}"
+            dependencies, rewritten, bundle, CANDIDATE_SOURCE
         )
         metadata = cargo_metadata(snapshot, env, offline=True, no_deps=False)
         consumed = validate_resolution(
-            snapshot, bundle, metadata, f"registry+{registry_url}"
+            snapshot, bundle, metadata, CANDIDATE_SOURCE
         )
         for subcommand, extra in (
             ("check", []),

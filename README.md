@@ -61,8 +61,10 @@ archive-VCS drift, missing or extra registry entries, path/Git/workspace RSS dep
 RSS packages, and any change to the real checkout. The committed root `Cargo.lock` remains the
 released baseline; the candidate lock exists only for the proof lifetime.
 
-On a fresh runner, the proof generates an invocation-local root lock from the already-validated local
-candidate registry in its isolated Cargo home. The candidate metadata/build/test/lint matrix is
+On a fresh runner, the proof starts from the committed baseline lock, preserves every non-RSS
+registry identity, and resolves only the new workspace member and exact RSS candidate replacement.
+A stable logical candidate source is mapped to the already-validated local registry, so temporary
+filesystem paths never enter the candidate lock. The candidate metadata/build/test/lint matrix is
 explicitly locked and offline; the real checkout and committed baseline lock remain unchanged.
 
 Maintainers trigger the `CI` workflow manually with the exact successful RSS candidate-bundle run

@@ -395,6 +395,20 @@ class CandidateBundleTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (repository / "crates/consumer/Cargo.toml").write_text(
+                '[package]\nname = "consumer"\nversion = "0.0.0"\nedition = "2024"\n',
+                encoding="utf-8",
+            )
+            (repository / "crates/consumer/src/lib.rs").write_text(
+                "pub fn consume() {}\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["cargo", "generate-lockfile"], cwd=repository, check=True
+            )
+            baseline_registry_identities = candidate_proof.locked_registry_identities(
+                repository / "Cargo.lock", include_rss=False
+            )
+            (repository / "crates/consumer/Cargo.toml").write_text(
                 '[package]\nname = "consumer"\nversion = "0.0.0"\nedition = "2024"\n'
                 '[dependencies]\nrss-diag-context = "=0.1.0"\n',
                 encoding="utf-8",
@@ -412,11 +426,13 @@ class CandidateBundleTests(unittest.TestCase):
             (empty_registry / "crates").mkdir()
             candidate_proof.initialize_registry(empty_registry)
 
-            candidate_url = (registry / "index").resolve().as_uri()
             empty_url = (empty_registry / "index").resolve().as_uri()
             (repository / ".cargo").mkdir()
             (repository / ".cargo/config.toml").write_text(
-                f'[registries.rss-candidate]\nindex = "{candidate_url}"\n'
+                f'[registries.rss-candidate]\nindex = "{candidate_proof.CANDIDATE_REGISTRY_URL}"\n'
+                f'[source.rss-candidate]\nregistry = "{candidate_proof.CANDIDATE_REGISTRY_URL}"\n'
+                'replace-with = "rss-candidate-local"\n'
+                f'[source.rss-candidate-local]\nregistry = "{(registry / "index").resolve().as_uri()}"\n'
                 '[source.crates-io]\nreplace-with = "empty-test-registry"\n'
                 f'[source.empty-test-registry]\nregistry = "{empty_url}"\n',
                 encoding="utf-8",
@@ -429,7 +445,9 @@ class CandidateBundleTests(unittest.TestCase):
             )
             env = candidate_proof.command_env(root / "cargo")
 
-            candidate_proof.prepare_candidate_lock(repository, env)
+            candidate_proof.prepare_candidate_lock(
+                repository, env, baseline_registry_identities
+            )
             direct = candidate_proof.cargo_metadata(
                 repository, env, offline=True, no_deps=True
             )
@@ -437,16 +455,104 @@ class CandidateBundleTests(unittest.TestCase):
                 dependencies,
                 direct,
                 bundle,
-                f"registry+{candidate_url}",
+                candidate_proof.CANDIDATE_SOURCE,
             )
             metadata = candidate_proof.cargo_metadata(
                 repository, env, offline=True, no_deps=False
             )
             self.assertEqual(
                 candidate_proof.validate_resolution(
-                    repository, bundle, metadata, f"registry+{candidate_url}"
+                    repository, bundle, metadata, candidate_proof.CANDIDATE_SOURCE
                 ),
                 ["rss-diag-context"],
+            )
+
+    def test_candidate_lock_is_stable_across_physical_registry_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle_root = root / "bundle"
+            write_bundle(bundle_root, names=("rss-diag-context",))
+            bundle = candidate_proof.validate_bundle(bundle_root)
+            locks = []
+
+            for run in ("first", "second"):
+                repository = root / run / "repository"
+                (repository / "crates/consumer/src").mkdir(parents=True)
+                (repository / "Cargo.toml").write_text(
+                    '[workspace]\nresolver = "3"\nmembers = ["crates/*"]\n',
+                    encoding="utf-8",
+                )
+                manifest = repository / "crates/consumer/Cargo.toml"
+                manifest.write_text(
+                    '[package]\nname = "consumer"\nversion = "0.0.0"\nedition = "2024"\n',
+                    encoding="utf-8",
+                )
+                (repository / "crates/consumer/src/lib.rs").write_text(
+                    "pub fn consume() {}\n", encoding="utf-8"
+                )
+                subprocess.run(
+                    ["cargo", "generate-lockfile"], cwd=repository, check=True
+                )
+                baseline = candidate_proof.locked_registry_identities(
+                    repository / "Cargo.lock", include_rss=False
+                )
+                manifest.write_text(
+                    '[package]\nname = "consumer"\nversion = "0.0.0"\nedition = "2024"\n'
+                    '[dependencies]\nrss-diag-context = "=0.1.0"\n',
+                    encoding="utf-8",
+                )
+                registry = root / run / "physical-registry"
+                candidate_proof.shutil.copytree(bundle.root / "registry", registry)
+                candidate_proof.initialize_registry(registry)
+                (repository / ".cargo").mkdir()
+                (repository / ".cargo/config.toml").write_text(
+                    f'[registries.rss-candidate]\nindex = "{candidate_proof.CANDIDATE_REGISTRY_URL}"\n'
+                    f'[source.rss-candidate]\nregistry = "{candidate_proof.CANDIDATE_REGISTRY_URL}"\n'
+                    'replace-with = "rss-candidate-local"\n'
+                    f'[source.rss-candidate-local]\nregistry = "{(registry / "index").resolve().as_uri()}"\n',
+                    encoding="utf-8",
+                )
+                dependencies = candidate_proof.manifest_rss_dependencies(
+                    repository, {"rss-diag-context"}
+                )
+                candidate_proof.rewrite_dependencies(
+                    repository, dependencies, bundle.packages, {}
+                )
+                candidate_proof.prepare_candidate_lock(
+                    repository,
+                    candidate_proof.command_env(root / run / "cargo-home"),
+                    baseline,
+                )
+                locks.append((repository / "Cargo.lock").read_bytes())
+
+            self.assertEqual(locks[0], locks[1])
+            self.assertIn(candidate_proof.CANDIDATE_REGISTRY_URL.encode(), locks[0])
+            self.assertNotIn(str(root).encode(), locks[0])
+
+    def test_candidate_lock_rejects_baseline_registry_identity_drift(self):
+        baseline = {
+            (
+                "baseline-package",
+                "1.0.0",
+                "registry+https://github.com/rust-lang/crates.io-index",
+                "a" * 64,
+            )
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            (repository / "Cargo.lock").write_text("version = 4\n", encoding="utf-8")
+            with mock.patch.object(candidate_proof, "run_visible") as visible:
+                with self.assertRaisesRegex(
+                    candidate_proof.ProofError, "baseline registry identities"
+                ):
+                    candidate_proof.prepare_candidate_lock(
+                        repository, {}, baseline
+                    )
+            visible.assert_called_once_with(
+                ["cargo", "update", "--workspace"],
+                repository,
+                {},
+                "resolve candidate workspace from baseline lock",
             )
 
     def test_manifest_rejects_workspace_inheritance_and_underscore_internal(self):
@@ -651,6 +757,10 @@ class CandidateBundleTests(unittest.TestCase):
                 (destination / "Cargo.toml").write_text(
                     '[workspace]\nmembers = ["crates/*"]\n', encoding="utf-8"
                 )
+                (destination / "Cargo.lock").write_text(
+                    'version = 4\n\n[[package]]\nname = "consumer"\nversion = "0.0.0"\n',
+                    encoding="utf-8",
+                )
                 (destination / "crates/consumer/Cargo.toml").write_text(
                     '[package]\nname = "consumer"\nversion = "0.0.0"\n'
                     'edition = "2024"\n[dependencies]\n'
@@ -665,8 +775,6 @@ class CandidateBundleTests(unittest.TestCase):
 
             def visible(args, cwd, _env, _label):
                 commands.append((tuple(args), cwd))
-                if args[:2] == ["cargo", "generate-lockfile"]:
-                    (cwd / "Cargo.lock").write_text("version = 4\n", encoding="utf-8")
                 if fail_test and args[:2] == ["cargo", "test"]:
                     raise candidate_proof.ProofError("synthetic test failure")
 
@@ -682,11 +790,9 @@ class CandidateBundleTests(unittest.TestCase):
                 }
                 self.assertTrue(offline)
                 self.assertEqual(no_deps, metadata_calls == 1)
-                config = tomllib.loads(
-                    (repository / ".cargo/config.toml").read_text(encoding="utf-8")
+                rewritten = dict(
+                    baseline_dependency, source=candidate_proof.CANDIDATE_SOURCE
                 )
-                source = "registry+" + config["registries"]["rss-candidate"]["index"]
-                rewritten = dict(baseline_dependency, source=source)
                 return {
                     "workspace_members": ["consumer-id"],
                     "packages": [dict(workspace, dependencies=[rewritten])],
@@ -718,18 +824,18 @@ class CandidateBundleTests(unittest.TestCase):
             self.assertIn(command, matrix)
             self.assertIn("--locked", matrix[command])
             self.assertIn("--offline", matrix[command])
-        self.assertEqual(matrix["generate-lockfile"], ("cargo", "generate-lockfile"))
+        self.assertEqual(matrix["update"], ("cargo", "update", "--workspace"))
         self.assertTrue(snapshots)
         self.assertTrue(snapshots[0].parent.name.startswith("rss-incubator-candidate-"))
         self.assertTrue(all(cwd == snapshots[0] for _args, cwd in commands))
         command_args = [args for args, _cwd in commands]
-        generated = command_args.index(("cargo", "generate-lockfile"))
-        self.assertEqual(command_args[generated + 1], ("cargo", "fetch", "--locked"))
+        updated = command_args.index(("cargo", "update", "--workspace"))
+        self.assertEqual(command_args[updated + 1], ("cargo", "fetch", "--locked"))
         first_matrix = min(
             command_args.index(matrix[subcommand])
             for subcommand in ("check", "test", "clippy")
         )
-        self.assertLess(generated + 1, first_matrix)
+        self.assertLess(updated + 1, first_matrix)
         failed_commands, _ = run_once(fail_test=True)
         self.assertTrue(any(args[:2] == ("cargo", "test") for args, _ in failed_commands))
 
