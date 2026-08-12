@@ -49,12 +49,15 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Check workspace
+        if: ${{ github.event_name != 'workflow_dispatch' }}
         run: cargo check --workspace --all-targets --locked
 
       - name: Test workspace
+        if: ${{ github.event_name != 'workflow_dispatch' }}
         run: cargo test --workspace --all-targets --locked
 
       - name: Lint workspace
+        if: ${{ github.event_name != 'workflow_dispatch' }}
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   candidate-proof:
@@ -130,7 +133,10 @@ jobs:
             --bundle "$RUNNER_TEMP/rss-candidate-bundle" | tee "$proof_log"
           summary="$(tail -n 1 "$proof_log")"
           jq -e --arg revision "$RSS_EXPECTED_REVISION" \
-            '.schemaVersion == 1 and .rssRevision == $revision' <<< "$summary" >/dev/null
+            '.schemaVersion == 1 and
+             .rssRevision == $revision and
+             ([.packages[].name] | sort) == (.consumedPackages | sort)' \
+            <<< "$summary" >/dev/null
           {
             echo 'summary<<RSS_CANDIDATE_SUMMARY'
             echo "$summary"
@@ -150,10 +156,13 @@ jobs:
             echo "- Incubator candidate run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
             echo "- RSS revision: \`$(jq -r '.rssRevision' <<< "$RSS_PROOF_SUMMARY")\`"
             echo "- Incubator revision: \`$(jq -r '.incubatorRevision' <<< "$RSS_PROOF_SUMMARY")\`"
+            echo "- Artifact identity: \`${{ steps.artifact.outputs.name }}\`"
             echo "- Artifact digest: \`$RSS_ARTIFACT_DIGEST\`"
             echo "- Candidate lock SHA-256: \`$(jq -r '.candidateLockSha256' <<< "$RSS_PROOF_SUMMARY")\`"
+            echo '- Registry-only resolution: verified'
+            echo '- Candidate matrix: `cargo check`, `cargo test`, and `cargo clippy` passed with `--locked --offline`'
             echo '- Release Surface packages:'
-            jq -r '.packages[] | "  - `\(.name)@\(.version)` — `\(.checksum)`"' <<< "$RSS_PROOF_SUMMARY"
+            jq -r '.rssRevision as $revision | .packages[] | "  - `\(.name)@\(.version)` — checksum `\(.checksum)` — archive VCS `\($revision)`"' <<< "$RSS_PROOF_SUMMARY"
             echo '- Consumed RSS packages:'
             jq -r '.consumedPackages[] | "  - `\(.)`"' <<< "$RSS_PROOF_SUMMARY"
           } >> "$GITHUB_STEP_SUMMARY"

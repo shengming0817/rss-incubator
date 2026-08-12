@@ -4,9 +4,12 @@
 workspace, and lifecycle boundary. It is not the RSS source workspace, an RSS Product Surface, an
 official profile, or the owner of production acceptance.
 
-The current `crates/rss-consumer-smoke` package is a non-publishable Tokio/Tower smoke that jointly
-consumes `rss-diag-context` and `rss-trace-context`. It proves only that this product-consumption seam
-works; it is not an accepted product, an official profile, a maturity claim, or a production gate.
+The non-publishable `crates/rss-consumer-smoke` package jointly consumes `rss-diag-context` and
+`rss-trace-context`. The non-publishable `crates/platform-authoring-smoke` package directly consumes
+`rss-contract`, `rss-request-context`, and Platform vNext, authors a typed contract and asynchronous
+handler, and exercises product-owned host admission. Together they prove only that these external
+product-consumption seams work; they are not accepted products, official profiles, maturity claims,
+or production gates.
 
 ## Ownership
 
@@ -23,9 +26,7 @@ must not use path, Git, workspace, submodule, vendored, internal, generated, pro
 plan, test-fixture, or governance surfaces.
 
 A candidate proof establishes only this repository's product-consumption seam. It does not establish
-RSS release correctness, RC status, maturity, or publish approval. Until Azure PBI 2095 establishes the
-incubator-owned CI and candidate first-green, the ADR-026 legacy carrier remains transitional; this
-change does not perform that cutover.
+RSS release correctness, RC status, maturity, or publish approval.
 
 ## Local verification
 
@@ -38,8 +39,9 @@ cargo test --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-GitHub Actions runs the same committed-lock matrix on every pull request and push to `main`. The
-workflow also runs the candidate-proof policy tests before compiling the workspace.
+GitHub Actions runs the same committed-lock matrix on every pull request and push to `main`. A manual
+candidate run first executes the proof policy tests and formatting check, then delegates all candidate
+metadata, build, test, and lint execution to the isolated candidate-proof job.
 
 ## Candidate artifact proof
 
@@ -51,21 +53,24 @@ entrypoint:
 python3 scripts/candidate-proof.py --bundle /absolute/path/to/rss-candidate-bundle
 ```
 
-The bundle carries the complete RSS Release Surface exact-set. The proof dynamically selects the
-subset directly consumed by this workspace, rewrites only a committed-HEAD temporary snapshot, and
-then runs Cargo metadata, check, test, and clippy with `--locked --offline`. It rejects checksum or
+The bundle carries the complete RSS Release Surface exact-set. Before Cargo resolution, the proof
+statically discovers the subset directly consumed by this workspace, rewrites only a committed-HEAD
+temporary snapshot, and then runs Cargo metadata, check, test, and clippy with `--locked --offline`.
+It rejects checksum or
 archive-VCS drift, missing or extra registry entries, path/Git/workspace RSS dependencies, internal
 RSS packages, and any change to the real checkout. The committed root `Cargo.lock` remains the
 released baseline; the candidate lock exists only for the proof lifetime.
 
-On a fresh runner, the proof first fetches the committed released lock and then the already-validated
-local candidate registry into its isolated Cargo home. Network access is preparation only; the
-candidate metadata/build/test/lint matrix is explicitly locked and offline.
+On a fresh runner, the proof generates an invocation-local root lock from the already-validated local
+candidate registry in its isolated Cargo home. The candidate metadata/build/test/lint matrix is
+explicitly locked and offline; the real checkout and committed baseline lock remain unchanged.
 
 Maintainers trigger the `CI` workflow manually with the exact successful RSS candidate-bundle run
 ID. `RSS_ARTIFACTS_READ_TOKEN` is a fine-grained Actions secret with read-only access to the RSS
 repository's workflow artifacts. The workflow derives the RSS revision, run attempt, artifact name,
-and digest from that immutable run and publishes the first-green identities in the job summary.
+and digest from that immutable run. The job summary publishes both canonical run URLs, both commits,
+artifact identity and digest, the dynamic package exact-set with checksums and verified archive VCS,
+the consumed set, candidate-lock digest, registry-only result, and locked/offline matrix result.
 
 A green candidate proof establishes only this repository's product-consumption seam. It does not
 establish RSS release correctness, RC status, package maturity, publish approval, an official

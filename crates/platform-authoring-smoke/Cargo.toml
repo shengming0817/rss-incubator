@@ -1,0 +1,17 @@
+[package]
+name = "platform-authoring-smoke"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+rss-contract = "=0.1.0"
+rss-platform = "=0.3.0"
+rss-request-context = "=0.1.0"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[lints]
+workspace = true

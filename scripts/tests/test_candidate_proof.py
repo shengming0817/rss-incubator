@@ -261,6 +261,125 @@ class CandidateBundleTests(unittest.TestCase):
             with self.assertRaises(candidate_proof.ProofError):
                 candidate_proof.direct_rss_dependencies(metadata, bundle_names)
 
+    def test_unpublished_rss_dependencies_are_discovered_before_cargo_resolution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            (repository / "crates/platform-authoring-smoke").mkdir(parents=True)
+            (repository / "Cargo.toml").write_text(
+                '[workspace]\nresolver = "3"\nmembers = ["crates/*"]\n',
+                encoding="utf-8",
+            )
+            manifest = repository / "crates/platform-authoring-smoke/Cargo.toml"
+            manifest.write_text(
+                '[package]\nname = "platform-authoring-smoke"\nversion = "0.0.0"\n'
+                'edition = "2024"\n'
+                '[dependencies]\n'
+                'rss_contract = { package = "rss-contract", version = "=0.1.0" }\n'
+                'rss-platform = { version = "=0.3.0", default-features = false }\n'
+                '[target.\'cfg(unix)\'.dev-dependencies]\n'
+                'rss-request-context = { version = "=0.1.0", features = ["std"] }\n',
+                encoding="utf-8",
+            )
+
+            dependencies = candidate_proof.manifest_rss_dependencies(
+                repository,
+                {"rss-contract", "rss-platform", "rss-request-context"},
+            )
+
+            self.assertEqual(len(dependencies), 3)
+            identities = {
+                candidate_proof.dependency_identity(package, dependency)
+                for package, dependency in dependencies
+            }
+            self.assertIn(
+                (
+                    "platform-authoring-smoke",
+                    "rss-contract",
+                    "rss_contract",
+                    None,
+                    None,
+                ),
+                identities,
+            )
+            self.assertIn(
+                (
+                    "platform-authoring-smoke",
+                    "rss-request-context",
+                    None,
+                    "dev",
+                    "cfg(unix)",
+                ),
+                identities,
+            )
+
+    def test_static_manifest_discovery_rejects_forbidden_and_bundle_external_rss(self):
+        cases = [
+            'rss-platform = { version = "=0.3.0", path = "../rss" }\n',
+            'rss-platform = { git = "https://invalid", rev = "deadbeef" }\n',
+            'rss-platform = { workspace = true }\n',
+            'rss-internal = "=0.1.0"\n',
+        ]
+        for declaration in cases:
+            with self.subTest(declaration=declaration), tempfile.TemporaryDirectory() as directory:
+                repository = Path(directory)
+                (repository / "crates/consumer").mkdir(parents=True)
+                (repository / "Cargo.toml").write_text(
+                    '[workspace]\nmembers = ["crates/*"]\n', encoding="utf-8"
+                )
+                (repository / "crates/consumer/Cargo.toml").write_text(
+                    '[package]\nname = "consumer"\nversion = "0.0.0"\n'
+                    'edition = "2024"\n[dependencies]\n'
+                    + declaration,
+                    encoding="utf-8",
+                )
+                with self.assertRaises(candidate_proof.ProofError):
+                    candidate_proof.manifest_rss_dependencies(
+                        repository, {"rss-platform"}
+                    )
+
+    def test_candidate_rewrite_is_one_root_patch_and_requires_bundle_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            manifest = repository / "Cargo.toml"
+            manifest.write_text(
+                '[workspace]\nmembers = ["crates/*"]\n', encoding="utf-8"
+            )
+            package = candidate_proof.CandidatePackage(
+                "rss-platform", "0.3.0", "0" * 64, Path("/candidate/archive")
+            )
+            dependencies = [
+                (
+                    {"name": "consumer", "manifest_path": "/consumer/Cargo.toml"},
+                    {
+                        "name": "rss-platform",
+                        "req": "=0.3.0",
+                        "source": "registry+manifest",
+                        "kind": None,
+                        "rename": None,
+                        "optional": False,
+                        "uses_default_features": True,
+                        "features": [],
+                        "target": None,
+                    },
+                )
+            ]
+
+            candidate_proof.rewrite_dependencies(
+                repository, dependencies, (package,), {}
+            )
+
+            rewritten = manifest.read_text(encoding="utf-8")
+            self.assertEqual(rewritten.count("[patch.crates-io]"), 1)
+            self.assertIn(
+                'rss-platform = { version = "=0.3.0", registry = "rss-candidate" }',
+                rewritten,
+            )
+            mismatched = [(dependencies[0][0], dict(dependencies[0][1], req="=0.2.0"))]
+            with self.assertRaises(candidate_proof.ProofError):
+                candidate_proof.rewrite_dependencies(
+                    repository, mismatched, (package,), {}
+                )
+
     def test_manifest_rejects_workspace_inheritance_and_underscore_internal(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -416,7 +535,16 @@ class CandidateBundleTests(unittest.TestCase):
             snapshots = []
 
             def materialize(_repository, destination):
-                destination.mkdir(parents=True)
+                (destination / "crates/consumer").mkdir(parents=True)
+                (destination / "Cargo.toml").write_text(
+                    '[workspace]\nmembers = ["crates/*"]\n', encoding="utf-8"
+                )
+                (destination / "crates/consumer/Cargo.toml").write_text(
+                    '[package]\nname = "consumer"\nversion = "0.0.0"\n'
+                    'edition = "2024"\n[dependencies]\n'
+                    'rss_diag_context = { package = "rss-diag-context", version = "=0.1.0" }\n',
+                    encoding="utf-8",
+                )
                 snapshots.append(destination)
 
             def copytree(_source, destination):
@@ -438,21 +566,10 @@ class CandidateBundleTests(unittest.TestCase):
                 workspace = {
                     "id": "consumer-id",
                     "name": "consumer",
-                    "manifest_path": str(repository / "Cargo.toml"),
+                    "manifest_path": str(repository / "crates/consumer/Cargo.toml"),
                 }
-                if metadata_calls == 1:
-                    (repository / "Cargo.toml").write_text(
-                        '[package]\nname = "consumer"\nversion = "0.0.0"\n'
-                        '[dependencies]\nrss_diag_context = '
-                        '{ package = "rss-diag-context", version = "=0.1.0" }\n',
-                        encoding="utf-8",
-                    )
-                    return {
-                        "workspace_members": ["consumer-id"],
-                        "packages": [dict(workspace, dependencies=[baseline_dependency])],
-                    }
                 self.assertTrue(offline)
-                self.assertTrue(no_deps if metadata_calls == 2 else not no_deps)
+                self.assertEqual(no_deps, metadata_calls == 1)
                 config = tomllib.loads(
                     (repository / ".cargo/config.toml").read_text(encoding="utf-8")
                 )
