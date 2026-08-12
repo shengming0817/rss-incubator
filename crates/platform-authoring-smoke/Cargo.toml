@@ -7,7 +7,7 @@ publish = false
 
 [dependencies]
 rss-contract = "=0.1.0"
-rss-platform = "=0.3.0"
+rss-platform = "=0.2.0"
 rss-request-context = "=0.1.0"
 
 [dev-dependencies]
