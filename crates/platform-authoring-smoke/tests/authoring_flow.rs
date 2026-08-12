@@ -234,7 +234,11 @@ async fn cancellation_and_deadline_stop_admitted_work() {
             .dispatch::<CreateWidget>(
                 &CreateWidget::DESCRIPTOR,
                 CreateWidgetRequest::Wait,
-                expired.view(Instant::now() - Duration::from_millis(1)),
+                expired.view(
+                    Instant::now()
+                        .checked_sub(Duration::from_millis(1))
+                        .expect("one millisecond is representable"),
+                ),
             )
             .await
             .expect("expired deadline is a closed outcome"),
