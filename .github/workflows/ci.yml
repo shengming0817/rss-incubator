@@ -48,18 +48,6 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Check workspace
-        if: ${{ github.event_name != 'workflow_dispatch' }}
-        run: cargo check --workspace --all-targets --locked
-
-      - name: Test workspace
-        if: ${{ github.event_name != 'workflow_dispatch' }}
-        run: cargo test --workspace --all-targets --locked
-
-      - name: Lint workspace
-        if: ${{ github.event_name != 'workflow_dispatch' }}
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
   candidate-proof:
     name: candidate-proof
     if: ${{ github.event_name == 'workflow_dispatch' }}

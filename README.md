@@ -39,9 +39,11 @@ cargo test --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-GitHub Actions runs the same committed-lock matrix on every pull request and push to `main`. A manual
-candidate run first executes the proof policy tests and formatting check, then delegates all candidate
-metadata, build, test, and lint execution to the isolated candidate-proof job.
+GitHub Actions runs the proof policy tests and formatting check on every pull request and push to
+`main`. The three candidate-only packages are intentionally absent from crates.io, so those events
+must not attempt Cargo workspace resolution through the released registry. A manual candidate run
+uses the exact immutable RSS bundle and delegates all metadata, build, test, and lint execution to
+the isolated candidate-proof job.
 
 ## Candidate artifact proof
 

@@ -12,6 +12,7 @@ from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "candidate-proof.py"
+WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml"
 SPEC = importlib.util.spec_from_file_location("candidate_proof", SCRIPT)
 candidate_proof = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(candidate_proof)
@@ -105,6 +106,16 @@ def write_bundle(root: Path, names=("rss-diag-context", "rss-trace-context", "rs
 
 
 class CandidateBundleTests(unittest.TestCase):
+    def test_pr_lane_does_not_resolve_unpublished_candidate_packages(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        for command in (
+            "cargo check --workspace --all-targets --locked",
+            "cargo test --workspace --all-targets --locked",
+            "cargo clippy --workspace --all-targets --locked",
+        ):
+            self.assertNotIn(command, workflow)
+        self.assertIn("python3 scripts/candidate-proof.py", workflow)
+
     def test_valid_bundle_is_generic_and_sorted(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
