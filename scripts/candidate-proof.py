@@ -28,6 +28,10 @@ SEMVER = re.compile(
 )
 LOWER_HEX_40 = re.compile(r"[0-9a-f]{40}\Z")
 LOWER_HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
+CONFORMANCE_PACKAGE = "rss-conformance"
+CONFORMANCE_FIXTURE = Path("fixtures/rss-conformance-consumer")
+MATERIALIZED_FIXTURE = Path("crates/rss-conformance-candidate-fixture")
+CONFORMANCE_VERSION_TOKEN = "__RSS_CONFORMANCE_VERSION__"
 
 
 class ProofError(RuntimeError):
@@ -45,6 +49,58 @@ class CandidateBundle(NamedTuple):
     root: Path
     rss_revision: str
     packages: tuple[CandidatePackage, ...]
+
+
+def require_conformance_candidate(bundle: CandidateBundle) -> CandidatePackage:
+    matches = [package for package in bundle.packages if package.name == CONFORMANCE_PACKAGE]
+    if len(matches) != 1:
+        raise ProofError("candidate bundle must contain exactly one `rss-conformance` package")
+    return matches[0]
+
+
+def validate_conformance_fixture(repository: Path):
+    fixture = repository / CONFORMANCE_FIXTURE
+    expected = {Path("Cargo.toml.in"), Path("src/lib.rs")}
+    if regular_files(fixture) != expected:
+        raise ProofError("rss-conformance candidate fixture exact-set differs")
+    template = (fixture / "Cargo.toml.in").read_text(encoding="utf-8")
+    if template.count(CONFORMANCE_VERSION_TOKEN) != 1:
+        raise ProofError("rss-conformance fixture must contain one exact version token")
+    rendered = template.replace(CONFORMANCE_VERSION_TOKEN, "0.1.0")
+    try:
+        manifest = tomllib.loads(rendered)
+    except tomllib.TOMLDecodeError as error:
+        raise ProofError("rss-conformance fixture manifest template is invalid") from error
+    require_keys(manifest, {"package", "dependencies", "dev-dependencies", "lints"}, "conformance fixture")
+    package = manifest["package"]
+    require_keys(package, {"name", "version", "edition", "publish"}, "conformance fixture package")
+    if package != {
+        "name": "rss-conformance-candidate-fixture",
+        "version": "0.0.0",
+        "edition": "2024",
+        "publish": False,
+    }:
+        raise ProofError("rss-conformance fixture package identity differs")
+    if manifest["dependencies"] != {
+        CONFORMANCE_PACKAGE: {"version": "=0.1.0", "registry": "rss-candidate"}
+    }:
+        raise ProofError("rss-conformance fixture dependency must be exact and registry-only")
+    if manifest["dev-dependencies"] != {"tokio": {"version": "1", "features": ["macros", "rt"]}}:
+        raise ProofError("rss-conformance fixture dev dependency exact-set differs")
+    if manifest["lints"] != {"workspace": True}:
+        raise ProofError("rss-conformance fixture must inherit workspace lints")
+
+
+def materialize_conformance_fixture(snapshot: Path, candidate: CandidatePackage):
+    validate_conformance_fixture(snapshot)
+    source = snapshot / CONFORMANCE_FIXTURE
+    destination = snapshot / MATERIALIZED_FIXTURE
+    (destination / "src").mkdir(parents=True)
+    shutil.copy2(source / "src/lib.rs", destination / "src/lib.rs")
+    template = (source / "Cargo.toml.in").read_text(encoding="utf-8")
+    (destination / "Cargo.toml").write_text(
+        template.replace(CONFORMANCE_VERSION_TOKEN, candidate.version), encoding="utf-8"
+    )
 
 
 def strict_object(pairs):
@@ -320,6 +376,8 @@ def validate_rewritten_dependencies(baseline_dependencies, metadata, bundle, exp
     }
     actual = {}
     for workspace_package, dependency in rewritten:
+        if workspace_package["name"] == "rss-conformance-candidate-fixture":
+            continue
         identity = dependency_identity(workspace_package, dependency)
         candidate = candidates[canonical_package_name(dependency["name"])]
         if dependency.get("source") != expected_source:
@@ -331,6 +389,29 @@ def validate_rewritten_dependencies(baseline_dependencies, metadata, bundle, exp
         actual[identity] = dependency_semantics(dependency)
     if actual != baseline:
         raise ProofError("rewritten RSS dependency kinds, targets, features, or aliases differ")
+
+
+def validate_conformance_fixture_dependency(metadata, bundle, candidate, expected_source):
+    fixture_rss_dependencies = [
+        (workspace_package, dependency)
+        for workspace_package, dependency in direct_rss_dependencies(
+            metadata, {package.name for package in bundle.packages}
+        )
+        if workspace_package["name"] == "rss-conformance-candidate-fixture"
+    ]
+    if len(fixture_rss_dependencies) != 1:
+        raise ProofError("materialized fixture must consume rss-conformance exactly once")
+    _workspace, dependency = fixture_rss_dependencies[0]
+    if (
+        canonical_package_name(dependency["name"]) != candidate.name
+        or dependency.get("rename") is not None
+        or dependency.get("source") != expected_source
+        or dependency.get("req") != f"={candidate.version}"
+        or dependency.get("kind") is not None
+        or dependency.get("optional")
+        or dependency.get("features")
+    ):
+        raise ProofError("materialized fixture dependency identity/source differs")
 
 
 def command_env(temp_root: Path):
@@ -371,6 +452,17 @@ def git_status(repository: Path) -> bytes:
         os.environ.copy(),
         "read incubator status",
     )
+
+
+def verify_checkout_unchanged(before_status, before_lock_exists, before_lock, repository):
+    after_status = git_status(repository)
+    lock_path = repository / "Cargo.lock"
+    after_lock_exists = lock_path.exists()
+    after_lock = lock_path.read_bytes() if after_lock_exists else None
+    if after_status != before_status:
+        raise ProofError("candidate proof changed the real incubator checkout")
+    if after_lock_exists != before_lock_exists or after_lock != before_lock:
+        raise ProofError("candidate proof changed the committed incubator Cargo.lock bytes")
 
 
 def materialize_head(repository: Path, destination: Path):
@@ -531,6 +623,7 @@ def validate_resolution(repository: Path, bundle: CandidateBundle, metadata, exp
 
 def execute(repository: Path, bundle_root: Path):
     bundle = validate_bundle(bundle_root)
+    candidate = require_conformance_candidate(bundle)
     with tempfile.TemporaryDirectory(prefix="rss-incubator-candidate-") as directory:
         temp_root = Path(directory)
         snapshot = temp_root / "repository"
@@ -555,14 +648,24 @@ def execute(repository: Path, bundle_root: Path):
             f'[registries.rss-candidate]\nindex = "{registry_url}"\n', encoding="utf-8"
         )
         rewrite_dependencies(snapshot, dependencies, bundle.packages, env)
+        materialize_conformance_fixture(snapshot, candidate)
         prepare_candidate_lock(snapshot, env)
         rewritten = cargo_metadata(snapshot, env, offline=True, no_deps=True)
         validate_rewritten_dependencies(
             dependencies, rewritten, bundle, f"registry+{registry_url}"
         )
+        validate_conformance_fixture_dependency(
+            rewritten, bundle, candidate, f"registry+{registry_url}"
+        )
         metadata = cargo_metadata(snapshot, env, offline=True, no_deps=False)
         consumed = validate_resolution(
             snapshot, bundle, metadata, f"registry+{registry_url}"
+        )
+        run_visible(
+            ["cargo", "fmt", "--all", "--", "--check"],
+            snapshot,
+            env,
+            "candidate workspace fmt",
         )
         for subcommand, extra in (
             ("check", []),
@@ -616,6 +719,9 @@ def main(argv=None):
     if not bundle_root.is_absolute():
         raise ProofError("--bundle must be an absolute path")
     before = git_status(repository)
+    lock_path = repository / "Cargo.lock"
+    lock_existed = lock_path.exists()
+    lock_before = lock_path.read_bytes() if lock_existed else None
     previous_handlers = {}
 
     def interrupted(signum, _frame):
@@ -629,11 +735,9 @@ def main(argv=None):
         summary = execute(repository, bundle_root)
     except Exception as caught:  # preserve cleanup/status evidence before reporting
         error = caught
-    after = git_status(repository)
     for signum, handler in previous_handlers.items():
         signal.signal(signum, handler)
-    if after != before:
-        raise ProofError("candidate proof changed the real incubator checkout")
+    verify_checkout_unchanged(before, lock_existed, lock_before, repository)
     if error is not None:
         if isinstance(error, ProofError):
             raise error
