@@ -555,6 +555,72 @@ class CandidateBundleTests(unittest.TestCase):
                 "resolve candidate workspace from baseline lock",
             )
 
+    def test_non_rss_lock_additions_require_candidate_graph_reachability(self):
+        crates_io = "registry+https://github.com/rust-lang/crates.io-index"
+        baseline_identity = ("baseline", "1.0.0", crates_io, "a" * 64)
+        required_identity = ("required", "2.0.0", crates_io, "b" * 64)
+        unrelated_identity = ("unrelated", "3.0.0", crates_io, "c" * 64)
+        rss_id = "registry+https://rss-candidate.invalid/index#rss-platform@0.3.0"
+        required_id = "registry+https://github.com/rust-lang/crates.io-index#required@2.0.0"
+        unrelated_id = "registry+https://github.com/rust-lang/crates.io-index#unrelated@3.0.0"
+        metadata = {
+            "packages": [
+                {
+                    "id": rss_id,
+                    "name": "rss-platform",
+                    "version": "0.3.0",
+                    "source": candidate_proof.CANDIDATE_SOURCE,
+                    "checksum": "d" * 64,
+                },
+                {
+                    "id": required_id,
+                    "name": required_identity[0],
+                    "version": required_identity[1],
+                    "source": required_identity[2],
+                    "checksum": required_identity[3],
+                },
+                {
+                    "id": unrelated_id,
+                    "name": unrelated_identity[0],
+                    "version": unrelated_identity[1],
+                    "source": unrelated_identity[2],
+                    "checksum": unrelated_identity[3],
+                },
+            ],
+            "resolve": {
+                "nodes": [
+                    {"id": rss_id, "dependencies": [required_id]},
+                    {"id": required_id, "dependencies": []},
+                    {"id": unrelated_id, "dependencies": []},
+                ]
+            },
+        }
+        baseline = {baseline_identity}
+
+        candidate_proof.validate_non_rss_lock_delta(
+            metadata, baseline, baseline | {required_identity}
+        )
+        with self.assertRaisesRegex(
+            candidate_proof.ProofError, "outside the candidate dependency graph"
+        ):
+            candidate_proof.validate_non_rss_lock_delta(
+                metadata,
+                baseline,
+                baseline | {required_identity, unrelated_identity},
+            )
+
+    def test_non_rss_lock_delta_requires_a_well_formed_resolve_graph(self):
+        identity = (
+            "extra",
+            "1.0.0",
+            "registry+https://github.com/rust-lang/crates.io-index",
+            "a" * 64,
+        )
+        with self.assertRaisesRegex(
+            candidate_proof.ProofError, "no dependency resolve graph"
+        ):
+            candidate_proof.validate_non_rss_lock_delta({}, set(), {identity})
+
     def test_manifest_rejects_workspace_inheritance_and_underscore_internal(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

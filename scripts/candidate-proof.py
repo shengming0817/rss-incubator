@@ -597,6 +597,66 @@ def prepare_candidate_lock(repository: Path, env, baseline_registry_identities):
     )
 
 
+def validate_non_rss_lock_delta(metadata, baseline_identities, candidate_identities):
+    missing = baseline_identities - candidate_identities
+    if missing:
+        names = sorted(identity[0] for identity in missing)
+        raise ProofError(f"candidate lock changed baseline registry identities: {names}")
+    extra = candidate_identities - baseline_identities
+    if not extra:
+        return
+
+    packages = {package.get("id"): package for package in metadata.get("packages", [])}
+    resolve = metadata.get("resolve")
+    nodes = resolve.get("nodes") if isinstance(resolve, dict) else None
+    if not isinstance(nodes, list):
+        raise ProofError("candidate metadata has no dependency resolve graph")
+    adjacency = {}
+    for node in nodes:
+        node_id = node.get("id") if isinstance(node, dict) else None
+        dependencies = node.get("dependencies") if isinstance(node, dict) else None
+        if not isinstance(node_id, str) or not isinstance(dependencies, list) or not all(
+            isinstance(item, str) for item in dependencies
+        ):
+            raise ProofError("candidate metadata resolve graph is malformed")
+        adjacency[node_id] = dependencies
+
+    roots = {
+        package_id
+        for package_id, package in packages.items()
+        if is_rss_package_name(package.get("name"))
+        and package.get("source") == CANDIDATE_SOURCE
+    }
+    reachable = set(roots)
+    pending = list(roots)
+    while pending:
+        package_id = pending.pop()
+        for dependency_id in adjacency.get(package_id, []):
+            if dependency_id not in reachable:
+                reachable.add(dependency_id)
+                pending.append(dependency_id)
+
+    reachable_identities = {
+        (
+            package.get("name"),
+            package.get("version"),
+            package.get("source"),
+            package.get("checksum"),
+        )
+        for package_id, package in packages.items()
+        if package_id in reachable
+        and not is_rss_package_name(package.get("name"))
+        and isinstance(package.get("source"), str)
+        and package["source"].startswith("registry+")
+    }
+    unjustified = extra - reachable_identities
+    if unjustified:
+        names = sorted(identity[0] for identity in unjustified)
+        raise ProofError(
+            f"candidate lock added non-RSS identities outside the candidate dependency graph: {names}"
+        )
+
+
 def validate_resolution(repository: Path, bundle: CandidateBundle, metadata, expected_source: str):
     bundle_by_name = {package.name: package for package in bundle.packages}
     workspace_ids = set(metadata.get("workspace_members", []))
@@ -694,6 +754,11 @@ def execute(repository: Path, bundle_root: Path):
             dependencies, rewritten, bundle, CANDIDATE_SOURCE
         )
         metadata = cargo_metadata(snapshot, env, offline=True, no_deps=False)
+        validate_non_rss_lock_delta(
+            metadata,
+            baseline_registry_identities,
+            locked_registry_identities(snapshot / "Cargo.lock", include_rss=False),
+        )
         consumed = validate_resolution(
             snapshot, bundle, metadata, CANDIDATE_SOURCE
         )
