@@ -1,0 +1,14 @@
+[package]
+name = "rss-conformance-candidate-fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rss-conformance = { version = "=__RSS_CONFORMANCE_VERSION__", registry = "rss-candidate" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[lints]
+workspace = true

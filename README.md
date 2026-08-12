@@ -8,6 +8,11 @@ The current `crates/rss-consumer-smoke` package is a non-publishable Tokio/Tower
 consumes `rss-diag-context` and `rss-trace-context`. It proves only that this product-consumption seam
 works; it is not an accepted product, an official profile, a maturity claim, or a production gate.
 
+`fixtures/rss-conformance-consumer` is a committed candidate-only template. It is intentionally not
+a normal workspace member and its manifest contains no resolvable released dependency. Candidate
+proof materializes it only inside the committed-HEAD temporary snapshot, injects the exact
+file-registry `rss-conformance` version, and runs all five provider-neutral LocalTx behaviors.
+
 ## Ownership
 
 | Boundary | Owner responsibilities |
@@ -53,7 +58,7 @@ python3 scripts/candidate-proof.py --bundle /absolute/path/to/rss-candidate-bund
 
 The bundle carries the complete RSS Release Surface exact-set. The proof dynamically selects the
 subset directly consumed by this workspace, rewrites only a committed-HEAD temporary snapshot, and
-then runs Cargo metadata, check, test, and clippy with `--locked --offline`. It rejects checksum or
+then runs Cargo fmt, metadata, check, test, and clippy with `--locked --offline`. It rejects checksum or
 archive-VCS drift, missing or extra registry entries, path/Git/workspace RSS dependencies, internal
 RSS packages, and any change to the real checkout. The committed root `Cargo.lock` remains the
 released baseline; the candidate lock exists only for the proof lifetime.

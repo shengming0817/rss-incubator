@@ -104,6 +104,23 @@ def write_bundle(root: Path, names=("rss-diag-context", "rss-trace-context", "rs
 
 
 class CandidateBundleTests(unittest.TestCase):
+    def test_conformance_candidate_is_mandatory(self):
+        package = candidate_proof.CandidatePackage(
+            "rss-diag-context", "0.1.0", "aa" * 32, Path("unused")
+        )
+        bundle = candidate_proof.CandidateBundle(Path("unused"), REVISION, (package,))
+        with self.assertRaises(candidate_proof.ProofError):
+            candidate_proof.require_conformance_candidate(bundle)
+
+    def test_candidate_fixture_template_is_closed_and_complete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = root / "fixtures/rss-conformance-consumer"
+            fixture.mkdir(parents=True)
+            (fixture / "Cargo.toml.in").write_text("[package]\nname='wrong'\n", encoding="utf-8")
+            with self.assertRaises(candidate_proof.ProofError):
+                candidate_proof.validate_conformance_fixture(root)
+
     def test_valid_bundle_is_generic_and_sorted(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -394,7 +411,7 @@ class CandidateBundleTests(unittest.TestCase):
 
     def test_execute_reaches_locked_offline_matrix_and_fails_closed(self):
         package = candidate_proof.CandidatePackage(
-            "rss-diag-context", "0.1.0", "aa" * 32, Path("unused")
+            "rss-conformance", "0.1.0", "aa" * 32, Path("unused")
         )
         bundle = candidate_proof.CandidateBundle(
             Path("/synthetic-bundle"), REVISION, (package,)
@@ -404,7 +421,7 @@ class CandidateBundleTests(unittest.TestCase):
             "req": "=0.1.0",
             "source": "registry+https://github.com/rust-lang/crates.io-index",
             "kind": None,
-            "rename": "rss_diag_context",
+            "rename": "rss_conformance",
             "optional": False,
             "uses_default_features": True,
             "features": [],
@@ -443,8 +460,8 @@ class CandidateBundleTests(unittest.TestCase):
                 if metadata_calls == 1:
                     (repository / "Cargo.toml").write_text(
                         '[package]\nname = "consumer"\nversion = "0.0.0"\n'
-                        '[dependencies]\nrss_diag_context = '
-                        '{ package = "rss-diag-context", version = "=0.1.0" }\n',
+                        '[dependencies]\nrss_conformance = '
+                        '{ package = "rss-conformance", version = "=0.1.0" }\n',
                         encoding="utf-8",
                     )
                     return {
@@ -473,8 +490,10 @@ class CandidateBundleTests(unittest.TestCase):
                 mock.patch.object(candidate_proof, "cargo_metadata", side_effect=metadata),
                 mock.patch.object(candidate_proof, "validate_resolution", return_value=[package.name]),
                 mock.patch.object(candidate_proof, "run_capture", return_value=("b" * 40).encode()),
+                mock.patch.object(candidate_proof, "materialize_conformance_fixture"),
+                mock.patch.object(candidate_proof, "validate_conformance_fixture_dependency"),
             )
-            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patches[8]:
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patches[8], patches[9], patches[10]:
                 if fail_test:
                     with self.assertRaises(candidate_proof.ProofError):
                         candidate_proof.execute(Path("/real-checkout"), bundle.root)
