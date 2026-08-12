@@ -8,7 +8,8 @@ use platform_authoring_smoke::{
 use rss_contract::ContractDescriptor;
 use rss_platform::{
     AdmissionPermit, AdmissionState, ApplicationBuilder, ApplicationModule, ApplicationName,
-    ConditionStatus, Contract, DispatchError, DispatchOutcome, Dispatcher, HostView, ModuleName,
+    ConditionStatus, Contract, DispatchError, DispatchOutcome, Dispatcher, HandlerFailureClass,
+    HostView, ModuleName, TrustedContextMinter,
 };
 use rss_request_context::{
     Cancellation, CancellationFuture, CancellationObserver, CancellationReason, Deadline,
@@ -101,7 +102,7 @@ impl CancellationObserver for TestCancellation {
     }
 }
 
-fn dispatcher(host: Arc<TestHost>) -> Dispatcher {
+fn application(host: Arc<TestHost>) -> (Dispatcher, TrustedContextMinter) {
     ApplicationBuilder::new(
         ApplicationName::parse("incubator").expect("fixed application name"),
         host,
@@ -112,6 +113,7 @@ fn dispatcher(host: Arc<TestHost>) -> Dispatcher {
     )
     .build()
     .expect("unique module and contract")
+    .into_parts()
 }
 
 struct ContextFixture {
@@ -146,15 +148,17 @@ impl ContextFixture {
 
 #[tokio::test]
 async fn authored_contract_dispatches_and_reads_the_context_view() {
-    let dispatcher = dispatcher(Arc::new(TestHost::new(AdmissionState::Ready)));
+    let (dispatcher, minter) = application(Arc::new(TestHost::new(AdmissionState::Ready)));
     let fixture = ContextFixture::new(false);
     let outcome = dispatcher
         .dispatch::<CreateWidget>(
             &CreateWidget::DESCRIPTOR,
-            CreateWidgetRequest::Create {
-                name: "external-widget".to_owned(),
-            },
-            fixture.view(Instant::now() + Duration::from_secs(1)),
+            minter.admit(
+                CreateWidgetRequest::Create {
+                    name: "external-widget".to_owned(),
+                },
+                fixture.view(Instant::now() + Duration::from_secs(1)),
+            ),
         )
         .await
         .expect("ready host dispatches");
@@ -179,18 +183,20 @@ async fn authored_contract_dispatches_and_reads_the_context_view() {
 
 #[tokio::test]
 async fn handler_failure_and_descriptor_upgrade_mismatch_fail_closed() {
-    let dispatcher = dispatcher(Arc::new(TestHost::new(AdmissionState::Ready)));
+    let (dispatcher, minter) = application(Arc::new(TestHost::new(AdmissionState::Ready)));
     let fixture = ContextFixture::new(false);
     assert_eq!(
         dispatcher
             .dispatch::<CreateWidget>(
                 &CreateWidget::DESCRIPTOR,
-                CreateWidgetRequest::Fail,
-                fixture.view(Instant::now() + Duration::from_secs(1)),
+                minter.admit(
+                    CreateWidgetRequest::Fail,
+                    fixture.view(Instant::now() + Duration::from_secs(1)),
+                ),
             )
             .await
             .expect("handler failures are closed outcomes"),
-        DispatchOutcome::HandlerFailed
+        DispatchOutcome::HandlerFailed(HandlerFailureClass::Rejected)
     );
 
     let incompatible = ContractDescriptor::from_static(
@@ -202,10 +208,12 @@ async fn handler_failure_and_descriptor_upgrade_mismatch_fail_closed() {
         dispatcher
             .dispatch::<CreateWidget>(
                 &incompatible,
-                CreateWidgetRequest::Create {
-                    name: "rejected".to_owned(),
-                },
-                fixture.view(Instant::now() + Duration::from_secs(1)),
+                minter.admit(
+                    CreateWidgetRequest::Create {
+                        name: "rejected".to_owned(),
+                    },
+                    fixture.view(Instant::now() + Duration::from_secs(1)),
+                ),
             )
             .await,
         Err(DispatchError::DescriptorMismatch)
@@ -214,14 +222,16 @@ async fn handler_failure_and_descriptor_upgrade_mismatch_fail_closed() {
 
 #[tokio::test]
 async fn cancellation_and_deadline_stop_admitted_work() {
-    let dispatcher = dispatcher(Arc::new(TestHost::new(AdmissionState::Ready)));
+    let (dispatcher, minter) = application(Arc::new(TestHost::new(AdmissionState::Ready)));
     let pre_cancelled = ContextFixture::new(true);
     assert_eq!(
         dispatcher
             .dispatch::<CreateWidget>(
                 &CreateWidget::DESCRIPTOR,
-                CreateWidgetRequest::Wait,
-                pre_cancelled.view(Instant::now() + Duration::from_secs(1)),
+                minter.admit(
+                    CreateWidgetRequest::Wait,
+                    pre_cancelled.view(Instant::now() + Duration::from_secs(1)),
+                ),
             )
             .await
             .expect("pre-cancel is a closed outcome"),
@@ -233,11 +243,13 @@ async fn cancellation_and_deadline_stop_admitted_work() {
         dispatcher
             .dispatch::<CreateWidget>(
                 &CreateWidget::DESCRIPTOR,
-                CreateWidgetRequest::Wait,
-                expired.view(
-                    Instant::now()
-                        .checked_sub(Duration::from_millis(1))
-                        .expect("one millisecond is representable"),
+                minter.admit(
+                    CreateWidgetRequest::Wait,
+                    expired.view(
+                        Instant::now()
+                            .checked_sub(Duration::from_millis(1))
+                            .expect("one millisecond is representable"),
+                    ),
                 ),
             )
             .await
@@ -252,8 +264,10 @@ async fn cancellation_and_deadline_stop_admitted_work() {
     };
     let dispatch = dispatcher.dispatch::<CreateWidget>(
         &CreateWidget::DESCRIPTOR,
-        CreateWidgetRequest::Wait,
-        in_flight.view(Instant::now() + Duration::from_secs(1)),
+        minter.admit(
+            CreateWidgetRequest::Wait,
+            in_flight.view(Instant::now() + Duration::from_secs(1)),
+        ),
     );
     let (outcome, ()) = tokio::join!(dispatch, cancel);
     assert_eq!(
@@ -265,7 +279,7 @@ async fn cancellation_and_deadline_stop_admitted_work() {
 #[tokio::test]
 async fn draining_and_stopped_hosts_reject_new_admission() {
     let host = Arc::new(TestHost::new(AdmissionState::Ready));
-    let dispatcher = dispatcher(host.clone());
+    let (dispatcher, minter) = application(host.clone());
     let fixture = ContextFixture::new(false);
     for (state, expected) in [
         (AdmissionState::Draining, DispatchError::HostDraining),
@@ -276,13 +290,38 @@ async fn draining_and_stopped_hosts_reject_new_admission() {
             dispatcher
                 .dispatch::<CreateWidget>(
                     &CreateWidget::DESCRIPTOR,
-                    CreateWidgetRequest::Create {
-                        name: "rejected".to_owned(),
-                    },
-                    fixture.view(Instant::now() + Duration::from_secs(1)),
+                    minter.admit(
+                        CreateWidgetRequest::Create {
+                            name: "rejected".to_owned(),
+                        },
+                        fixture.view(Instant::now() + Duration::from_secs(1)),
+                    ),
                 )
                 .await,
             Err(expected)
         );
     }
+}
+
+#[tokio::test]
+async fn admitted_request_is_bound_to_the_owning_application() {
+    let host = Arc::new(TestHost::new(AdmissionState::Ready));
+    let (dispatcher, _) = application(Arc::clone(&host));
+    let (_, other_minter) = application(host);
+    let fixture = ContextFixture::new(false);
+
+    assert_eq!(
+        dispatcher
+            .dispatch::<CreateWidget>(
+                &CreateWidget::DESCRIPTOR,
+                other_minter.admit(
+                    CreateWidgetRequest::Create {
+                        name: "cross-instance".to_owned(),
+                    },
+                    fixture.view(Instant::now() + Duration::from_secs(1)),
+                ),
+            )
+            .await,
+        Err(DispatchError::AdmissionCapabilityMismatch)
+    );
 }
