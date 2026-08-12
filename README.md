@@ -28,11 +28,22 @@ plan, test-fixture, or governance surfaces.
 A candidate proof establishes only this repository's product-consumption seam. It does not establish
 RSS release correctness, RC status, maturity, or publish approval.
 
-## Local verification
+## Local policy verification
 
 The committed root `Cargo.lock` is the single dependency resolution for this workspace.
+Before the candidate packages are published, a fresh clone can run the same non-resolution gates as
+pull requests and pushes:
 
 ```sh
+cargo fmt --all -- --check
+python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+```
+
+The complete workspace matrix requires an exact candidate bundle and runs only through the closed
+proof entrypoint described below. Inside its temporary snapshot, the proof executes the equivalent
+of:
+
+```text
 cargo fmt --all -- --check
 cargo check --workspace --all-targets --locked
 cargo test --workspace --all-targets --locked

@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import re
 import subprocess
 import tarfile
 import tempfile
@@ -108,13 +109,12 @@ def write_bundle(root: Path, names=("rss-diag-context", "rss-trace-context", "rs
 class CandidateBundleTests(unittest.TestCase):
     def test_pr_lane_does_not_resolve_unpublished_candidate_packages(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
-        for command in (
-            "cargo check --workspace --all-targets --locked",
-            "cargo test --workspace --all-targets --locked",
-            "cargo clippy --workspace --all-targets --locked",
-        ):
-            self.assertNotIn(command, workflow)
-        self.assertIn("python3 scripts/candidate-proof.py", workflow)
+        ci_job, candidate_job = workflow.split("  candidate-proof:", maxsplit=1)
+        self.assertIsNone(re.search(r"\bcargo\s+(?:check|test|clippy)\b", ci_job))
+        self.assertIn("if: ${{ github.event_name == 'workflow_dispatch' }}", candidate_job)
+        self.assertIn("needs: ci", candidate_job)
+        self.assertEqual(workflow.count("python3 scripts/candidate-proof.py"), 1)
+        self.assertIn("python3 scripts/candidate-proof.py", candidate_job)
 
     def test_valid_bundle_is_generic_and_sorted(self):
         with tempfile.TemporaryDirectory() as directory:
