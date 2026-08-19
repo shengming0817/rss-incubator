@@ -292,7 +292,7 @@ observed_fact!(
     "Returns the opaque upstream authorization receipt reference."
 );
 
-/// An application acknowledgement is not interchangeable with a report or receipt.
+/// A command acknowledgement is not interchangeable with a report or receipt.
 ///
 /// ```compile_fail
 /// use rotation_model::{ApplicationReceiptObservation, CommandAcknowledgement};
