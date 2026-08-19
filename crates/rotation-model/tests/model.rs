@@ -1,10 +1,12 @@
 use std::any::TypeId;
 
 use rotation_model::{
-    ApplicationReceiptObservation, ApplicationReceiptRef, AuthorizationReceiptRef,
-    CommandAcknowledgement, CommandRef, CredentialReport, CredentialRevision, DeviceRef,
-    FenceEpoch, Generation, PrincipalRef, RotationAccepted, RotationCoordinates, RotationId,
-    RotationIntent, RotationModelError, TenantRef,
+    AcceptanceCondition, ApplicationReceiptObservation, ApplicationReceiptOutcome,
+    ApplicationStaleReason, ArtifactDigest, CommandAckPosition, CommandAcknowledgement,
+    CommandAcknowledgementOutcome, CommandRef, CommandRejectionReason, CredentialReport, DeviceRef,
+    DeviceSequence, FenceEpoch, Generation, IngressEnvelopeRef, PrincipalRef, ReportPosition,
+    RotationAccepted, RotationCoordinates, RotationId, RotationIntent, RotationModelError,
+    StateHash, TenantRef, UnixTimestamp,
 };
 
 #[test]
@@ -22,18 +24,23 @@ fn opaque_references_reject_blank_and_control_characters() {
 }
 
 #[test]
-fn opaque_references_preserve_product_correlation() {
+fn opaque_references_require_explicit_exposure_and_redact_debug_output() {
     let coordinates = coordinates();
     let intent = RotationIntent::new(
         coordinates.clone(),
         PrincipalRef::try_from("operator-9").expect("fixed principal reference"),
     );
 
-    assert_eq!(intent.coordinates(), &coordinates);
-    assert_eq!(intent.requested_by().as_str(), "operator-9");
-    assert_eq!(coordinates.rotation_id().as_str(), "rotation-17");
-    assert_eq!(coordinates.tenant().as_str(), "tenant-a");
-    assert_eq!(coordinates.device().as_str(), "device-42");
+    assert_eq!(intent.requested_by().expose(), "operator-9");
+    assert_eq!(coordinates.rotation_id().expose(), "rotation-17");
+    assert_eq!(coordinates.tenant().expose(), "tenant-a");
+    assert_eq!(coordinates.device().expose(), "device-42");
+
+    let formatted = format!("{intent:?}");
+    for secret in ["operator-9", "rotation-17", "tenant-a", "device-42"] {
+        assert!(!formatted.contains(secret));
+    }
+    assert!(formatted.contains("[REDACTED]"));
 }
 
 #[test]
@@ -54,49 +61,85 @@ fn generation_and_fence_epoch_are_positive() {
 }
 
 #[test]
-fn product_facts_preserve_scope_and_their_specific_evidence() {
-    let coordinates = coordinates();
-    let generation = Generation::try_from(8).expect("positive generation");
+fn accepted_rotation_matches_the_public_acceptance_shape() {
     let accepted = RotationAccepted::new(
-        coordinates.clone(),
-        generation,
-        AuthorizationReceiptRef::try_from("authorization-receipt-1")
-            .expect("fixed receipt reference"),
-    );
-    let acknowledged = CommandAcknowledgement::new(
-        coordinates.clone(),
-        generation,
-        CommandRef::try_from("command-3").expect("fixed command reference"),
-    );
-    let reported = CredentialReport::new(
-        coordinates.clone(),
-        generation,
-        CredentialRevision::try_from("credential-revision-4").expect("fixed credential revision"),
-    );
-    let receipted = ApplicationReceiptObservation::new(
-        coordinates.clone(),
-        generation,
-        ApplicationReceiptRef::try_from("application-receipt-5").expect("fixed receipt reference"),
+        coordinates(),
+        Generation::try_from(8).expect("positive generation"),
+        AcceptanceCondition::PendingDevice,
     );
 
-    assert_eq!(accepted.coordinates(), &coordinates);
-    assert_eq!(accepted.generation(), generation);
-    assert_eq!(
-        accepted.authorization_receipt().as_str(),
-        "authorization-receipt-1"
+    assert_eq!(accepted.coordinates(), &coordinates());
+    assert_eq!(accepted.accepted_generation().get(), 8);
+    assert_eq!(accepted.condition(), AcceptanceCondition::PendingDevice);
+}
+
+#[test]
+fn acknowledgement_preserves_fence_sequence_outcome_and_time() {
+    let acknowledged = CommandAcknowledgement::new(
+        coordinates(),
+        CommandRef::try_from("command-3").expect("fixed command reference"),
+        CommandAckPosition::new(
+            Generation::try_from(8).expect("positive generation"),
+            FenceEpoch::try_from(2).expect("positive fence"),
+            DeviceSequence::new(13),
+            UnixTimestamp::new(1_725_000_000),
+        ),
+        CommandAcknowledgementOutcome::Rejected(CommandRejectionReason::FenceEpochStale),
     );
-    assert_eq!(acknowledged.coordinates(), &coordinates);
-    assert_eq!(acknowledged.generation(), generation);
-    assert_eq!(acknowledged.command().as_str(), "command-3");
-    assert_eq!(reported.coordinates(), &coordinates);
-    assert_eq!(reported.generation(), generation);
+
+    assert_eq!(acknowledged.command().expose(), "command-3");
+    assert_eq!(acknowledged.desired_generation().get(), 8);
+    assert_eq!(acknowledged.fence_epoch().get(), 2);
+    assert_eq!(acknowledged.device_sequence().get(), 13);
     assert_eq!(
-        reported.credential_revision().as_str(),
-        "credential-revision-4"
+        acknowledged.outcome(),
+        CommandAcknowledgementOutcome::Rejected(CommandRejectionReason::FenceEpochStale)
     );
-    assert_eq!(receipted.coordinates(), &coordinates);
-    assert_eq!(receipted.generation(), generation);
-    assert_eq!(receipted.receipt().as_str(), "application-receipt-5");
+    assert_eq!(acknowledged.observed_at().get(), 1_725_000_000);
+}
+
+#[test]
+fn credential_report_preserves_observed_state_discriminants() {
+    let report = CredentialReport::new(
+        coordinates(),
+        ReportPosition::new(
+            Generation::try_from(8).expect("positive generation"),
+            FenceEpoch::try_from(2).expect("positive fence"),
+            DeviceSequence::new(14),
+            UnixTimestamp::new(1_725_000_010),
+        ),
+        StateHash::try_from("sha256:state").expect("fixed state hash"),
+        ArtifactDigest::try_from("sha256:artifact").expect("fixed artifact digest"),
+        Some(UnixTimestamp::new(1_725_100_000)),
+    );
+
+    assert_eq!(report.observed_generation().get(), 8);
+    assert_eq!(report.fence_epoch().get(), 2);
+    assert_eq!(report.device_sequence().get(), 14);
+    assert_eq!(report.state_hash().expose(), "sha256:state");
+    assert_eq!(report.artifact_digest().expose(), "sha256:artifact");
+    assert_eq!(
+        report.expires_at().map(UnixTimestamp::get),
+        Some(1_725_100_000)
+    );
+    assert_eq!(report.observed_at().get(), 1_725_000_010);
+}
+
+#[test]
+fn application_receipt_has_no_generation_and_preserves_its_outcome() {
+    let receipt = ApplicationReceiptObservation::new(
+        coordinates(),
+        IngressEnvelopeRef::try_from("envelope-5").expect("fixed ingress envelope"),
+        ApplicationReceiptOutcome::Stale(ApplicationStaleReason::DeviceSequenceStale),
+        UnixTimestamp::new(1_725_000_020),
+    );
+
+    assert_eq!(receipt.ingress_envelope().expose(), "envelope-5");
+    assert_eq!(
+        receipt.outcome(),
+        ApplicationReceiptOutcome::Stale(ApplicationStaleReason::DeviceSequenceStale)
+    );
+    assert_eq!(receipt.committed_at().get(), 1_725_000_020);
 }
 
 #[test]

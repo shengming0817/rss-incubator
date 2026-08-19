@@ -44,6 +44,7 @@ The committed root `Cargo.lock` is the single dependency resolution for this wor
 cargo fmt --all -- --check
 cargo check --workspace --all-targets --locked
 cargo test --workspace --all-targets --locked
+cargo test --workspace --doc --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 

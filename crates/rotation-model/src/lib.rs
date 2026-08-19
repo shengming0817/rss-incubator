@@ -10,7 +10,7 @@ pub enum RotationModelError {
     EmptyReference { kind: &'static str },
     /// An opaque reference contained a control character.
     ControlCharacter { kind: &'static str },
-    /// An accepted generation must be greater than zero.
+    /// A generation must be greater than zero.
     ZeroGeneration,
     /// A fence epoch must be greater than zero.
     ZeroFenceEpoch,
@@ -34,13 +34,13 @@ impl std::error::Error for RotationModelError {}
 macro_rules! opaque_reference {
     ($name:ident, $kind:literal, $description:literal) => {
         #[doc = $description]
-        #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
         pub struct $name(String);
 
         impl $name {
-            /// Returns the reference exactly as supplied by its owning boundary.
+            /// Explicitly exposes the value to a controlled mapping or serialization boundary.
             #[must_use]
-            pub fn as_str(&self) -> &str {
+            pub fn expose(&self) -> &str {
                 &self.0
             }
         }
@@ -63,9 +63,9 @@ macro_rules! opaque_reference {
             }
         }
 
-        impl fmt::Display for $name {
+        impl fmt::Debug for $name {
             fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str(&self.0)
+                formatter.write_str(concat!(stringify!($name), "([REDACTED])"))
             }
         }
     };
@@ -92,24 +92,24 @@ opaque_reference!(
     "Opaque requester reference that does not establish authentication."
 );
 opaque_reference!(
-    AuthorizationReceiptRef,
-    "authorization_receipt_ref",
-    "Opaque reference to an authorization receipt issued outside this model."
-);
-opaque_reference!(
     CommandRef,
     "command_ref",
     "Opaque reference to a device command issued outside this model."
 );
 opaque_reference!(
-    ApplicationReceiptRef,
-    "application_receipt_ref",
-    "Opaque reference to an application ingress receipt."
+    IngressEnvelopeRef,
+    "ingress_envelope_ref",
+    "Opaque correlation reference for a receipted inbound envelope."
 );
 opaque_reference!(
-    CredentialRevision,
-    "credential_revision",
-    "Opaque non-secret reference to a credential revision."
+    StateHash,
+    "state_hash",
+    "Opaque state hash observed through the public contract boundary."
+);
+opaque_reference!(
+    ArtifactDigest,
+    "artifact_digest",
+    "Opaque non-secret artifact digest observed through the public contract boundary."
 );
 
 fn validate_reference(value: &str, kind: &'static str) -> Result<(), RotationModelError> {
@@ -166,7 +166,43 @@ impl TryFrom<u64> for FenceEpoch {
     }
 }
 
-/// Stable product coordinates shared by every observed rotation fact.
+/// Monotonic device sequence from an ACK or reported observation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DeviceSequence(u64);
+
+impl DeviceSequence {
+    /// Creates a sequence value. Zero is valid at the public contract boundary.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the sequence value.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Contract timestamp represented as signed Unix time without transport encoding.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct UnixTimestamp(i64);
+
+impl UnixTimestamp {
+    /// Creates a timestamp value.
+    #[must_use]
+    pub const fn new(value: i64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the signed Unix timestamp.
+    #[must_use]
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
+
+/// Stable product coordinates shared by correlated rotation observations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RotationCoordinates {
     rotation_id: RotationId,
@@ -234,63 +270,111 @@ impl RotationIntent {
     }
 }
 
-macro_rules! observed_fact {
-    (
-        $name:ident,
-        $description:literal,
-        $field:ident: $field_type:ty,
-        $field_description:literal
-    ) => {
-        #[doc = $description]
-        #[derive(Clone, Debug, Eq, PartialEq)]
-        pub struct $name {
-            coordinates: RotationCoordinates,
-            generation: Generation,
-            $field: $field_type,
-        }
-
-        impl $name {
-            /// Creates a product observation without minting upstream authority.
-            #[must_use]
-            pub const fn new(
-                coordinates: RotationCoordinates,
-                generation: Generation,
-                $field: $field_type,
-            ) -> Self {
-                Self {
-                    coordinates,
-                    generation,
-                    $field,
-                }
-            }
-
-            /// Returns the rotation coordinates.
-            #[must_use]
-            pub const fn coordinates(&self) -> &RotationCoordinates {
-                &self.coordinates
-            }
-
-            /// Returns the upstream-observed generation.
-            #[must_use]
-            pub const fn generation(&self) -> Generation {
-                self.generation
-            }
-
-            #[doc = $field_description]
-            #[must_use]
-            pub const fn $field(&self) -> &$field_type {
-                &self.$field
-            }
-        }
-    };
+/// Closed condition returned when desired policy is accepted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AcceptanceCondition {
+    /// Upstream reconciliation is in progress.
+    Reconciling,
+    /// Upstream is waiting for the device.
+    PendingDevice,
 }
 
-observed_fact!(
-    RotationAccepted,
-    "Observed upstream acceptance; it does not authorize local policy decisions.",
-    authorization_receipt: AuthorizationReceiptRef,
-    "Returns the opaque upstream authorization receipt reference."
-);
+/// Product projection of the public policy acceptance response.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RotationAccepted {
+    coordinates: RotationCoordinates,
+    accepted_generation: Generation,
+    condition: AcceptanceCondition,
+}
+
+impl RotationAccepted {
+    /// Creates a shape-validated projection without establishing authenticated provenance.
+    #[must_use]
+    pub const fn new(
+        coordinates: RotationCoordinates,
+        accepted_generation: Generation,
+        condition: AcceptanceCondition,
+    ) -> Self {
+        Self {
+            coordinates,
+            accepted_generation,
+            condition,
+        }
+    }
+
+    /// Returns the rotation coordinates.
+    #[must_use]
+    pub const fn coordinates(&self) -> &RotationCoordinates {
+        &self.coordinates
+    }
+
+    /// Returns the accepted desired generation.
+    #[must_use]
+    pub const fn accepted_generation(&self) -> Generation {
+        self.accepted_generation
+    }
+
+    /// Returns the upstream acceptance condition.
+    #[must_use]
+    pub const fn condition(&self) -> AcceptanceCondition {
+        self.condition
+    }
+}
+
+/// Rejection reasons preserved from the public command acknowledgement contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandRejectionReason {
+    /// The referenced artifact was unavailable.
+    ArtifactUnavailable,
+    /// The artifact digest did not match.
+    ArtifactDigestMismatch,
+    /// Device policy rejected the command.
+    PolicyRejected,
+    /// The desired generation was stale.
+    GenerationStale,
+    /// The fence epoch was stale.
+    FenceEpochStale,
+    /// The command was malformed.
+    MalformedCommand,
+    /// The device failed while handling the command.
+    DeviceFailure,
+}
+
+/// Closed result of a device command acknowledgement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandAcknowledgementOutcome {
+    /// The device received the command.
+    Received,
+    /// The device rejected the command for the attached reason.
+    Rejected(CommandRejectionReason),
+}
+
+/// Position fields carried by the command acknowledgement contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommandAckPosition {
+    desired_generation: Generation,
+    fence_epoch: FenceEpoch,
+    device_sequence: DeviceSequence,
+    observed_at: UnixTimestamp,
+}
+
+impl CommandAckPosition {
+    /// Creates the preserved ACK position without advancing authoritative state.
+    #[must_use]
+    pub const fn new(
+        desired_generation: Generation,
+        fence_epoch: FenceEpoch,
+        device_sequence: DeviceSequence,
+        observed_at: UnixTimestamp,
+    ) -> Self {
+        Self {
+            desired_generation,
+            fence_epoch,
+            device_sequence,
+            observed_at,
+        }
+    }
+}
 
 /// A command acknowledgement is not interchangeable with a report or receipt.
 ///
@@ -305,22 +389,25 @@ observed_fact!(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandAcknowledgement {
     coordinates: RotationCoordinates,
-    generation: Generation,
     command: CommandRef,
+    position: CommandAckPosition,
+    outcome: CommandAcknowledgementOutcome,
 }
 
 impl CommandAcknowledgement {
-    /// Creates an ACK observation without deriving readiness.
+    /// Creates an ACK projection without deriving readiness or trusted provenance.
     #[must_use]
     pub const fn new(
         coordinates: RotationCoordinates,
-        generation: Generation,
         command: CommandRef,
+        position: CommandAckPosition,
+        outcome: CommandAcknowledgementOutcome,
     ) -> Self {
         Self {
             coordinates,
-            generation,
             command,
+            position,
+            outcome,
         }
     }
 
@@ -330,29 +417,230 @@ impl CommandAcknowledgement {
         &self.coordinates
     }
 
-    /// Returns the acknowledged generation.
-    #[must_use]
-    pub const fn generation(&self) -> Generation {
-        self.generation
-    }
-
     /// Returns the opaque command reference.
     #[must_use]
     pub const fn command(&self) -> &CommandRef {
         &self.command
     }
+
+    /// Returns the desired generation carried by the ACK.
+    #[must_use]
+    pub const fn desired_generation(&self) -> Generation {
+        self.position.desired_generation
+    }
+
+    /// Returns the fence epoch carried by the ACK.
+    #[must_use]
+    pub const fn fence_epoch(&self) -> FenceEpoch {
+        self.position.fence_epoch
+    }
+
+    /// Returns the device sequence carried by the ACK.
+    #[must_use]
+    pub const fn device_sequence(&self) -> DeviceSequence {
+        self.position.device_sequence
+    }
+
+    /// Returns the closed ACK outcome.
+    #[must_use]
+    pub const fn outcome(&self) -> CommandAcknowledgementOutcome {
+        self.outcome
+    }
+
+    /// Returns the ACK observation time.
+    #[must_use]
+    pub const fn observed_at(&self) -> UnixTimestamp {
+        self.position.observed_at
+    }
 }
 
-observed_fact!(
-    CredentialReport,
-    "Observed device credential report; it does not advance authoritative state.",
-    credential_revision: CredentialRevision,
-    "Returns the reported non-secret credential revision reference."
-);
+/// Position fields carried by the reported-state contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReportPosition {
+    observed_generation: Generation,
+    fence_epoch: FenceEpoch,
+    device_sequence: DeviceSequence,
+    observed_at: UnixTimestamp,
+}
 
-observed_fact!(
-    ApplicationReceiptObservation,
-    "Observed application receipt; readiness remains an upstream status concern.",
-    receipt: ApplicationReceiptRef,
-    "Returns the opaque application receipt reference."
-);
+impl ReportPosition {
+    /// Creates a reported position without advancing authoritative state.
+    #[must_use]
+    pub const fn new(
+        observed_generation: Generation,
+        fence_epoch: FenceEpoch,
+        device_sequence: DeviceSequence,
+        observed_at: UnixTimestamp,
+    ) -> Self {
+        Self {
+            observed_generation,
+            fence_epoch,
+            device_sequence,
+            observed_at,
+        }
+    }
+}
+
+/// Product projection of a device credential report.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredentialReport {
+    coordinates: RotationCoordinates,
+    position: ReportPosition,
+    state_hash: StateHash,
+    artifact_digest: ArtifactDigest,
+    expires_at: Option<UnixTimestamp>,
+}
+
+impl CredentialReport {
+    /// Creates a report projection without advancing authoritative state.
+    #[must_use]
+    pub const fn new(
+        coordinates: RotationCoordinates,
+        position: ReportPosition,
+        state_hash: StateHash,
+        artifact_digest: ArtifactDigest,
+        expires_at: Option<UnixTimestamp>,
+    ) -> Self {
+        Self {
+            coordinates,
+            position,
+            state_hash,
+            artifact_digest,
+            expires_at,
+        }
+    }
+
+    /// Returns the rotation coordinates.
+    #[must_use]
+    pub const fn coordinates(&self) -> &RotationCoordinates {
+        &self.coordinates
+    }
+
+    /// Returns the observed generation.
+    #[must_use]
+    pub const fn observed_generation(&self) -> Generation {
+        self.position.observed_generation
+    }
+
+    /// Returns the observed fence epoch.
+    #[must_use]
+    pub const fn fence_epoch(&self) -> FenceEpoch {
+        self.position.fence_epoch
+    }
+
+    /// Returns the observed device sequence.
+    #[must_use]
+    pub const fn device_sequence(&self) -> DeviceSequence {
+        self.position.device_sequence
+    }
+
+    /// Returns the opaque state hash.
+    #[must_use]
+    pub const fn state_hash(&self) -> &StateHash {
+        &self.state_hash
+    }
+
+    /// Returns the opaque artifact digest.
+    #[must_use]
+    pub const fn artifact_digest(&self) -> &ArtifactDigest {
+        &self.artifact_digest
+    }
+
+    /// Returns the optional upstream expiry time.
+    #[must_use]
+    pub const fn expires_at(&self) -> Option<UnixTimestamp> {
+        self.expires_at
+    }
+
+    /// Returns the report observation time.
+    #[must_use]
+    pub const fn observed_at(&self) -> UnixTimestamp {
+        self.position.observed_at
+    }
+}
+
+/// Reasons paired with a stale application receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApplicationStaleReason {
+    /// The desired generation was stale.
+    GenerationStale,
+    /// The fence epoch was stale.
+    FenceEpochStale,
+    /// The device sequence was stale.
+    DeviceSequenceStale,
+}
+
+/// Reasons paired with a rejected application receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApplicationRejectionReason {
+    /// Desired policy had not been accepted.
+    NotAccepted,
+    /// The inbound payload failed schema validation.
+    SchemaRejected,
+    /// The inbound payload violated the protocol.
+    ProtocolViolation,
+}
+
+/// Closed application ingress outcome with only valid reason pairings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApplicationReceiptOutcome {
+    /// The inbound observation was committed.
+    Committed,
+    /// The inbound observation was already committed.
+    Duplicate,
+    /// The inbound observation was stale for the attached reason.
+    Stale(ApplicationStaleReason),
+    /// The inbound observation was rejected for the attached reason.
+    Rejected(ApplicationRejectionReason),
+}
+
+/// Product projection of an application ingress receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApplicationReceiptObservation {
+    coordinates: RotationCoordinates,
+    ingress_envelope: IngressEnvelopeRef,
+    outcome: ApplicationReceiptOutcome,
+    committed_at: UnixTimestamp,
+}
+
+impl ApplicationReceiptObservation {
+    /// Creates a receipt projection without deriving readiness or trusted provenance.
+    #[must_use]
+    pub const fn new(
+        coordinates: RotationCoordinates,
+        ingress_envelope: IngressEnvelopeRef,
+        outcome: ApplicationReceiptOutcome,
+        committed_at: UnixTimestamp,
+    ) -> Self {
+        Self {
+            coordinates,
+            ingress_envelope,
+            outcome,
+            committed_at,
+        }
+    }
+
+    /// Returns the rotation coordinates.
+    #[must_use]
+    pub const fn coordinates(&self) -> &RotationCoordinates {
+        &self.coordinates
+    }
+
+    /// Returns correlation to the receipted inbound envelope.
+    #[must_use]
+    pub const fn ingress_envelope(&self) -> &IngressEnvelopeRef {
+        &self.ingress_envelope
+    }
+
+    /// Returns the closed application outcome.
+    #[must_use]
+    pub const fn outcome(&self) -> ApplicationReceiptOutcome {
+        self.outcome
+    }
+
+    /// Returns the durable ingress commit time.
+    #[must_use]
+    pub const fn committed_at(&self) -> UnixTimestamp {
+        self.committed_at
+    }
+}
