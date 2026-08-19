@@ -8,6 +8,16 @@ The current `crates/rss-consumer-smoke` package is a non-publishable Tokio/Tower
 consumes `rss-diag-context` and `rss-trace-context`. It proves only that this product-consumption seam
 works; it is not an accepted product, an official profile, a maturity claim, or a production gate.
 
+## Incubating products
+
+The [Secure Device Credential Rotation](docs/secure-device-credential-rotation.md) skeleton is an
+accepted incubation scope. Its `rotation-model` package contains only transport-neutral product
+correlation and observation facts. The future registry client, control CLI, reference device agent,
+reference deployment, and external T2 journey retain separate implementation owners.
+
+The rotation product does not absorb `rss-consumer-smoke`. The observability smoke remains an
+independent compatibility proof and supplies no identity, authorization, or device-state authority.
+
 ## Ownership
 
 | Boundary | Owner responsibilities |
@@ -23,9 +33,8 @@ must not use path, Git, workspace, submodule, vendored, internal, generated, pro
 plan, test-fixture, or governance surfaces.
 
 A candidate proof establishes only this repository's product-consumption seam. It does not establish
-RSS release correctness, RC status, maturity, or publish approval. Until Azure PBI 2095 establishes the
-incubator-owned CI and candidate first-green, the ADR-026 legacy carrier remains transitional; this
-change does not perform that cutover.
+RSS release correctness, RC status, maturity, or publish approval. The ADR-026 ownership cutover is
+complete: this repository owns the consumer proof and RSS retains the Release Surface artifact proof.
 
 ## Local verification
 
@@ -35,6 +44,7 @@ The committed root `Cargo.lock` is the single dependency resolution for this wor
 cargo fmt --all -- --check
 cargo check --workspace --all-targets --locked
 cargo test --workspace --all-targets --locked
+cargo test --workspace --doc --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 

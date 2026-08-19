@@ -256,6 +256,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rotation-model"
+version = "0.0.0"
+
+[[package]]
 name = "rss-consumer-smoke"
 version = "0.0.0"
 dependencies = [
