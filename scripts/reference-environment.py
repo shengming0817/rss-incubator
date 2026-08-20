@@ -359,6 +359,7 @@ class ReferenceEnvironment:
         if not self.env_file.is_file():
             raise ReferenceEnvironmentError("runtime environment is missing; run `up` first")
         self.load_runtime_values()
+        self.verify_resource_ownership()
 
     def load_runtime_values(self) -> None:
         values = read_env_file(self.env_file)
@@ -2054,7 +2055,6 @@ SELECT json_build_object(
                 )
             return
         self.require_state()
-        self.verify_resource_ownership()
         self.compose("down", "--volumes", "--remove-orphans", "--timeout", "10", timeout=90)
         remaining = self.project_resources()
         if any(remaining.values()):

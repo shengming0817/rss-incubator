@@ -284,6 +284,22 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
             ), self.assertRaises(module.ReferenceEnvironmentError):
                 environment.initialize_state()
 
+    def test_existing_state_checks_resource_ownership_at_the_shared_funnel(self):
+        module = load_reference_environment()
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            environment = object.__new__(module.ReferenceEnvironment)
+            environment.project = "valid-project"
+            environment.state = state
+            environment.env_file = state / "runtime.env"
+            environment.env_file.touch()
+            calls = []
+            environment.load_runtime_values = lambda: calls.append("runtime")
+            environment.verify_resource_ownership = lambda: calls.append("ownership")
+            with mock.patch.object(module, "validate_sentinel"):
+                environment.require_state()
+        self.assertEqual(["runtime", "ownership"], calls)
+
     def test_mqtt_v5_denial_is_not_confused_with_cli_success(self):
         module = load_reference_environment()
         denied = subprocess.CompletedProcess(
