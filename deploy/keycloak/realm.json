@@ -1,0 +1,70 @@
+{
+  "realm": "rss-device-security",
+  "enabled": true,
+  "displayName": "RSS Device Security Reference",
+  "registrationAllowed": false,
+  "resetPasswordAllowed": false,
+  "rememberMe": false,
+  "roles": {
+    "realm": [
+      {"name": "rotation-operator"},
+      {"name": "deviceidentity-service"}
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "rotation-control",
+      "name": "Rotation Control",
+      "enabled": true,
+      "publicClient": true,
+      "directAccessGrantsEnabled": true,
+      "standardFlowEnabled": true,
+      "redirectUris": ["http://127.0.0.1:8765/callback"],
+      "attributes": {"pkce.code.challenge.method": "S256"},
+      "protocol": "openid-connect",
+      "protocolMappers": [
+        {
+          "name": "tenant-id",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "tenantId",
+            "claim.name": "tenantId",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "deviceidentity",
+      "name": "Device Identity Service",
+      "enabled": true,
+      "publicClient": false,
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "protocol": "openid-connect",
+      "protocolMappers": []
+    }
+  ],
+  "users": [
+    {
+      "username": "reference-operator",
+      "enabled": true,
+      "firstName": "Reference",
+      "lastName": "Operator",
+      "emailVerified": true,
+      "email": "operator@reference.invalid",
+      "attributes": {
+        "tenantId": ["{{tenantId}}"]
+      },
+      "requiredActions": [],
+      "realmRoles": ["rotation-operator"]
+    }
+  ]
+}

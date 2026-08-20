@@ -1,0 +1,175 @@
+services:
+  vault:
+    image: hashicorp/vault:2.0.3@sha256:a296a888b118615dc01d5f1a6846e6d4a7277946caaed5b447008fff5fe06b54
+    cap_drop: [ALL]
+    user: ${HOST_UID:?host uid is required}:${HOST_GID:?host gid is required}
+    entrypoint: [/bin/sh, -ec]
+    command:
+      - >-
+        set -o pipefail;
+        vault server -dev -dev-no-store-token -dev-tls
+        -dev-tls-cert-dir=/reference-state/vault-tls
+        -dev-listen-address=0.0.0.0:8200 2>&1 |
+        sed -e "s/$${VAULT_DEV_ROOT_TOKEN_ID}/<redacted-root-token>/g"
+        -e "s/^Unseal Key:.*/Unseal Key: <redacted-unseal-key>/"
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_ROOT_TOKEN:?runtime Vault token is required}
+      VAULT_ADDR: https://127.0.0.1:8200
+      VAULT_CACERT: /reference-state/vault-tls/vault-ca.pem
+    healthcheck:
+      test: [CMD-SHELL, "VAULT_TOKEN=$$VAULT_DEV_ROOT_TOKEN_ID vault status >/dev/null"]
+      interval: 2s
+      timeout: 2s
+      retries: 45
+    ports:
+      - target: 8200
+        published: ${VAULT_PORT:-18200}
+        host_ip: 127.0.0.1
+        protocol: tcp
+    volumes:
+      - type: bind
+        source: ${REFERENCE_STATE:?runtime state path is required}/vault-tls
+        target: /reference-state/vault-tls
+      - type: bind
+        source: ${REFERENCE_STATE:?runtime state path is required}/pki
+        target: /reference-state/pki
+      - type: bind
+        source: ./vault
+        target: /reference-config/vault
+        read_only: true
+    security_opt: [no-new-privileges:true]
+    labels:
+      rss.reference.owner: ${REFERENCE_OWNER:?runtime owner is required}
+
+  postgres:
+    image: postgres:18.4-bookworm@sha256:882236b897e39051d2368c5ccc6cda944904723506b2dfc97f2a8f5bc9afa382
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?runtime PostgreSQL password is required}
+      POSTGRES_DB: postgres
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U postgres -d postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 45
+    volumes:
+      - postgres-data:/var/lib/postgresql
+      - type: bind
+        source: ./postgres
+        target: /reference-config/postgres
+        read_only: true
+    security_opt: [no-new-privileges:true]
+    labels:
+      rss.reference.owner: ${REFERENCE_OWNER:?runtime owner is required}
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.7.0@sha256:0f198be292568439d700cdbfb893e69a6009bb43a94a06a945b1d3d506c76b13
+    user: ${HOST_UID:?host uid is required}:0
+    command:
+      - start
+      - --health-enabled=true
+      - --http-enabled=false
+      - --https-certificate-file=/reference-state/pki/keycloak.crt
+      - --https-certificate-key-file=/reference-state/pki/keycloak.key
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: reference-admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?runtime Keycloak password is required}
+      KC_DB: postgres
+      KC_DB_URL_HOST: postgres
+      KC_DB_URL_PORT: "5432"
+      KC_DB_URL_DATABASE: keycloak
+      KC_DB_USERNAME: keycloak_owner
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?runtime Keycloak database password is required}
+      KC_HEALTH_ENABLED: "true"
+      KC_HTTP_ENABLED: "false"
+      KC_HOSTNAME_STRICT: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, /bin/bash, -c, "exec 3<>/dev/tcp/127.0.0.1/9000"]
+      interval: 3s
+      timeout: 2s
+      retries: 60
+    ports:
+      - target: 8443
+        published: ${KEYCLOAK_PORT:-18080}
+        host_ip: 127.0.0.1
+        protocol: tcp
+    volumes:
+      - type: bind
+        source: ./keycloak
+        target: /reference-config/keycloak
+        read_only: true
+      - type: bind
+        source: ${REFERENCE_STATE:?runtime state path is required}/pki/ca.pem
+        target: /reference-state/pki/ca.pem
+        read_only: true
+      - type: bind
+        source: ${REFERENCE_STATE:?runtime state path is required}/pki/keycloak.crt
+        target: /reference-state/pki/keycloak.crt
+        read_only: true
+      - type: bind
+        source: ${REFERENCE_STATE:?runtime state path is required}/pki/keycloak.key
+        target: /reference-state/pki/keycloak.key
+        read_only: true
+    security_opt: [no-new-privileges:true]
+    labels:
+      rss.reference.owner: ${REFERENCE_OWNER:?runtime owner is required}
+
+  mosquitto:
+    image: eclipse-mosquitto:2.0.22-openssl@sha256:212f89e1eaeb2c322d6441b64396e3346026674db8fa9c27beac293405c32b3c
+    user: ${HOST_UID:?host uid is required}:${HOST_GID:?host gid is required}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          mosquitto_pub -V mqttv5 -h localhost -p 8883
+          --cafile /reference-state/pki/ca.pem -q 1
+          -t health/readiness -m health >/tmp/reference-health.log 2>&1;
+          test "$$?" -eq 7
+      interval: 3s
+      timeout: 4s
+      retries: 30
+    ports:
+      - target: 8883
+        published: ${MQTT_PORT:-18883}
+        host_ip: 127.0.0.1
+        protocol: tcp
+    volumes:
+      - type: bind
+        source: ${REFERENCE_STATE:?runtime state path is required}/mosquitto-data
+        target: /mosquitto/data
+      - type: bind
+        source: ./mosquitto/mosquitto.conf
+        target: /mosquitto/config/mosquitto.conf
+        read_only: true
+      - type: bind
+        source: ${REFERENCE_STATE:?runtime state path is required}/pki/ca.pem
+        target: /reference-state/pki/ca.pem
+        read_only: true
+      - type: bind
+        source: ${REFERENCE_STATE:?runtime state path is required}/pki/server.crt
+        target: /reference-state/pki/server.crt
+        read_only: true
+      - type: bind
+        source: ${REFERENCE_STATE:?runtime state path is required}/pki/server.key
+        target: /reference-state/pki/server.key
+        read_only: true
+      - type: bind
+        source: ${REFERENCE_STATE:?runtime state path is required}/mosquitto
+        target: /reference-state/mosquitto
+        read_only: true
+    security_opt: [no-new-privileges:true]
+    labels:
+      rss.reference.owner: ${REFERENCE_OWNER:?runtime owner is required}
+
+volumes:
+  postgres-data:
+    labels:
+      rss.reference.owner: ${REFERENCE_OWNER:?runtime owner is required}
+
+networks:
+  default:
+    labels:
+      rss.reference.owner: ${REFERENCE_OWNER:?runtime owner is required}

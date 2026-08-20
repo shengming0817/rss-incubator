@@ -1,0 +1,50 @@
+{
+  "mount": "device-pki",
+  "ca": {
+    "commonName": "RSS Device Security Reference CA",
+    "ttl": "8760h"
+  },
+  "roles": {
+    "mosquitto-server": {
+      "allowed_domains": ["mosquitto", "localhost"],
+      "allow_bare_domains": true,
+      "allow_subdomains": false,
+      "allow_ip_sans": false,
+      "server_flag": true,
+      "client_flag": false,
+      "ttl": "{{validitySeconds}}s",
+      "max_ttl": "24h"
+    },
+    "keycloak-server": {
+      "allowed_domains": ["localhost"],
+      "allow_bare_domains": true,
+      "allow_subdomains": false,
+      "allow_ip_sans": false,
+      "server_flag": true,
+      "client_flag": false,
+      "ttl": "{{validitySeconds}}s",
+      "max_ttl": "24h"
+    },
+    "mqtt-device": {
+      "allowed_domains": ["reference-device"],
+      "allowed_uri_sans": ["urn:rss:mqtt-device:v1:{{tenantId}}:{{deviceId}}:{{generation}}"],
+      "allow_bare_domains": true,
+      "allow_subdomains": false,
+      "allow_ip_sans": false,
+      "server_flag": false,
+      "client_flag": true,
+      "ttl": "{{validitySeconds}}s",
+      "max_ttl": "24h"
+    },
+    "mqtt-service": {
+      "allowed_domains": ["deviceidentity-service"],
+      "allow_bare_domains": true,
+      "allow_subdomains": false,
+      "allow_ip_sans": false,
+      "server_flag": false,
+      "client_flag": true,
+      "ttl": "{{validitySeconds}}s",
+      "max_ttl": "24h"
+    }
+  }
+}
