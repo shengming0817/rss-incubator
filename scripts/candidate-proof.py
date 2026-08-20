@@ -28,6 +28,9 @@ SEMVER = re.compile(
 )
 LOWER_HEX_40 = re.compile(r"[0-9a-f]{40}\Z")
 LOWER_HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
+CANDIDATE_REGISTRY_URL = "https://rss-candidate.invalid/index"
+CANDIDATE_SOURCE = f"registry+{CANDIDATE_REGISTRY_URL}"
+CANDIDATE_WORKSPACE_MEMBER = "crates/platform-authoring-smoke"
 
 
 class ProofError(RuntimeError):
@@ -241,6 +244,141 @@ def manifest_dependency_tables(manifest):
                     yield table
 
 
+def manifest_dependency_entries(manifest):
+    kinds = {
+        "dependencies": None,
+        "dev-dependencies": "dev",
+        "build-dependencies": "build",
+    }
+    for key, kind in kinds.items():
+        table = manifest.get(key, {})
+        if isinstance(table, dict):
+            yield None, kind, table
+    targets = manifest.get("target", {})
+    if isinstance(targets, dict):
+        for target, target_manifest in targets.items():
+            if not isinstance(target_manifest, dict):
+                continue
+            for key, kind in kinds.items():
+                table = target_manifest.get(key, {})
+                if isinstance(table, dict):
+                    yield target, kind, table
+
+
+def workspace_member_manifests(repository: Path):
+    root_manifest_path = repository / "Cargo.toml"
+    try:
+        root_manifest = tomllib.loads(root_manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        raise ProofError(f"cannot inspect root workspace manifest: {error}") from error
+    workspace = root_manifest.get("workspace")
+    members = workspace.get("members") if isinstance(workspace, dict) else None
+    excludes = workspace.get("exclude", []) if isinstance(workspace, dict) else []
+    if not isinstance(members, list) or not members or not all(isinstance(item, str) for item in members):
+        raise ProofError("workspace members must be a non-empty string array")
+    if not isinstance(excludes, list) or not all(isinstance(item, str) for item in excludes):
+        raise ProofError("workspace exclude must be a string array")
+
+    excluded = set()
+    for pattern in excludes:
+        if Path(pattern).is_absolute() or ".." in Path(pattern).parts:
+            raise ProofError(f"workspace exclude pattern is unsafe: {pattern}")
+        excluded.update(path.resolve() for path in repository.glob(pattern))
+
+    manifests = set()
+    for pattern in members:
+        if Path(pattern).is_absolute() or ".." in Path(pattern).parts:
+            raise ProofError(f"workspace member pattern is unsafe: {pattern}")
+        matches = sorted(repository.glob(pattern))
+        if not matches:
+            raise ProofError(f"workspace member pattern matched nothing: {pattern}")
+        for member in matches:
+            if member.resolve() in excluded:
+                continue
+            manifest = member / "Cargo.toml" if member.is_dir() else member
+            if manifest.name != "Cargo.toml" or not manifest.is_file() or manifest.is_symlink():
+                raise ProofError(f"workspace member has no safe manifest: {member}")
+            manifests.add(manifest)
+    if not manifests:
+        raise ProofError("workspace has no inspectable member manifests")
+    return sorted(manifests)
+
+
+def activate_candidate_workspace_member(repository: Path):
+    manifest_path = repository / "Cargo.toml"
+    try:
+        manifest = manifest_path.read_text(encoding="utf-8")
+        parsed = tomllib.loads(manifest)
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        raise ProofError(f"cannot activate candidate workspace member: {error}") from error
+    workspace = parsed.get("workspace")
+    excludes = workspace.get("exclude") if isinstance(workspace, dict) else None
+    if excludes != [CANDIDATE_WORKSPACE_MEMBER]:
+        raise ProofError("workspace candidate exclusion differs")
+    exclusion = f'exclude = ["{CANDIDATE_WORKSPACE_MEMBER}"]'
+    if manifest.count(exclusion) != 1:
+        raise ProofError("workspace candidate exclusion is not canonical")
+    candidate_manifest = repository / CANDIDATE_WORKSPACE_MEMBER / "Cargo.toml"
+    if not candidate_manifest.is_file() or candidate_manifest.is_symlink():
+        raise ProofError("candidate workspace member manifest is missing or unsafe")
+    manifest_path.write_text(
+        manifest.replace(exclusion, "exclude = []"),
+        encoding="utf-8",
+    )
+    if candidate_manifest not in workspace_member_manifests(repository):
+        raise ProofError("candidate workspace member was not activated")
+
+
+def manifest_rss_dependencies(repository: Path, bundle_names: set[str]):
+    dependencies = []
+    for manifest_path in workspace_member_manifests(repository):
+        try:
+            manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+            raise ProofError(f"cannot inspect workspace manifest `{manifest_path}`: {error}") from error
+        package_name = manifest.get("package", {}).get("name")
+        if not isinstance(package_name, str) or not package_name:
+            raise ProofError(f"workspace manifest has no package name: {manifest_path}")
+        workspace_package = {"name": package_name, "manifest_path": str(manifest_path)}
+        for target, kind, table in manifest_dependency_entries(manifest):
+            for alias, specification in table.items():
+                declared_name = (
+                    specification.get("package", alias)
+                    if isinstance(specification, dict)
+                    else alias
+                )
+                if not is_rss_package_name(declared_name):
+                    continue
+                canonical = canonical_package_name(declared_name)
+                if canonical not in bundle_names:
+                    raise ProofError(f"RSS dependency `{declared_name}` is outside the Release Surface bundle")
+                if isinstance(specification, dict) and any(
+                    key in specification for key in ("path", "git", "workspace")
+                ):
+                    raise ProofError(f"RSS dependency `{declared_name}` must be declared from a registry")
+                version = specification.get("version") if isinstance(specification, dict) else specification
+                if not isinstance(version, str) or not version.startswith("=") or not SEMVER.fullmatch(version[1:]):
+                    raise ProofError(f"RSS dependency `{declared_name}` must use an exact version")
+                features = specification.get("features", []) if isinstance(specification, dict) else []
+                if not isinstance(features, list) or not all(isinstance(item, str) for item in features):
+                    raise ProofError(f"RSS dependency `{declared_name}` has invalid features")
+                dependency = {
+                    "name": canonical,
+                    "req": version,
+                    "source": "registry+manifest",
+                    "kind": kind,
+                    "rename": alias if alias != declared_name else None,
+                    "optional": bool(specification.get("optional", False)) if isinstance(specification, dict) else False,
+                    "uses_default_features": bool(specification.get("default-features", True)) if isinstance(specification, dict) else True,
+                    "features": features,
+                    "target": target,
+                }
+                dependencies.append((workspace_package, dependency))
+    if not dependencies:
+        raise ProofError("workspace manifests declare no RSS candidate consumers")
+    return dependencies
+
+
 def validate_manifest_dependency_sources(metadata, bundle_names: set[str]):
     workspace_ids = set(metadata.get("workspace_members", []))
     found = set()
@@ -322,8 +460,8 @@ def validate_rewritten_dependencies(baseline_dependencies, metadata, bundle, exp
     for workspace_package, dependency in rewritten:
         identity = dependency_identity(workspace_package, dependency)
         candidate = candidates[canonical_package_name(dependency["name"])]
-        if dependency.get("source") != expected_source:
-            raise ProofError(f"rewritten RSS dependency `{dependency['name']}` has the wrong source")
+        if not isinstance(dependency.get("source"), str) or not dependency["source"].startswith("registry+"):
+            raise ProofError(f"rewritten RSS dependency `{dependency['name']}` is not registry-declared")
         if dependency.get("req") != f"={candidate.version}":
             raise ProofError(f"rewritten RSS dependency `{dependency['name']}` is not exact")
         if identity in actual:
@@ -421,49 +559,131 @@ def cargo_metadata(repository: Path, env, *, offline: bool, no_deps: bool):
     return json.loads(run_capture(args, repository, env, "load Cargo metadata"))
 
 
-def rewrite_dependencies(repository: Path, dependencies, packages, env):
+def rewrite_dependencies(repository: Path, dependencies, packages, _env):
     by_name = {package.name: package for package in packages}
-    for workspace_package, dependency in dependencies:
+    selected = set()
+    for _workspace_package, dependency in dependencies:
         candidate = by_name[canonical_package_name(dependency["name"])]
-        args = [
-            "cargo",
-            "add",
-            f"{candidate.name}@={candidate.version}",
-            "--registry",
-            "rss-candidate",
-            "--package",
-            workspace_package["name"],
-        ]
-        if dependency.get("rename"):
-            args.extend(["--rename", dependency["rename"]])
-        if dependency.get("kind") == "dev":
-            args.append("--dev")
-        elif dependency.get("kind") == "build":
-            args.append("--build")
-        if dependency.get("target"):
-            args.extend(["--target", dependency["target"]])
-        if dependency.get("optional"):
-            args.append("--optional")
-        if not dependency.get("uses_default_features", True):
-            args.append("--no-default-features")
-        if dependency.get("features"):
-            args.extend(["--features", ",".join(dependency["features"])])
-        run_visible(args, repository, env, f"select `{candidate.name}` candidate")
+        if dependency.get("req") != f"={candidate.version}":
+            raise ProofError(f"RSS dependency `{candidate.name}` does not match the candidate version")
+        selected.add(candidate.name)
+    manifest_path = repository / "Cargo.toml"
+    manifest = manifest_path.read_text(encoding="utf-8")
+    if "[patch.crates-io]" in manifest:
+        raise ProofError("root workspace already defines a crates.io patch table")
+    patch = ["", "[patch.crates-io]"]
+    for name in sorted(selected):
+        candidate = by_name[name]
+        patch.append(
+            f'{name} = {{ version = "={candidate.version}", registry = "rss-candidate" }}'
+        )
+    manifest_path.write_text(
+        manifest.rstrip() + "\n" + "\n".join(patch) + "\n", encoding="utf-8"
+    )
 
 
-def prepare_candidate_lock(repository: Path, env):
+def locked_registry_identities(lock_path: Path, *, include_rss: bool):
+    try:
+        lock = tomllib.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        raise ProofError(f"cannot inspect root lock: {error}") from error
+    identities = set()
+    for package in lock.get("package", []):
+        source = package.get("source")
+        if not isinstance(source, str) or not source.startswith("registry+"):
+            continue
+        if not include_rss and is_rss_package_name(package.get("name")):
+            continue
+        checksum = package.get("checksum")
+        if not isinstance(checksum, str) or LOWER_HEX_64.fullmatch(checksum) is None:
+            raise ProofError(f"lock package `{package.get('name')}` has no registry checksum")
+        identities.add((package.get("name"), package.get("version"), source, checksum))
+    return identities
+
+
+def prepare_candidate_lock(repository: Path, env, baseline_registry_identities):
     run_visible(
-        ["cargo", "generate-lockfile"],
+        ["cargo", "update", "--workspace"],
         repository,
         env,
-        "generate candidate lock",
+        "resolve candidate workspace from baseline lock",
     )
+    candidate_identities = locked_registry_identities(
+        repository / "Cargo.lock", include_rss=False
+    )
+    missing = baseline_registry_identities - candidate_identities
+    if missing:
+        names = sorted(identity[0] for identity in missing)
+        raise ProofError(f"candidate lock changed baseline registry identities: {names}")
     run_visible(
         ["cargo", "fetch", "--locked"],
         repository,
         env,
         "prefetch candidate lock",
     )
+
+
+def validate_non_rss_lock_delta(metadata, baseline_identities, candidate_identities):
+    missing = baseline_identities - candidate_identities
+    if missing:
+        names = sorted(identity[0] for identity in missing)
+        raise ProofError(f"candidate lock changed baseline registry identities: {names}")
+    extra = candidate_identities - baseline_identities
+    if not extra:
+        return
+
+    packages = {package.get("id"): package for package in metadata.get("packages", [])}
+    resolve = metadata.get("resolve")
+    nodes = resolve.get("nodes") if isinstance(resolve, dict) else None
+    if not isinstance(nodes, list):
+        raise ProofError("candidate metadata has no dependency resolve graph")
+    adjacency = {}
+    for node in nodes:
+        node_id = node.get("id") if isinstance(node, dict) else None
+        dependencies = node.get("dependencies") if isinstance(node, dict) else None
+        if not isinstance(node_id, str) or not isinstance(dependencies, list) or not all(
+            isinstance(item, str) for item in dependencies
+        ):
+            raise ProofError("candidate metadata resolve graph is malformed")
+        adjacency[node_id] = dependencies
+
+    roots = {
+        package_id
+        for package_id, package in packages.items()
+        if is_rss_package_name(package.get("name"))
+        and package.get("source") == CANDIDATE_SOURCE
+    }
+    reachable = set(roots)
+    pending = list(roots)
+    while pending:
+        package_id = pending.pop()
+        for dependency_id in adjacency.get(package_id, []):
+            if dependency_id not in reachable:
+                reachable.add(dependency_id)
+                pending.append(dependency_id)
+
+    reachable_coordinates = {
+        (
+            package.get("name"),
+            package.get("version"),
+            package.get("source"),
+        )
+        for package_id, package in packages.items()
+        if package_id in reachable
+        and not is_rss_package_name(package.get("name"))
+        and isinstance(package.get("source"), str)
+        and package["source"].startswith("registry+")
+    }
+    unjustified = {
+        identity
+        for identity in extra
+        if identity[:3] not in reachable_coordinates
+    }
+    if unjustified:
+        names = sorted(identity[0] for identity in unjustified)
+        raise ProofError(
+            f"candidate lock added non-RSS identities outside the candidate dependency graph: {names}"
+        )
 
 
 def validate_resolution(repository: Path, bundle: CandidateBundle, metadata, expected_source: str):
@@ -540,29 +760,37 @@ def execute(repository: Path, bundle_root: Path):
         initialize_registry(registry)
         env = command_env(temp_root)
 
-        run_visible(["cargo", "fetch", "--locked"], snapshot, env, "prefetch committed lock")
-        baseline = cargo_metadata(snapshot, env, offline=False, no_deps=True)
-        validate_manifest_dependency_sources(
-            baseline, {package.name for package in bundle.packages}
-        )
-        dependencies = direct_rss_dependencies(
-            baseline, {package.name for package in bundle.packages}
+        activate_candidate_workspace_member(snapshot)
+        dependencies = manifest_rss_dependencies(
+            snapshot, {package.name for package in bundle.packages}
         )
         config = snapshot / ".cargo/config.toml"
         config.parent.mkdir(parents=True, exist_ok=True)
-        registry_url = (registry / "index").resolve().as_uri()
         config.write_text(
-            f'[registries.rss-candidate]\nindex = "{registry_url}"\n', encoding="utf-8"
+            f'[registries.rss-candidate]\nindex = "{CANDIDATE_REGISTRY_URL}"\n'
+            f'[source.rss-candidate]\nregistry = "{CANDIDATE_REGISTRY_URL}"\n'
+            'replace-with = "rss-candidate-local"\n'
+            '[source.rss-candidate-local]\n'
+            f'registry = "{(registry / "index").resolve().as_uri()}"\n',
+            encoding="utf-8",
+        )
+        baseline_registry_identities = locked_registry_identities(
+            snapshot / "Cargo.lock", include_rss=False
         )
         rewrite_dependencies(snapshot, dependencies, bundle.packages, env)
-        prepare_candidate_lock(snapshot, env)
+        prepare_candidate_lock(snapshot, env, baseline_registry_identities)
         rewritten = cargo_metadata(snapshot, env, offline=True, no_deps=True)
         validate_rewritten_dependencies(
-            dependencies, rewritten, bundle, f"registry+{registry_url}"
+            dependencies, rewritten, bundle, CANDIDATE_SOURCE
         )
         metadata = cargo_metadata(snapshot, env, offline=True, no_deps=False)
+        validate_non_rss_lock_delta(
+            metadata,
+            baseline_registry_identities,
+            locked_registry_identities(snapshot / "Cargo.lock", include_rss=False),
+        )
         consumed = validate_resolution(
-            snapshot, bundle, metadata, f"registry+{registry_url}"
+            snapshot, bundle, metadata, CANDIDATE_SOURCE
         )
         for subcommand, extra in (
             ("check", []),

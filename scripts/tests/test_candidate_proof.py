@@ -12,6 +12,9 @@ from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "candidate-proof.py"
+WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml"
+REPOSITORY = SCRIPT.parents[1]
+ROOT_MANIFEST = REPOSITORY / "Cargo.toml"
 SPEC = importlib.util.spec_from_file_location("candidate_proof", SCRIPT)
 candidate_proof = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(candidate_proof)
@@ -44,9 +47,10 @@ def crate_bytes(
             git["dirty"] = dirty
         files = {
             f"{root}/Cargo.toml": (
-                f'[package]\nname = "{name}"\nversion = "{version}"\n'
+                f'[package]\nname = "{name}"\nversion = "{version}"\nedition = "2024"\n'
             ).encode(),
             f"{root}/.cargo_vcs_info.json": json.dumps({"git": git}).encode(),
+            f"{root}/src/lib.rs": b"pub fn candidate_identity() {}\n",
         }
         for path, contents in files.items():
             entry = tarfile.TarInfo(path)
@@ -104,6 +108,79 @@ def write_bundle(root: Path, names=("rss-diag-context", "rss-trace-context", "rs
 
 
 class CandidateBundleTests(unittest.TestCase):
+    def test_pr_lane_checks_resolvable_workspace_without_candidate_member(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        ci_job, candidate_job = workflow.split("  candidate-proof:", maxsplit=1)
+        manifest = tomllib.loads(ROOT_MANIFEST.read_text(encoding="utf-8"))
+        excluded_members = set(manifest["workspace"]["exclude"])
+        repository_members = {
+            str(path.parent.relative_to(REPOSITORY))
+            for path in (REPOSITORY / "crates").glob("*/Cargo.toml")
+        }
+
+        self.assertEqual(
+            excluded_members,
+            {candidate_proof.CANDIDATE_WORKSPACE_MEMBER},
+        )
+        self.assertTrue(excluded_members < repository_members)
+        for command in (
+            "cargo check --workspace --all-targets --locked",
+            "cargo test --workspace --all-targets --locked",
+            "cargo test --workspace --doc --locked",
+            "cargo clippy --workspace --all-targets --locked -- -D warnings",
+        ):
+            self.assertIn(command, ci_job)
+        self.assertIn(
+            "find crates/platform-authoring-smoke -type f -name '*.rs' "
+            "-exec rustfmt --edition 2024 --check {} +",
+            ci_job,
+        )
+        self.assertIn("if: ${{ github.event_name == 'workflow_dispatch' }}", candidate_job)
+        self.assertIn("needs: ci", candidate_job)
+        self.assertEqual(workflow.count("python3 scripts/candidate-proof.py"), 1)
+        self.assertIn("python3 scripts/candidate-proof.py", candidate_job)
+
+    def test_candidate_workspace_activation_is_exact_and_snapshot_local(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            candidate = (
+                repository
+                / candidate_proof.CANDIDATE_WORKSPACE_MEMBER
+                / "Cargo.toml"
+            )
+            candidate.parent.mkdir(parents=True)
+            candidate.write_text(
+                '[package]\nname = "candidate"\nversion = "0.0.0"\n',
+                encoding="utf-8",
+            )
+            root_manifest = repository / "Cargo.toml"
+            root_manifest.write_text(
+                '[workspace]\nmembers = ["crates/*"]\n'
+                f'exclude = ["{candidate_proof.CANDIDATE_WORKSPACE_MEMBER}"]\n',
+                encoding="utf-8",
+            )
+
+            candidate_proof.activate_candidate_workspace_member(repository)
+
+            workspace = tomllib.loads(root_manifest.read_text(encoding="utf-8"))[
+                "workspace"
+            ]
+            self.assertEqual(workspace["exclude"], [])
+            self.assertIn(
+                candidate,
+                candidate_proof.workspace_member_manifests(repository),
+            )
+
+            root_manifest.write_text(
+                '[workspace]\nmembers = ["crates/*"]\nexclude = []\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                candidate_proof.ProofError,
+                "workspace candidate exclusion differs",
+            ):
+                candidate_proof.activate_candidate_workspace_member(repository)
+
     def test_valid_bundle_is_generic_and_sorted(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -261,6 +338,365 @@ class CandidateBundleTests(unittest.TestCase):
             with self.assertRaises(candidate_proof.ProofError):
                 candidate_proof.direct_rss_dependencies(metadata, bundle_names)
 
+    def test_unpublished_rss_dependencies_are_discovered_before_cargo_resolution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            (repository / "crates/platform-authoring-smoke").mkdir(parents=True)
+            (repository / "Cargo.toml").write_text(
+                '[workspace]\nresolver = "3"\nmembers = ["crates/*"]\n',
+                encoding="utf-8",
+            )
+            manifest = repository / "crates/platform-authoring-smoke/Cargo.toml"
+            manifest.write_text(
+                '[package]\nname = "platform-authoring-smoke"\nversion = "0.0.0"\n'
+                'edition = "2024"\n'
+                '[dependencies]\n'
+                'rss_contract = { package = "rss-contract", version = "=0.1.0" }\n'
+                'rss-platform = { version = "=0.3.0", default-features = false }\n'
+                '[target.\'cfg(unix)\'.dev-dependencies]\n'
+                'rss-request-context = { version = "=0.1.0", features = ["std"] }\n',
+                encoding="utf-8",
+            )
+
+            dependencies = candidate_proof.manifest_rss_dependencies(
+                repository,
+                {"rss-contract", "rss-platform", "rss-request-context"},
+            )
+
+            self.assertEqual(len(dependencies), 3)
+            identities = {
+                candidate_proof.dependency_identity(package, dependency)
+                for package, dependency in dependencies
+            }
+            self.assertIn(
+                (
+                    "platform-authoring-smoke",
+                    "rss-contract",
+                    "rss_contract",
+                    None,
+                    None,
+                ),
+                identities,
+            )
+            self.assertIn(
+                (
+                    "platform-authoring-smoke",
+                    "rss-request-context",
+                    None,
+                    "dev",
+                    "cfg(unix)",
+                ),
+                identities,
+            )
+
+    def test_static_manifest_discovery_rejects_forbidden_and_bundle_external_rss(self):
+        cases = [
+            'rss-platform = { version = "=0.3.0", path = "../rss" }\n',
+            'rss-platform = { git = "https://invalid", rev = "deadbeef" }\n',
+            'rss-platform = { workspace = true }\n',
+            'rss-internal = "=0.1.0"\n',
+        ]
+        for declaration in cases:
+            with self.subTest(declaration=declaration), tempfile.TemporaryDirectory() as directory:
+                repository = Path(directory)
+                (repository / "crates/consumer").mkdir(parents=True)
+                (repository / "Cargo.toml").write_text(
+                    '[workspace]\nmembers = ["crates/*"]\n', encoding="utf-8"
+                )
+                (repository / "crates/consumer/Cargo.toml").write_text(
+                    '[package]\nname = "consumer"\nversion = "0.0.0"\n'
+                    'edition = "2024"\n[dependencies]\n'
+                    + declaration,
+                    encoding="utf-8",
+                )
+                with self.assertRaises(candidate_proof.ProofError):
+                    candidate_proof.manifest_rss_dependencies(
+                        repository, {"rss-platform"}
+                    )
+
+    def test_candidate_rewrite_is_one_root_patch_and_requires_bundle_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            manifest = repository / "Cargo.toml"
+            manifest.write_text(
+                '[workspace]\nmembers = ["crates/*"]\n', encoding="utf-8"
+            )
+            package = candidate_proof.CandidatePackage(
+                "rss-platform", "0.3.0", "0" * 64, Path("/candidate/archive")
+            )
+            dependencies = [
+                (
+                    {"name": "consumer", "manifest_path": "/consumer/Cargo.toml"},
+                    {
+                        "name": "rss-platform",
+                        "req": "=0.3.0",
+                        "source": "registry+manifest",
+                        "kind": None,
+                        "rename": None,
+                        "optional": False,
+                        "uses_default_features": True,
+                        "features": [],
+                        "target": None,
+                    },
+                )
+            ]
+
+            candidate_proof.rewrite_dependencies(
+                repository, dependencies, (package,), {}
+            )
+
+            rewritten = manifest.read_text(encoding="utf-8")
+            self.assertEqual(rewritten.count("[patch.crates-io]"), 1)
+            self.assertIn(
+                'rss-platform = { version = "=0.3.0", registry = "rss-candidate" }',
+                rewritten,
+            )
+            mismatched = [(dependencies[0][0], dict(dependencies[0][1], req="=0.2.0"))]
+            with self.assertRaises(candidate_proof.ProofError):
+                candidate_proof.rewrite_dependencies(
+                    repository, mismatched, (package,), {}
+                )
+
+    def test_real_cargo_bootstraps_unpublished_candidate_from_local_registry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle_root = root / "bundle"
+            write_bundle(bundle_root, names=("rss-diag-context",))
+            bundle = candidate_proof.validate_bundle(bundle_root)
+
+            repository = root / "repository"
+            (repository / "crates/consumer/src").mkdir(parents=True)
+            (repository / "Cargo.toml").write_text(
+                '[workspace]\nresolver = "3"\nmembers = ["crates/*"]\n',
+                encoding="utf-8",
+            )
+            (repository / "crates/consumer/Cargo.toml").write_text(
+                '[package]\nname = "consumer"\nversion = "0.0.0"\nedition = "2024"\n',
+                encoding="utf-8",
+            )
+            (repository / "crates/consumer/src/lib.rs").write_text(
+                "pub fn consume() {}\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["cargo", "generate-lockfile"], cwd=repository, check=True
+            )
+            baseline_registry_identities = candidate_proof.locked_registry_identities(
+                repository / "Cargo.lock", include_rss=False
+            )
+            (repository / "crates/consumer/Cargo.toml").write_text(
+                '[package]\nname = "consumer"\nversion = "0.0.0"\nedition = "2024"\n'
+                '[dependencies]\nrss-diag-context = "=0.1.0"\n',
+                encoding="utf-8",
+            )
+            (repository / "crates/consumer/src/lib.rs").write_text(
+                "pub fn consume() { rss_diag_context::candidate_identity(); }\n",
+                encoding="utf-8",
+            )
+
+            registry = root / "registry"
+            candidate_proof.shutil.copytree(bundle_root / "registry", registry)
+            candidate_proof.initialize_registry(registry)
+            empty_registry = root / "empty-registry"
+            (empty_registry / "index").mkdir(parents=True)
+            (empty_registry / "crates").mkdir()
+            candidate_proof.initialize_registry(empty_registry)
+
+            empty_url = (empty_registry / "index").resolve().as_uri()
+            (repository / ".cargo").mkdir()
+            (repository / ".cargo/config.toml").write_text(
+                f'[registries.rss-candidate]\nindex = "{candidate_proof.CANDIDATE_REGISTRY_URL}"\n'
+                f'[source.rss-candidate]\nregistry = "{candidate_proof.CANDIDATE_REGISTRY_URL}"\n'
+                'replace-with = "rss-candidate-local"\n'
+                f'[source.rss-candidate-local]\nregistry = "{(registry / "index").resolve().as_uri()}"\n'
+                '[source.crates-io]\nreplace-with = "empty-test-registry"\n'
+                f'[source.empty-test-registry]\nregistry = "{empty_url}"\n',
+                encoding="utf-8",
+            )
+            dependencies = candidate_proof.manifest_rss_dependencies(
+                repository, {"rss-diag-context"}
+            )
+            candidate_proof.rewrite_dependencies(
+                repository, dependencies, bundle.packages, {}
+            )
+            env = candidate_proof.command_env(root / "cargo")
+
+            candidate_proof.prepare_candidate_lock(
+                repository, env, baseline_registry_identities
+            )
+            direct = candidate_proof.cargo_metadata(
+                repository, env, offline=True, no_deps=True
+            )
+            candidate_proof.validate_rewritten_dependencies(
+                dependencies,
+                direct,
+                bundle,
+                candidate_proof.CANDIDATE_SOURCE,
+            )
+            metadata = candidate_proof.cargo_metadata(
+                repository, env, offline=True, no_deps=False
+            )
+            self.assertEqual(
+                candidate_proof.validate_resolution(
+                    repository, bundle, metadata, candidate_proof.CANDIDATE_SOURCE
+                ),
+                ["rss-diag-context"],
+            )
+
+    def test_candidate_lock_is_stable_across_physical_registry_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle_root = root / "bundle"
+            write_bundle(bundle_root, names=("rss-diag-context",))
+            bundle = candidate_proof.validate_bundle(bundle_root)
+            locks = []
+
+            for run in ("first", "second"):
+                repository = root / run / "repository"
+                (repository / "crates/consumer/src").mkdir(parents=True)
+                (repository / "Cargo.toml").write_text(
+                    '[workspace]\nresolver = "3"\nmembers = ["crates/*"]\n',
+                    encoding="utf-8",
+                )
+                manifest = repository / "crates/consumer/Cargo.toml"
+                manifest.write_text(
+                    '[package]\nname = "consumer"\nversion = "0.0.0"\nedition = "2024"\n',
+                    encoding="utf-8",
+                )
+                (repository / "crates/consumer/src/lib.rs").write_text(
+                    "pub fn consume() {}\n", encoding="utf-8"
+                )
+                subprocess.run(
+                    ["cargo", "generate-lockfile"], cwd=repository, check=True
+                )
+                baseline = candidate_proof.locked_registry_identities(
+                    repository / "Cargo.lock", include_rss=False
+                )
+                manifest.write_text(
+                    '[package]\nname = "consumer"\nversion = "0.0.0"\nedition = "2024"\n'
+                    '[dependencies]\nrss-diag-context = "=0.1.0"\n',
+                    encoding="utf-8",
+                )
+                registry = root / run / "physical-registry"
+                candidate_proof.shutil.copytree(bundle.root / "registry", registry)
+                candidate_proof.initialize_registry(registry)
+                (repository / ".cargo").mkdir()
+                (repository / ".cargo/config.toml").write_text(
+                    f'[registries.rss-candidate]\nindex = "{candidate_proof.CANDIDATE_REGISTRY_URL}"\n'
+                    f'[source.rss-candidate]\nregistry = "{candidate_proof.CANDIDATE_REGISTRY_URL}"\n'
+                    'replace-with = "rss-candidate-local"\n'
+                    f'[source.rss-candidate-local]\nregistry = "{(registry / "index").resolve().as_uri()}"\n',
+                    encoding="utf-8",
+                )
+                dependencies = candidate_proof.manifest_rss_dependencies(
+                    repository, {"rss-diag-context"}
+                )
+                candidate_proof.rewrite_dependencies(
+                    repository, dependencies, bundle.packages, {}
+                )
+                candidate_proof.prepare_candidate_lock(
+                    repository,
+                    candidate_proof.command_env(root / run / "cargo-home"),
+                    baseline,
+                )
+                locks.append((repository / "Cargo.lock").read_bytes())
+
+            self.assertEqual(locks[0], locks[1])
+            self.assertIn(candidate_proof.CANDIDATE_REGISTRY_URL.encode(), locks[0])
+            self.assertNotIn(str(root).encode(), locks[0])
+
+    def test_candidate_lock_rejects_baseline_registry_identity_drift(self):
+        baseline = {
+            (
+                "baseline-package",
+                "1.0.0",
+                "registry+https://github.com/rust-lang/crates.io-index",
+                "a" * 64,
+            )
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            (repository / "Cargo.lock").write_text("version = 4\n", encoding="utf-8")
+            with mock.patch.object(candidate_proof, "run_visible") as visible:
+                with self.assertRaisesRegex(
+                    candidate_proof.ProofError, "baseline registry identities"
+                ):
+                    candidate_proof.prepare_candidate_lock(
+                        repository, {}, baseline
+                    )
+            visible.assert_called_once_with(
+                ["cargo", "update", "--workspace"],
+                repository,
+                {},
+                "resolve candidate workspace from baseline lock",
+            )
+
+    def test_non_rss_lock_additions_require_candidate_graph_reachability(self):
+        crates_io = "registry+https://github.com/rust-lang/crates.io-index"
+        baseline_identity = ("baseline", "1.0.0", crates_io, "a" * 64)
+        required_identity = ("required", "2.0.0", crates_io, "b" * 64)
+        unrelated_identity = ("unrelated", "3.0.0", crates_io, "c" * 64)
+        rss_id = "registry+https://rss-candidate.invalid/index#rss-platform@0.3.0"
+        required_id = "registry+https://github.com/rust-lang/crates.io-index#required@2.0.0"
+        unrelated_id = "registry+https://github.com/rust-lang/crates.io-index#unrelated@3.0.0"
+        metadata = {
+            "packages": [
+                {
+                    "id": rss_id,
+                    "name": "rss-platform",
+                    "version": "0.3.0",
+                    "source": candidate_proof.CANDIDATE_SOURCE,
+                    "checksum": "d" * 64,
+                },
+                {
+                    "id": required_id,
+                    "name": required_identity[0],
+                    "version": required_identity[1],
+                    "source": required_identity[2],
+                    "checksum": None,
+                },
+                {
+                    "id": unrelated_id,
+                    "name": unrelated_identity[0],
+                    "version": unrelated_identity[1],
+                    "source": unrelated_identity[2],
+                    "checksum": None,
+                },
+            ],
+            "resolve": {
+                "nodes": [
+                    {"id": rss_id, "dependencies": [required_id]},
+                    {"id": required_id, "dependencies": []},
+                    {"id": unrelated_id, "dependencies": []},
+                ]
+            },
+        }
+        baseline = {baseline_identity}
+
+        candidate_proof.validate_non_rss_lock_delta(
+            metadata, baseline, baseline | {required_identity}
+        )
+        with self.assertRaisesRegex(
+            candidate_proof.ProofError, "outside the candidate dependency graph"
+        ):
+            candidate_proof.validate_non_rss_lock_delta(
+                metadata,
+                baseline,
+                baseline | {required_identity, unrelated_identity},
+            )
+
+    def test_non_rss_lock_delta_requires_a_well_formed_resolve_graph(self):
+        identity = (
+            "extra",
+            "1.0.0",
+            "registry+https://github.com/rust-lang/crates.io-index",
+            "a" * 64,
+        )
+        with self.assertRaisesRegex(
+            candidate_proof.ProofError, "no dependency resolve graph"
+        ):
+            candidate_proof.validate_non_rss_lock_delta({}, set(), {identity})
+
     def test_manifest_rejects_workspace_inheritance_and_underscore_internal(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -319,7 +755,7 @@ class CandidateBundleTests(unittest.TestCase):
                 "registry+file:///candidate/index",
             )
 
-    def test_resolution_rejects_git_or_checksum_drift(self):
+    def test_resolution_failures_reach_each_registry_only_exact_set_branch(self):
         candidate = candidate_proof.CandidatePackage(
             "rss-diag-context", "0.1.0", "aa" * 32, Path("unused")
         )
@@ -328,36 +764,79 @@ class CandidateBundleTests(unittest.TestCase):
         )
         source = "registry+file:///candidate/index"
         workspace_id = "path+file:///consumer#0.0.0"
-        metadata = {
-            "workspace_members": [workspace_id],
-            "packages": [
-                {
-                    "id": workspace_id,
-                    "name": "rss-consumer-smoke",
-                    "source": None,
-                    "checksum": None,
-                },
-                {
-                    "id": "rss-diag-context@0.1.0",
-                    "name": candidate.name,
-                    "version": candidate.version,
-                    "source": source,
-                    "checksum": candidate.checksum,
-                },
-                {
-                    "id": "bad@1.0.0",
-                    "name": "bad",
-                    "version": "1.0.0",
-                    "source": "git+https://invalid",
-                    "checksum": None,
-                },
-            ],
+        workspace = {
+            "id": workspace_id,
+            "name": "rss-consumer-smoke",
+            "source": None,
+            "checksum": None,
         }
-        with tempfile.TemporaryDirectory() as directory:
-            repository = Path(directory)
-            (repository / "Cargo.lock").write_text("version = 4\n", encoding="utf-8")
-            with self.assertRaises(candidate_proof.ProofError):
-                candidate_proof.validate_resolution(repository, bundle, metadata, source)
+        resolved_candidate = {
+            "id": "rss-diag-context@0.1.0",
+            "name": candidate.name,
+            "version": candidate.version,
+            "source": source,
+            "checksum": candidate.checksum,
+        }
+        base_metadata = {
+            "workspace_members": [workspace_id],
+            "packages": [workspace, resolved_candidate],
+        }
+        correct_lock = (
+            "version = 4\n\n"
+            '[[package]]\nname = "rss-consumer-smoke"\nversion = "0.0.0"\n\n'
+            '[[package]]\nname = "rss-diag-context"\nversion = "0.1.0"\n'
+            f'source = "{source}"\nchecksum = "{candidate.checksum}"\n'
+        )
+        cases = {
+            "git source": (
+                dict(
+                    base_metadata,
+                    packages=base_metadata["packages"]
+                    + [
+                        {
+                            "id": "bad@1.0.0",
+                            "name": "bad",
+                            "version": "1.0.0",
+                            "source": "git+https://invalid",
+                            "checksum": None,
+                        }
+                    ],
+                ),
+                correct_lock,
+            ),
+            "unexpected RSS package": (
+                dict(
+                    base_metadata,
+                    packages=base_metadata["packages"]
+                    + [
+                        {
+                            "id": "rss-extra@0.1.0",
+                            "name": "rss-extra",
+                            "version": "0.1.0",
+                            "source": source,
+                            "checksum": "bb" * 32,
+                        }
+                    ],
+                ),
+                correct_lock,
+            ),
+            "checksum drift": (
+                base_metadata,
+                correct_lock.replace(candidate.checksum, "bb" * 32),
+            ),
+            "missing lock package": (
+                base_metadata,
+                'version = 4\n\n[[package]]\nname = "rss-consumer-smoke"\nversion = "0.0.0"\n',
+            ),
+        }
+        for label, (metadata, lock) in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                repository = Path(directory)
+                (repository / "Cargo.lock").write_text(lock, encoding="utf-8")
+                with self.assertRaises(candidate_proof.ProofError):
+                    candidate_proof.validate_resolution(
+                        repository, bundle, metadata, source
+                    )
 
     def test_invalid_cli_does_not_change_checkout_status(self):
         repository = SCRIPT.parents[1]
@@ -416,7 +895,32 @@ class CandidateBundleTests(unittest.TestCase):
             snapshots = []
 
             def materialize(_repository, destination):
-                destination.mkdir(parents=True)
+                (destination / "crates/consumer").mkdir(parents=True)
+                candidate = (
+                    destination
+                    / candidate_proof.CANDIDATE_WORKSPACE_MEMBER
+                    / "Cargo.toml"
+                )
+                candidate.parent.mkdir(parents=True)
+                (destination / "Cargo.toml").write_text(
+                    '[workspace]\nmembers = ["crates/*"]\n'
+                    f'exclude = ["{candidate_proof.CANDIDATE_WORKSPACE_MEMBER}"]\n',
+                    encoding="utf-8",
+                )
+                (destination / "Cargo.lock").write_text(
+                    'version = 4\n\n[[package]]\nname = "consumer"\nversion = "0.0.0"\n',
+                    encoding="utf-8",
+                )
+                candidate.write_text(
+                    '[package]\nname = "candidate"\nversion = "0.0.0"\n',
+                    encoding="utf-8",
+                )
+                (destination / "crates/consumer/Cargo.toml").write_text(
+                    '[package]\nname = "consumer"\nversion = "0.0.0"\n'
+                    'edition = "2024"\n[dependencies]\n'
+                    'rss_diag_context = { package = "rss-diag-context", version = "=0.1.0" }\n',
+                    encoding="utf-8",
+                )
                 snapshots.append(destination)
 
             def copytree(_source, destination):
@@ -425,8 +929,6 @@ class CandidateBundleTests(unittest.TestCase):
 
             def visible(args, cwd, _env, _label):
                 commands.append((tuple(args), cwd))
-                if args[:2] == ["cargo", "generate-lockfile"]:
-                    (cwd / "Cargo.lock").write_text("version = 4\n", encoding="utf-8")
                 if fail_test and args[:2] == ["cargo", "test"]:
                     raise candidate_proof.ProofError("synthetic test failure")
 
@@ -438,26 +940,13 @@ class CandidateBundleTests(unittest.TestCase):
                 workspace = {
                     "id": "consumer-id",
                     "name": "consumer",
-                    "manifest_path": str(repository / "Cargo.toml"),
+                    "manifest_path": str(repository / "crates/consumer/Cargo.toml"),
                 }
-                if metadata_calls == 1:
-                    (repository / "Cargo.toml").write_text(
-                        '[package]\nname = "consumer"\nversion = "0.0.0"\n'
-                        '[dependencies]\nrss_diag_context = '
-                        '{ package = "rss-diag-context", version = "=0.1.0" }\n',
-                        encoding="utf-8",
-                    )
-                    return {
-                        "workspace_members": ["consumer-id"],
-                        "packages": [dict(workspace, dependencies=[baseline_dependency])],
-                    }
                 self.assertTrue(offline)
-                self.assertTrue(no_deps if metadata_calls == 2 else not no_deps)
-                config = tomllib.loads(
-                    (repository / ".cargo/config.toml").read_text(encoding="utf-8")
+                self.assertEqual(no_deps, metadata_calls == 1)
+                rewritten = dict(
+                    baseline_dependency, source=candidate_proof.CANDIDATE_SOURCE
                 )
-                source = "registry+" + config["registries"]["rss-candidate"]["index"]
-                rewritten = dict(baseline_dependency, source=source)
                 return {
                     "workspace_members": ["consumer-id"],
                     "packages": [dict(workspace, dependencies=[rewritten])],
@@ -489,18 +978,18 @@ class CandidateBundleTests(unittest.TestCase):
             self.assertIn(command, matrix)
             self.assertIn("--locked", matrix[command])
             self.assertIn("--offline", matrix[command])
-        self.assertEqual(matrix["generate-lockfile"], ("cargo", "generate-lockfile"))
+        self.assertEqual(matrix["update"], ("cargo", "update", "--workspace"))
         self.assertTrue(snapshots)
         self.assertTrue(snapshots[0].parent.name.startswith("rss-incubator-candidate-"))
         self.assertTrue(all(cwd == snapshots[0] for _args, cwd in commands))
         command_args = [args for args, _cwd in commands]
-        generated = command_args.index(("cargo", "generate-lockfile"))
-        self.assertEqual(command_args[generated + 1], ("cargo", "fetch", "--locked"))
+        updated = command_args.index(("cargo", "update", "--workspace"))
+        self.assertEqual(command_args[updated + 1], ("cargo", "fetch", "--locked"))
         first_matrix = min(
             command_args.index(matrix[subcommand])
             for subcommand in ("check", "test", "clippy")
         )
-        self.assertLess(generated + 1, first_matrix)
+        self.assertLess(updated + 1, first_matrix)
         failed_commands, _ = run_once(fail_test=True)
         self.assertTrue(any(args[:2] == ("cargo", "test") for args, _ in failed_commands))
 
