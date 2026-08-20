@@ -11,6 +11,16 @@ handler, and exercises product-owned host admission. Together they prove only th
 product-consumption seams work; they are not accepted products, official profiles, maturity claims,
 or production gates.
 
+## Incubating products
+
+The [Secure Device Credential Rotation](docs/secure-device-credential-rotation.md) skeleton is an
+accepted incubation scope. Its `rotation-model` package contains only transport-neutral product
+correlation and observation facts. The future registry client, control CLI, reference device agent,
+reference deployment, and external T2 journey retain separate implementation owners.
+
+The rotation product does not absorb `rss-consumer-smoke`. The observability smoke remains an
+independent compatibility proof and supplies no identity, authorization, or device-state authority.
+
 ## Ownership
 
 | Boundary | Owner responsibilities |
@@ -26,17 +36,24 @@ must not use path, Git, workspace, submodule, vendored, internal, generated, pro
 plan, test-fixture, or governance surfaces.
 
 A candidate proof establishes only this repository's product-consumption seam. It does not establish
-RSS release correctness, RC status, maturity, or publish approval.
+RSS release correctness, RC status, maturity, or publish approval. The ADR-026 ownership cutover is
+complete: this repository owns the consumer proof and RSS retains the Release Surface artifact proof.
 
 ## Local policy verification
 
-The committed root `Cargo.lock` is the single dependency resolution for this workspace.
-Before the candidate packages are published, a fresh clone can run the same non-resolution gates as
-pull requests and pushes:
+The committed root `Cargo.lock` is the single dependency resolution for this workspace. Before the
+Platform candidate packages are published, the regular workspace excludes only
+`platform-authoring-smoke`; the candidate proof atomically re-enrolls it only in its isolated
+snapshot. A fresh clone and the pull-request/push lane run:
 
 ```sh
 cargo fmt --all -- --check
+find crates/platform-authoring-smoke -type f -name '*.rs' -exec rustfmt --edition 2024 --check {} +
 python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+cargo check --workspace --all-targets --locked
+cargo test --workspace --all-targets --locked
+cargo test --workspace --doc --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
 The complete workspace matrix requires an exact candidate bundle and runs only through the closed
@@ -49,11 +66,12 @@ cargo test --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-GitHub Actions runs the proof policy tests and formatting check on every pull request and push to
-`main`. The three candidate-only packages are intentionally absent from crates.io, so those events
-must not attempt Cargo workspace resolution through the released registry. A manual candidate run
-uses the exact immutable RSS bundle and delegates all metadata, build, test, and lint execution to
-the isolated candidate-proof job.
+GitHub Actions runs the policy, formatting, check, test, documentation, and lint gates for the
+regular workspace on every pull request and push to `main`. The three Platform candidate packages
+are intentionally absent from crates.io, so those events must not resolve
+`platform-authoring-smoke`. A manual candidate run uses the exact immutable RSS bundle, activates
+that excluded member only in its temporary snapshot, and delegates the complete workspace metadata,
+build, test, and lint execution to the isolated candidate-proof job.
 
 ## Candidate artifact proof
 

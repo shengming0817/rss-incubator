@@ -3,7 +3,6 @@ import importlib.util
 import io
 import json
 from pathlib import Path
-import re
 import subprocess
 import tarfile
 import tempfile
@@ -14,6 +13,8 @@ from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / "candidate-proof.py"
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml"
+REPOSITORY = SCRIPT.parents[1]
+ROOT_MANIFEST = REPOSITORY / "Cargo.toml"
 SPEC = importlib.util.spec_from_file_location("candidate_proof", SCRIPT)
 candidate_proof = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(candidate_proof)
@@ -107,14 +108,78 @@ def write_bundle(root: Path, names=("rss-diag-context", "rss-trace-context", "rs
 
 
 class CandidateBundleTests(unittest.TestCase):
-    def test_pr_lane_does_not_resolve_unpublished_candidate_packages(self):
+    def test_pr_lane_checks_resolvable_workspace_without_candidate_member(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         ci_job, candidate_job = workflow.split("  candidate-proof:", maxsplit=1)
-        self.assertIsNone(re.search(r"\bcargo\s+(?:check|test|clippy)\b", ci_job))
+        manifest = tomllib.loads(ROOT_MANIFEST.read_text(encoding="utf-8"))
+        excluded_members = set(manifest["workspace"]["exclude"])
+        repository_members = {
+            str(path.parent.relative_to(REPOSITORY))
+            for path in (REPOSITORY / "crates").glob("*/Cargo.toml")
+        }
+
+        self.assertEqual(
+            excluded_members,
+            {candidate_proof.CANDIDATE_WORKSPACE_MEMBER},
+        )
+        self.assertTrue(excluded_members < repository_members)
+        for command in (
+            "cargo check --workspace --all-targets --locked",
+            "cargo test --workspace --all-targets --locked",
+            "cargo test --workspace --doc --locked",
+            "cargo clippy --workspace --all-targets --locked -- -D warnings",
+        ):
+            self.assertIn(command, ci_job)
+        self.assertIn(
+            "find crates/platform-authoring-smoke -type f -name '*.rs' "
+            "-exec rustfmt --edition 2024 --check {} +",
+            ci_job,
+        )
         self.assertIn("if: ${{ github.event_name == 'workflow_dispatch' }}", candidate_job)
         self.assertIn("needs: ci", candidate_job)
         self.assertEqual(workflow.count("python3 scripts/candidate-proof.py"), 1)
         self.assertIn("python3 scripts/candidate-proof.py", candidate_job)
+
+    def test_candidate_workspace_activation_is_exact_and_snapshot_local(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            candidate = (
+                repository
+                / candidate_proof.CANDIDATE_WORKSPACE_MEMBER
+                / "Cargo.toml"
+            )
+            candidate.parent.mkdir(parents=True)
+            candidate.write_text(
+                '[package]\nname = "candidate"\nversion = "0.0.0"\n',
+                encoding="utf-8",
+            )
+            root_manifest = repository / "Cargo.toml"
+            root_manifest.write_text(
+                '[workspace]\nmembers = ["crates/*"]\n'
+                f'exclude = ["{candidate_proof.CANDIDATE_WORKSPACE_MEMBER}"]\n',
+                encoding="utf-8",
+            )
+
+            candidate_proof.activate_candidate_workspace_member(repository)
+
+            workspace = tomllib.loads(root_manifest.read_text(encoding="utf-8"))[
+                "workspace"
+            ]
+            self.assertEqual(workspace["exclude"], [])
+            self.assertIn(
+                candidate,
+                candidate_proof.workspace_member_manifests(repository),
+            )
+
+            root_manifest.write_text(
+                '[workspace]\nmembers = ["crates/*"]\nexclude = []\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                candidate_proof.ProofError,
+                "workspace candidate exclusion differs",
+            ):
+                candidate_proof.activate_candidate_workspace_member(repository)
 
     def test_valid_bundle_is_generic_and_sorted(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -831,11 +896,23 @@ class CandidateBundleTests(unittest.TestCase):
 
             def materialize(_repository, destination):
                 (destination / "crates/consumer").mkdir(parents=True)
+                candidate = (
+                    destination
+                    / candidate_proof.CANDIDATE_WORKSPACE_MEMBER
+                    / "Cargo.toml"
+                )
+                candidate.parent.mkdir(parents=True)
                 (destination / "Cargo.toml").write_text(
-                    '[workspace]\nmembers = ["crates/*"]\n', encoding="utf-8"
+                    '[workspace]\nmembers = ["crates/*"]\n'
+                    f'exclude = ["{candidate_proof.CANDIDATE_WORKSPACE_MEMBER}"]\n',
+                    encoding="utf-8",
                 )
                 (destination / "Cargo.lock").write_text(
                     'version = 4\n\n[[package]]\nname = "consumer"\nversion = "0.0.0"\n',
+                    encoding="utf-8",
+                )
+                candidate.write_text(
+                    '[package]\nname = "candidate"\nversion = "0.0.0"\n',
                     encoding="utf-8",
                 )
                 (destination / "crates/consumer/Cargo.toml").write_text(

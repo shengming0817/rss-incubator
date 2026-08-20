@@ -30,6 +30,7 @@ LOWER_HEX_40 = re.compile(r"[0-9a-f]{40}\Z")
 LOWER_HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
 CANDIDATE_REGISTRY_URL = "https://rss-candidate.invalid/index"
 CANDIDATE_SOURCE = f"registry+{CANDIDATE_REGISTRY_URL}"
+CANDIDATE_WORKSPACE_MEMBER = "crates/platform-authoring-smoke"
 
 
 class ProofError(RuntimeError):
@@ -301,6 +302,31 @@ def workspace_member_manifests(repository: Path):
     if not manifests:
         raise ProofError("workspace has no inspectable member manifests")
     return sorted(manifests)
+
+
+def activate_candidate_workspace_member(repository: Path):
+    manifest_path = repository / "Cargo.toml"
+    try:
+        manifest = manifest_path.read_text(encoding="utf-8")
+        parsed = tomllib.loads(manifest)
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        raise ProofError(f"cannot activate candidate workspace member: {error}") from error
+    workspace = parsed.get("workspace")
+    excludes = workspace.get("exclude") if isinstance(workspace, dict) else None
+    if excludes != [CANDIDATE_WORKSPACE_MEMBER]:
+        raise ProofError("workspace candidate exclusion differs")
+    exclusion = f'exclude = ["{CANDIDATE_WORKSPACE_MEMBER}"]'
+    if manifest.count(exclusion) != 1:
+        raise ProofError("workspace candidate exclusion is not canonical")
+    candidate_manifest = repository / CANDIDATE_WORKSPACE_MEMBER / "Cargo.toml"
+    if not candidate_manifest.is_file() or candidate_manifest.is_symlink():
+        raise ProofError("candidate workspace member manifest is missing or unsafe")
+    manifest_path.write_text(
+        manifest.replace(exclusion, "exclude = []"),
+        encoding="utf-8",
+    )
+    if candidate_manifest not in workspace_member_manifests(repository):
+        raise ProofError("candidate workspace member was not activated")
 
 
 def manifest_rss_dependencies(repository: Path, bundle_names: set[str]):
@@ -734,6 +760,7 @@ def execute(repository: Path, bundle_root: Path):
         initialize_registry(registry)
         env = command_env(temp_root)
 
+        activate_candidate_workspace_member(snapshot)
         dependencies = manifest_rss_dependencies(
             snapshot, {package.name for package in bundle.packages}
         )
