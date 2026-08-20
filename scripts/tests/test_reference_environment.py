@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -56,7 +57,6 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
                     "KEYCLOAK_PORT": "18080",
                     "VAULT_PORT": "18200",
                     "MQTT_PORT": "18883",
-                    "MQTT_HEALTH_TOPIC": "rss/v1/unit/unit/1/downlink/health",
                 }
             )
             completed = subprocess.run(
@@ -105,7 +105,9 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
         )
         self.assertEqual(
             {
-                f"{state_root}/pki",
+                f"{state_root}/pki/ca.pem",
+                f"{state_root}/pki/server.crt",
+                f"{state_root}/pki/server.key",
                 f"{state_root}/mosquitto",
                 f"{state_root}/mosquitto-data",
             },
@@ -123,6 +125,21 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
                 if volume["source"].startswith(state_root)
             },
         )
+        self.assertEqual(
+            {
+                f"{state_root}/pki/ca.pem",
+                f"{state_root}/pki/keycloak.crt",
+                f"{state_root}/pki/keycloak.key",
+            },
+            {
+                volume["source"]
+                for volume in model["services"]["keycloak"]["volumes"]
+                if volume["source"].startswith(state_root)
+            },
+        )
+        lifecycle = SCRIPT.read_text(encoding="utf-8")
+        for image in expected_images.values():
+            self.assertNotIn(image, lifecycle)
 
     def test_fixture_is_a_stable_disposable_exact_set(self):
         fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
@@ -167,6 +184,7 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
 
         policy = (ROOT / "deploy/vault/deviceidentity-sign.hcl").read_text(encoding="utf-8")
         self.assertIn('path "device-pki/sign/mqtt-device"', policy)
+        self.assertIn('"ttl" = []', policy)
         self.assertNotIn('path "device-pki/sign/mqtt-service"', policy)
         self.assertNotIn('path "device-pki/sign/mosquitto-server"', policy)
         self.assertNotIn('path "device-pki/root', policy)
@@ -249,6 +267,22 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
                 module.remove_state(outside, "valid-project", deploy_root=deploy_root)
             module.remove_state(state, "valid-project", deploy_root=deploy_root)
             self.assertFalse(state.exists())
+
+    def test_empty_state_never_adopts_an_existing_project_namespace(self):
+        module = load_reference_environment()
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "empty-state"
+            state.mkdir()
+            environment = object.__new__(module.ReferenceEnvironment)
+            environment.project = "valid-project"
+            environment.state = state
+            environment.env_file = state / "runtime.env"
+            with mock.patch.object(
+                environment,
+                "project_resources",
+                return_value={"containers": ["foreign"], "networks": [], "volumes": []},
+            ), self.assertRaises(module.ReferenceEnvironmentError):
+                environment.initialize_state()
 
     def test_mqtt_v5_denial_is_not_confused_with_cli_success(self):
         module = load_reference_environment()

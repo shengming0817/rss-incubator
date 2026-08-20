@@ -54,11 +54,10 @@ image until its owning PBI supplies an immutable artifact.
 Use the failing command's message first. While state still exists, inspect scoped provider logs with:
 
 ```sh
-docker compose \
-  --env-file deploy/.state/rss-device-security-reference/runtime.env \
-  --project-name rss-device-security-reference \
-  --file deploy/compose.yaml logs --no-color
+python3 scripts/reference-environment.py --project rss-device-security-reference logs
 ```
+
+This path validates the project sentinel and redacts every generated credential before output.
 
 Do not use Docker prune or broad volume/container deletion. If the sentinel is missing or differs,
 the lifecycle tool deliberately refuses cleanup; inspect the exact project-labelled resources and

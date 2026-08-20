@@ -77,9 +77,16 @@ jobs:
           docker compose version
 
       - name: Run disposable reference environment journey
+        timeout-minutes: 17
         env:
           REFERENCE_PROJECT: rss-ci-${{ github.run_id }}-${{ github.run_attempt }}
         run: python3 scripts/reference-environment.py --project "$REFERENCE_PROJECT" smoke
+
+      - name: Collect redacted scoped logs after failure
+        if: ${{ failure() || cancelled() }}
+        env:
+          REFERENCE_PROJECT: rss-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        run: python3 scripts/reference-environment.py --project "$REFERENCE_PROJECT" logs
 
       - name: Remove scoped runtime state
         if: ${{ always() }}

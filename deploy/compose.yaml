@@ -101,8 +101,16 @@ services:
         target: /reference-config/keycloak
         read_only: true
       - type: bind
-        source: ${REFERENCE_STATE:?runtime state path is required}/pki
-        target: /reference-state/pki
+        source: ${REFERENCE_STATE:?runtime state path is required}/pki/ca.pem
+        target: /reference-state/pki/ca.pem
+        read_only: true
+      - type: bind
+        source: ${REFERENCE_STATE:?runtime state path is required}/pki/keycloak.crt
+        target: /reference-state/pki/keycloak.crt
+        read_only: true
+      - type: bind
+        source: ${REFERENCE_STATE:?runtime state path is required}/pki/keycloak.key
+        target: /reference-state/pki/keycloak.key
         read_only: true
     security_opt: [no-new-privileges:true]
     labels:
@@ -111,17 +119,14 @@ services:
   mosquitto:
     image: eclipse-mosquitto:2.0.22-openssl@sha256:212f89e1eaeb2c322d6441b64396e3346026674db8fa9c27beac293405c32b3c
     user: ${HOST_UID:?host uid is required}:${HOST_GID:?host gid is required}
-    environment:
-      MQTT_HEALTH_TOPIC: ${MQTT_HEALTH_TOPIC:?exact MQTT health topic is required}
     healthcheck:
       test:
         - CMD-SHELL
         - >-
-          mosquitto_pub -h localhost -p 8883 -q 1
-          --cafile /reference-state/pki/ca.pem
-          --cert /reference-state/pki/service.crt
-          --key /reference-state/pki/service.key
-          -t "$$MQTT_HEALTH_TOPIC" -m health
+          mosquitto_pub -V mqttv5 -h localhost -p 8883
+          --cafile /reference-state/pki/ca.pem -q 1
+          -t health/readiness -m health >/tmp/reference-health.log 2>&1;
+          test "$$?" -eq 7
       interval: 3s
       timeout: 4s
       retries: 30
@@ -139,8 +144,16 @@ services:
         target: /mosquitto/config/mosquitto.conf
         read_only: true
       - type: bind
-        source: ${REFERENCE_STATE:?runtime state path is required}/pki
-        target: /reference-state/pki
+        source: ${REFERENCE_STATE:?runtime state path is required}/pki/ca.pem
+        target: /reference-state/pki/ca.pem
+        read_only: true
+      - type: bind
+        source: ${REFERENCE_STATE:?runtime state path is required}/pki/server.crt
+        target: /reference-state/pki/server.crt
+        read_only: true
+      - type: bind
+        source: ${REFERENCE_STATE:?runtime state path is required}/pki/server.key
+        target: /reference-state/pki/server.key
         read_only: true
       - type: bind
         source: ${REFERENCE_STATE:?runtime state path is required}/mosquitto

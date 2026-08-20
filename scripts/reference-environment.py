@@ -47,7 +47,6 @@ RUNTIME_KEYS = {
     "VAULT_PORT",
     "KEYCLOAK_PORT",
     "MQTT_PORT",
-    "MQTT_HEALTH_TOPIC",
 }
 SECRET_MARKERS = ("PASSWORD", "SECRET", "TOKEN")
 KEYCLOAK_BUILTIN_CLIENTS = {
@@ -212,6 +211,8 @@ def render_fixture_placeholders(value: object, fixture: dict[str, object]) -> ob
         "{{tenantId}}": str(fixture["tenantId"]),
         "{{deviceId}}": str(fixture["deviceId"]),
         "{{generation}}": str(fixture["generation"]),
+        "{{validitySeconds}}": str(fixture["rotationPolicy"]["validitySeconds"]),
+        "{{renewBeforeSeconds}}": str(fixture["rotationPolicy"]["renewBeforeSeconds"]),
     }
     if isinstance(value, str):
         for placeholder, replacement in replacements.items():
@@ -227,6 +228,14 @@ def render_fixture_placeholders(value: object, fixture: dict[str, object]) -> ob
             for key, item in value.items()
         }
     return value
+
+
+def duration_seconds(value: str) -> int:
+    match = re.fullmatch(r"([1-9][0-9]*)([smh])", value)
+    if match is None:
+        raise ReferenceEnvironmentError(f"unsupported duration: {value}")
+    multiplier = {"s": 1, "m": 60, "h": 3600}[match.group(2)]
+    return int(match.group(1)) * multiplier
 
 
 def tracked_secret_violations(entries: dict[str, bytes]) -> list[str]:
@@ -273,6 +282,7 @@ class ReferenceEnvironment:
         )
         self.values: dict[str, str] = {}
         self._keycloak_port: int | None = None
+        self._compose_model: dict[str, object] | None = None
 
     def private_values(self) -> tuple[str, ...]:
         values = [
@@ -298,7 +308,9 @@ class ReferenceEnvironment:
         run(["docker", "compose", "version"], timeout=15)
 
     def initialize_state(self) -> None:
-        if not self.state.exists() and any(self.project_resources().values()):
+        if not (self.state / SENTINEL).is_file() and any(
+            self.project_resources().values()
+        ):
             raise ReferenceEnvironmentError(
                 f"refusing to adopt existing Docker resources for project `{self.project}`"
             )
@@ -314,10 +326,6 @@ class ReferenceEnvironment:
             write_sentinel(self.state, self.project)
 
         if not self.env_file.exists():
-            tenant = self.fixture["tenantId"]
-            device = self.fixture["deviceId"]
-            generation = self.fixture["generation"]
-            downlink = self.fixture["mqtt"]["downlinkContracts"][0]
             values = {
                 "REFERENCE_STATE": str(self.state),
                 "REFERENCE_OWNER": secrets.token_hex(16),
@@ -334,7 +342,6 @@ class ReferenceEnvironment:
                 "VAULT_PORT": "0",
                 "KEYCLOAK_PORT": "0",
                 "MQTT_PORT": "0",
-                "MQTT_HEALTH_TOPIC": f"rss/v1/{tenant}/{device}/{generation}/downlink/{downlink}",
             }
             write_private_text(
                 self.env_file,
@@ -427,6 +434,22 @@ class ReferenceEnvironment:
         command.extend(arguments)
         return self.compose(*command, check=check, timeout=timeout)
 
+    def compose_model(self) -> dict[str, object]:
+        if self._compose_model is None:
+            self._compose_model = json.loads(
+                self.compose("config", "--format", "json", timeout=30).stdout
+            )
+        return self._compose_model
+
+    def service_image(self, service: str) -> str:
+        services = self.compose_model().get("services", {})
+        try:
+            return str(services[service]["image"])
+        except (KeyError, TypeError) as error:
+            raise ReferenceEnvironmentError(
+                f"canonical Compose image is missing: {service}"
+            ) from error
+
     def vault(
         self, arguments: list[str], *, token: str | None = None, check: bool = True
     ) -> subprocess.CompletedProcess[str]:
@@ -441,6 +464,7 @@ class ReferenceEnvironment:
         self.check_dependencies()
         self.initialize_state()
         self._keycloak_port = None
+        self._compose_model = None
         self.compose("config", "--quiet", timeout=30)
         self.compose("up", "--detach", "--wait", "--wait-timeout", "120", "vault", "postgres", timeout=150)
         self.verify_resource_ownership()
@@ -491,6 +515,12 @@ class ReferenceEnvironment:
         roles = self.vault_config["roles"]
         if not isinstance(roles, dict):
             raise ReferenceEnvironmentError("Vault role configuration is invalid")
+        inventory = self.vault(
+            ["list", "-format=json", f"{mount}/roles"], check=False
+        )
+        existing_roles = set(json.loads(inventory.stdout)) if inventory.returncode == 0 else set()
+        for extra in sorted(existing_roles - set(roles)):
+            self.vault(["delete", f"{mount}/roles/{extra}"])
         for name, desired in roles.items():
             if not isinstance(desired, dict):
                 raise ReferenceEnvironmentError(f"Vault role configuration is invalid: {name}")
@@ -607,7 +637,7 @@ class ReferenceEnvironment:
         )
         key.chmod(0o600)
         relative_csr = f"/reference-state/pki/{name}.csr"
-        fields = [f"csr=@{relative_csr}", f"common_name={common_name}", "ttl=1h"]
+        fields = [f"csr=@{relative_csr}", f"common_name={common_name}"]
         if san_kind == "URI":
             fields.append(f"uri_sans={san_value}")
         elif san_kind == "DNS":
@@ -709,7 +739,9 @@ class ReferenceEnvironment:
             tzinfo=timezone.utc
         )
         remaining = (not_after - datetime.now(timezone.utc)).total_seconds()
-        return 0 < remaining <= 3700
+        validity = int(self.fixture["rotationPolicy"]["validitySeconds"])
+        renew_before = int(self.fixture["rotationPolicy"]["renewBeforeSeconds"])
+        return renew_before < remaining <= validity + 100
 
     def bootstrap_postgres(self) -> None:
         self.compose_exec(
@@ -817,6 +849,44 @@ class ReferenceEnvironment:
             )
             self.keycloak_admin_request("POST", path, token=token, payload=[role])
 
+    def reconcile_identity_authority_sources(
+        self, *, user_id: str, desired_role: str, token: str
+    ) -> None:
+        self.reconcile_realm_role_mapping(
+            user_id=user_id, desired_role=desired_role, token=token
+        )
+        _, mappings = self.keycloak_admin_request(
+            "GET",
+            f"/realms/rss-device-security/users/{user_id}/role-mappings",
+            token=token,
+        )
+        if not isinstance(mappings, dict):
+            raise ReferenceEnvironmentError("Keycloak role-mapping inventory is invalid")
+        client_mappings = mappings.get("clientMappings") or {}
+        for mapping in client_mappings.values():
+            client_id = mapping.get("id")
+            roles = mapping.get("mappings") or []
+            if client_id and roles:
+                self.keycloak_admin_request(
+                    "DELETE",
+                    f"/realms/rss-device-security/users/{user_id}/role-mappings/clients/{client_id}",
+                    token=token,
+                    payload=roles,
+                )
+        _, groups = self.keycloak_admin_request(
+            "GET",
+            f"/realms/rss-device-security/users/{user_id}/groups",
+            token=token,
+        )
+        if not isinstance(groups, list):
+            raise ReferenceEnvironmentError("Keycloak group-membership inventory is invalid")
+        for group in groups:
+            self.keycloak_admin_request(
+                "DELETE",
+                f"/realms/rss-device-security/users/{user_id}/groups/{group['id']}",
+                token=token,
+            )
+
     def verify_realm_role_mapping(
         self, *, user_id: str, desired_role: str, token: str
     ) -> None:
@@ -830,6 +900,31 @@ class ReferenceEnvironment:
         if actual != expected:
             raise ReferenceEnvironmentError(
                 f"Keycloak direct realm-role closure differs for {user_id}: {actual}"
+            )
+
+    def verify_identity_authority_sources(
+        self, *, user_id: str, desired_role: str, token: str
+    ) -> None:
+        self.verify_realm_role_mapping(
+            user_id=user_id, desired_role=desired_role, token=token
+        )
+        _, mappings = self.keycloak_admin_request(
+            "GET",
+            f"/realms/rss-device-security/users/{user_id}/role-mappings",
+            token=token,
+        )
+        if not isinstance(mappings, dict) or mappings.get("clientMappings"):
+            raise ReferenceEnvironmentError(
+                f"Keycloak client-role mapping closure differs for {user_id}"
+            )
+        _, groups = self.keycloak_admin_request(
+            "GET",
+            f"/realms/rss-device-security/users/{user_id}/groups",
+            token=token,
+        )
+        if groups != []:
+            raise ReferenceEnvironmentError(
+                f"Keycloak group-membership closure differs for {user_id}"
             )
 
     def bootstrap_keycloak(self) -> None:
@@ -874,6 +969,24 @@ class ReferenceEnvironment:
                     token=token,
                     payload=role,
                 )
+            self.keycloak_admin_request(
+                "PUT",
+                f"/realms/rss-device-security/roles/{urllib.parse.quote(name, safe='')}",
+                token=token,
+                payload={**role, "composite": False},
+            )
+            _, composites = self.keycloak_admin_request(
+                "GET",
+                f"/realms/rss-device-security/roles/{urllib.parse.quote(name, safe='')}/composites",
+                token=token,
+            )
+            if isinstance(composites, list) and composites:
+                self.keycloak_admin_request(
+                    "DELETE",
+                    f"/realms/rss-device-security/roles/{urllib.parse.quote(name, safe='')}/composites",
+                    token=token,
+                    payload=composites,
+                )
 
         for client in desired["clients"]:
             query = urllib.parse.urlencode({"clientId": client["clientId"]})
@@ -915,7 +1028,7 @@ class ReferenceEnvironment:
         )
         if not isinstance(service_account, dict) or "id" not in service_account:
             raise ReferenceEnvironmentError("Keycloak service account identity is invalid")
-        self.reconcile_realm_role_mapping(
+        self.reconcile_identity_authority_sources(
             user_id=service_account["id"],
             desired_role="deviceidentity-service",
             token=token,
@@ -978,7 +1091,7 @@ class ReferenceEnvironment:
                 "value": self.values["OPERATOR_PASSWORD"],
             },
         )
-        self.reconcile_realm_role_mapping(
+        self.reconcile_identity_authority_sources(
             user_id=identifier,
             desired_role="rotation-operator",
             token=token,
@@ -1001,7 +1114,7 @@ class ReferenceEnvironment:
         lines.extend(f"topic write {topic}" for topic in downlinks)
         path = self.state / "mosquitto/acl"
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        path.chmod(0o644)
+        path.chmod(0o600)
 
     def bootstrap(self) -> None:
         self.check_dependencies()
@@ -1019,12 +1132,20 @@ class ReferenceEnvironment:
     def verify_vault(self) -> None:
         runtime_token = (self.state / "vault-runtime-token").read_text(encoding="utf-8").strip()
         mount = str(self.vault_config["mount"])
+        inventory = json.loads(
+            self.vault(["list", "-format=json", f"{mount}/roles"]).stdout
+        )
+        if set(inventory) != set(self.vault_config["roles"]):
+            raise ReferenceEnvironmentError(
+                f"Vault role inventory differs: {sorted(inventory)}"
+            )
         for role, desired in self.vault_config["roles"].items():
             result = json.loads(
                 self.vault(["read", "-format=json", f"{mount}/roles/{role}"]).stdout
             )["data"]
             expected = dict(desired)
-            expected["max_ttl"] = 24 * 60 * 60
+            expected["max_ttl"] = duration_seconds(str(desired["max_ttl"]))
+            expected["ttl"] = duration_seconds(str(desired["ttl"]))
             for key, value in expected.items():
                 if result.get(key) != value:
                     raise ReferenceEnvironmentError(
@@ -1074,7 +1195,6 @@ class ReferenceEnvironment:
                         f"{mount}/sign/mqtt-device",
                         f"csr=@{outside_csr}",
                         "common_name=reference-device",
-                        "ttl=1h",
                     ],
                     "Vault accepted an out-of-scope device URI SAN",
                 ),
@@ -1104,23 +1224,20 @@ class ReferenceEnvironment:
             for arguments, message in checks:
                 if self.vault(arguments, token=runtime_token, check=False).returncode == 0:
                     raise ReferenceEnvironmentError(message)
-            bounded = json.loads(
-                self.vault(
-                    [
-                        "write",
-                        "-format=json",
-                        f"{mount}/sign/mqtt-device",
-                        f"csr=@{legal_csr}",
-                        "common_name=reference-device",
-                        "ttl=25h",
-                    ],
-                    token=runtime_token,
-                ).stdout
+            ttl_override = self.vault(
+                [
+                    "write",
+                    f"{mount}/sign/mqtt-device",
+                    f"csr=@{legal_csr}",
+                    "common_name=reference-device",
+                    "ttl=25h",
+                ],
+                token=runtime_token,
+                check=False,
             )
-            remaining = int(bounded["data"]["expiration"]) - int(time.time())
-            if not 0 < remaining <= 24 * 60 * 60:
+            if ttl_override.returncode == 0:
                 raise ReferenceEnvironmentError(
-                    "Vault issued a certificate above the role TTL maximum"
+                    "Vault runtime signer accepted a caller-controlled certificate TTL"
                 )
         finally:
             shutil.rmtree(verification, ignore_errors=True)
@@ -1258,7 +1375,7 @@ SELECT json_build_object(
         )
         if not isinstance(operators, list) or len(operators) != 1:
             raise ReferenceEnvironmentError("Keycloak operator identity closure differs")
-        self.verify_realm_role_mapping(
+        self.verify_identity_authority_sources(
             user_id=operators[0]["id"],
             desired_role="rotation-operator",
             token=admin_token,
@@ -1270,7 +1387,7 @@ SELECT json_build_object(
         )
         if not isinstance(service_account, dict) or "id" not in service_account:
             raise ReferenceEnvironmentError("Keycloak service account identity closure differs")
-        self.verify_realm_role_mapping(
+        self.verify_identity_authority_sources(
             user_id=service_account["id"],
             desired_role="deviceidentity-service",
             token=admin_token,
@@ -1324,9 +1441,42 @@ SELECT json_build_object(
         service_roles = service_claims.get("realm_access", {}).get("roles", [])
         if "deviceidentity-service" not in service_roles:
             raise ReferenceEnvironmentError("Keycloak service identity role differs")
+        for role_name in ("rotation-operator", "deviceidentity-service"):
+            _, role = self.keycloak_admin_request(
+                "GET",
+                f"/realms/rss-device-security/roles/{role_name}",
+                token=admin_token,
+            )
+            _, composites = self.keycloak_admin_request(
+                "GET",
+                f"/realms/rss-device-security/roles/{role_name}/composites",
+                token=admin_token,
+            )
+            if not isinstance(role, dict) or role.get("composite") or composites != []:
+                raise ReferenceEnvironmentError(
+                    f"Keycloak managed role `{role_name}` is composite"
+                )
 
     def mqtt_command(self, arguments: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
-        return self.compose_exec("mosquitto", arguments, check=check, timeout=20)
+        return run(self.mqtt_command_line(arguments), check=check, timeout=20)
+
+    def mqtt_command_line(self, arguments: list[str]) -> list[str]:
+        container = self.compose("ps", "--quiet", "mosquitto", timeout=15).stdout.strip()
+        if not re.fullmatch(r"[0-9a-f]{12,64}", container):
+            raise ReferenceEnvironmentError("Mosquitto container identity is unavailable")
+        return [
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            f"container:{container}",
+            "--mount",
+            f"type=bind,source={self.state / 'pki'},target=/reference-state/pki,readonly",
+            "--entrypoint",
+            arguments[0],
+            self.service_image("mosquitto"),
+            *arguments[1:],
+        ]
 
     @staticmethod
     def mqtt_was_denied(result: subprocess.CompletedProcess[str]) -> bool:
@@ -1343,10 +1493,8 @@ SELECT json_build_object(
         message: str,
     ) -> None:
         subscriber = subprocess.Popen(
-            self.compose_command(
-                "exec",
-                "--no-TTY",
-                "mosquitto",
+            self.mqtt_command_line(
+                [
                 "mosquitto_sub",
                 *common,
                 *subscriber_auth,
@@ -1358,6 +1506,7 @@ SELECT json_build_object(
                 "10",
                 "-t",
                 topic,
+                ]
             ),
             cwd=ROOT,
             stdout=subprocess.PIPE,
@@ -1397,10 +1546,8 @@ SELECT json_build_object(
         topic: str,
     ) -> None:
         subscriber = subprocess.Popen(
-            self.compose_command(
-                "exec",
-                "--no-TTY",
-                "mosquitto",
+            self.mqtt_command_line(
+                [
                 "mosquitto_sub",
                 *common,
                 *identity,
@@ -1412,6 +1559,7 @@ SELECT json_build_object(
                 "2",
                 "-t",
                 topic,
+                ]
             ),
             cwd=ROOT,
             stdout=subprocess.PIPE,
@@ -1534,6 +1682,22 @@ SELECT json_build_object(
         )
         if not self.mqtt_was_denied(wrong_direction):
             raise ReferenceEnvironmentError("Mosquitto accepted a device write on a downlink")
+        service_wrong_direction = self.mqtt_command(
+            [
+                "mosquitto_pub",
+                *common,
+                *service_auth,
+                "-q",
+                "1",
+                "-t",
+                uplink,
+                "-m",
+                "forbidden",
+            ],
+            check=False,
+        )
+        if not self.mqtt_was_denied(service_wrong_direction):
+            raise ReferenceEnvironmentError("Mosquitto accepted a service write on an uplink")
         forbidden_topics = {
             "tenant": uplink.replace(tenant, "00000000-0000-0000-0000-000000000999"),
             "device": uplink.replace(device, "00000000-0000-0000-0000-000000000999"),
@@ -1557,6 +1721,30 @@ SELECT json_build_object(
             if not self.mqtt_was_denied(result):
                 raise ReferenceEnvironmentError(
                     f"Mosquitto accepted a cross-{boundary} topic"
+                )
+        service_forbidden_topics = {
+            "tenant": downlink.replace(tenant, "00000000-0000-0000-0000-000000000999"),
+            "device": downlink.replace(device, "00000000-0000-0000-0000-000000000999"),
+            "generation": downlink.replace(f"/{generation}/downlink/", "/999/downlink/"),
+        }
+        for boundary, topic in service_forbidden_topics.items():
+            result = self.mqtt_command(
+                [
+                    "mosquitto_pub",
+                    *common,
+                    *service_auth,
+                    "-q",
+                    "1",
+                    "-t",
+                    topic,
+                    "-m",
+                    "forbidden",
+                ],
+                check=False,
+            )
+            if not self.mqtt_was_denied(result):
+                raise ReferenceEnvironmentError(
+                    f"Mosquitto accepted a service cross-{boundary} topic"
                 )
         self.mqtt_expect_no_delivery(
             common=common, identity=device_auth, topic=uplink
@@ -1638,6 +1826,15 @@ SELECT json_build_object(
                 "max_ttl=24h",
             ]
         )
+        self.vault(
+            [
+                "write",
+                f"{self.vault_config['mount']}/roles/rogue",
+                "allow_any_name=true",
+                "client_flag=true",
+                "server_flag=true",
+            ]
+        )
         self.compose_exec(
             "postgres",
             [
@@ -1669,6 +1866,32 @@ SELECT json_build_object(
             f"/realms/rss-device-security/users/{service_account['id']}/role-mappings/realm",
             token=token,
             payload=[extra_role],
+        )
+        management_query = urllib.parse.urlencode({"clientId": "realm-management"})
+        _, management_clients = self.keycloak_admin_request(
+            "GET",
+            f"/realms/rss-device-security/clients?{management_query}",
+            token=token,
+        )
+        if not isinstance(management_clients, list) or len(management_clients) != 1:
+            raise ReferenceEnvironmentError("cannot inject Keycloak client-role drift")
+        management_id = management_clients[0]["id"]
+        _, manage_users = self.keycloak_admin_request(
+            "GET",
+            f"/realms/rss-device-security/clients/{management_id}/roles/manage-users",
+            token=token,
+        )
+        self.keycloak_admin_request(
+            "POST",
+            f"/realms/rss-device-security/users/{service_account['id']}/role-mappings/clients/{management_id}",
+            token=token,
+            payload=[manage_users],
+        )
+        self.keycloak_admin_request(
+            "POST",
+            "/realms/rss-device-security/roles/deviceidentity-service/composites",
+            token=token,
+            payload=[manage_users],
         )
         with (self.state / "mosquitto/acl").open("a", encoding="utf-8") as acl:
             acl.write("topic readwrite #\n")
@@ -1758,12 +1981,14 @@ SELECT json_build_object(
         return {**runtime, **material}
 
     def logs(self) -> None:
-        if self.env_file.exists():
-            result = self.compose("logs", "--no-color", check=False, timeout=30)
-            if result.stdout:
-                print(self.redact(result.stdout), file=sys.stderr)
-            if result.stderr:
-                print(self.redact(result.stderr), file=sys.stderr)
+        if not self.state.exists():
+            return
+        self.require_state()
+        result = self.compose("logs", "--no-color", check=False, timeout=30)
+        if result.stdout:
+            print(self.redact(result.stdout), file=sys.stderr)
+        if result.stderr:
+            print(self.redact(result.stderr), file=sys.stderr)
 
     def smoke(self) -> None:
         first_fingerprint: dict[str, str] | None = None
@@ -1777,6 +2002,7 @@ SELECT json_build_object(
         }
         try:
             self.down()
+            self.up()
             run(
                 [
                     "docker",
@@ -1812,12 +2038,11 @@ SELECT json_build_object(
                     f"com.docker.compose.project={neighbor_project}",
                     "--entrypoint",
                     "/bin/sh",
-                    "hashicorp/vault:2.0.3@sha256:a296a888b118615dc01d5f1a6846e6d4a7277946caaed5b447008fff5fe06b54",
+                    self.service_image("vault"),
                     "-c",
                     "while :; do sleep 60; done",
                 ]
             )
-            self.up()
             self.bootstrap()
             self.verify()
             before = self.fingerprints()
@@ -1888,7 +2113,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="rss-device-security-reference",
         help="isolated lowercase Docker Compose project identity",
     )
-    parser.add_argument("command", choices=("up", "bootstrap", "verify", "down", "smoke"))
+    parser.add_argument(
+        "command", choices=("up", "bootstrap", "verify", "logs", "down", "smoke")
+    )
     return parser.parse_args(argv)
 
 

@@ -12,6 +12,7 @@
       "allow_ip_sans": false,
       "server_flag": true,
       "client_flag": false,
+      "ttl": "{{validitySeconds}}s",
       "max_ttl": "24h"
     },
     "keycloak-server": {
@@ -21,6 +22,7 @@
       "allow_ip_sans": false,
       "server_flag": true,
       "client_flag": false,
+      "ttl": "{{validitySeconds}}s",
       "max_ttl": "24h"
     },
     "mqtt-device": {
@@ -31,6 +33,7 @@
       "allow_ip_sans": false,
       "server_flag": false,
       "client_flag": true,
+      "ttl": "{{validitySeconds}}s",
       "max_ttl": "24h"
     },
     "mqtt-service": {
@@ -40,6 +43,7 @@
       "allow_ip_sans": false,
       "server_flag": false,
       "client_flag": true,
+      "ttl": "{{validitySeconds}}s",
       "max_ttl": "24h"
     }
   }
