@@ -10,7 +10,8 @@ services:
         vault server -dev -dev-no-store-token -dev-tls
         -dev-tls-cert-dir=/reference-state/vault-tls
         -dev-listen-address=0.0.0.0:8200 2>&1 |
-        sed "s/$${VAULT_DEV_ROOT_TOKEN_ID}/<redacted-root-token>/g"
+        sed -e "s/$${VAULT_DEV_ROOT_TOKEN_ID}/<redacted-root-token>/g"
+        -e "s/^Unseal Key:.*/Unseal Key: <redacted-unseal-key>/"
     environment:
       VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_ROOT_TOKEN:?runtime Vault token is required}
       VAULT_ADDR: https://127.0.0.1:8200
@@ -65,7 +66,7 @@ services:
     image: quay.io/keycloak/keycloak:26.7.0@sha256:0f198be292568439d700cdbfb893e69a6009bb43a94a06a945b1d3d506c76b13
     user: ${HOST_UID:?host uid is required}:0
     command:
-      - start-dev
+      - start
       - --health-enabled=true
       - --http-enabled=false
       - --https-certificate-file=/reference-state/pki/keycloak.crt

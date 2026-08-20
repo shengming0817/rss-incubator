@@ -352,6 +352,7 @@ class ReferenceEnvironment:
             path = self.state / directory
             path.mkdir(exist_ok=True, mode=0o700)
             path.chmod(0o700)
+        self.verify_resource_ownership()
 
     def require_state(self) -> None:
         validate_sentinel(self.state, self.project)
@@ -779,20 +780,28 @@ class ReferenceEnvironment:
         return urllib.request.urlopen(request, timeout=10, context=context)
 
     def keycloak_admin_token(self) -> str:
-        request = urllib.request.Request(
-            self.keycloak_url("/realms/master/protocol/openid-connect/token"),
-            data=urllib.parse.urlencode(
-                {
-                    "grant_type": "password",
-                    "client_id": "admin-cli",
-                    "username": "reference-admin",
-                    "password": self.values["KEYCLOAK_ADMIN_PASSWORD"],
-                }
-            ).encode(),
-            method="POST",
-        )
-        with self.keycloak_open(request) as response:
-            return json.load(response)["access_token"]
+        deadline = time.monotonic() + 90
+        while True:
+            request = urllib.request.Request(
+                self.keycloak_url("/realms/master/protocol/openid-connect/token"),
+                data=urllib.parse.urlencode(
+                    {
+                        "grant_type": "password",
+                        "client_id": "admin-cli",
+                        "username": "reference-admin",
+                        "password": self.values["KEYCLOAK_ADMIN_PASSWORD"],
+                    }
+                ).encode(),
+                method="POST",
+            )
+            try:
+                with self.keycloak_open(request) as response:
+                    return json.load(response)["access_token"]
+            except (urllib.error.HTTPError, urllib.error.URLError) as error:
+                retryable = not isinstance(error, urllib.error.HTTPError) or error.code == 503
+                if not retryable or time.monotonic() >= deadline:
+                    raise
+                time.sleep(1)
 
     def keycloak_admin_request(
         self,
@@ -824,6 +833,72 @@ class ReferenceEnvironment:
             raise ReferenceEnvironmentError(
                 f"Keycloak Admin API {method} {path} failed ({error.code}): {self.redact(detail)}"
             ) from error
+
+    def reconcile_client_protocol_mappers(
+        self, *, client_id: str, desired: list[dict[str, object]], token: str
+    ) -> None:
+        path = f"/realms/rss-device-security/clients/{client_id}/protocol-mappers/models"
+        _, current = self.keycloak_admin_request("GET", path, token=token)
+        if not isinstance(current, list):
+            raise ReferenceEnvironmentError("Keycloak protocol-mapper inventory is invalid")
+        desired_by_name = {mapper["name"]: mapper for mapper in desired}
+        if len(desired_by_name) != len(desired):
+            raise ReferenceEnvironmentError("duplicate canonical Keycloak protocol mapper")
+        current_by_name = {mapper["name"]: mapper for mapper in current}
+        if len(current_by_name) != len(current):
+            raise ReferenceEnvironmentError("duplicate actual Keycloak protocol mapper")
+        for name, mapper in current_by_name.items():
+            if name not in desired_by_name:
+                self.keycloak_admin_request(
+                    "DELETE", f"{path}/{mapper['id']}", token=token
+                )
+        for name, mapper in desired_by_name.items():
+            existing = current_by_name.get(name)
+            if existing is None:
+                self.keycloak_admin_request("POST", path, token=token, payload=mapper)
+            else:
+                self.keycloak_admin_request(
+                    "PUT",
+                    f"{path}/{existing['id']}",
+                    token=token,
+                    payload={**mapper, "id": existing["id"]},
+                )
+
+    def verify_client_protocol_mappers(
+        self, *, client_id: str, desired: list[dict[str, object]], token: str
+    ) -> None:
+        _, current = self.keycloak_admin_request(
+            "GET",
+            f"/realms/rss-device-security/clients/{client_id}/protocol-mappers/models",
+            token=token,
+        )
+        if not isinstance(current, list):
+            raise ReferenceEnvironmentError("Keycloak protocol-mapper inventory is invalid")
+        actual_by_name = {mapper["name"]: mapper for mapper in current}
+        desired_by_name = {mapper["name"]: mapper for mapper in desired}
+        if set(actual_by_name) != set(desired_by_name):
+            raise ReferenceEnvironmentError("Keycloak protocol-mapper closure differs")
+        for name, expected in desired_by_name.items():
+            actual = actual_by_name[name]
+            for key in ("name", "protocol", "protocolMapper", "consentRequired", "config"):
+                if actual.get(key) != expected.get(key):
+                    raise ReferenceEnvironmentError(
+                        f"Keycloak protocol mapper `{name}` property differs: {key}"
+                    )
+
+    @staticmethod
+    def verify_token_authority(claims: dict[str, object], desired_role: str) -> None:
+        expected_roles = {desired_role}
+        actual_roles = set(claims.get("realm_access", {}).get("roles", []))
+        if actual_roles != expected_roles:
+            raise ReferenceEnvironmentError(
+                f"Keycloak token realm authority differs: {actual_roles}"
+            )
+        resource_access = claims.get("resource_access", {})
+        if resource_access != {}:
+            raise ReferenceEnvironmentError(
+                f"Keycloak token client authority differs: {set(resource_access)}"
+            )
 
     def reconcile_realm_role_mapping(
         self, *, user_id: str, desired_role: str, token: str
@@ -1006,6 +1081,14 @@ class ReferenceEnvironment:
                     token=token,
                     payload=representation,
                 )
+                _, created = self.keycloak_admin_request(
+                    "GET", f"/realms/rss-device-security/clients?{query}", token=token
+                )
+                if not isinstance(created, list) or len(created) != 1:
+                    raise ReferenceEnvironmentError(
+                        f"Keycloak client creation did not converge: {client['clientId']}"
+                    )
+                identifier = created[0]["id"]
             else:
                 self.keycloak_admin_request(
                     "PUT",
@@ -1013,6 +1096,11 @@ class ReferenceEnvironment:
                     token=token,
                     payload=representation,
                 )
+            self.reconcile_client_protocol_mappers(
+                client_id=identifier,
+                desired=client.get("protocolMappers", []),
+                token=token,
+            )
 
         query = urllib.parse.urlencode({"clientId": "deviceidentity"})
         _, service_clients = self.keycloak_admin_request(
@@ -1420,6 +1508,7 @@ SELECT json_build_object(
         claims = json.loads(base64.urlsafe_b64decode(payload))
         if claims.get("tenantId") != self.fixture["tenantId"]:
             raise ReferenceEnvironmentError("Keycloak tenant claim differs")
+        self.verify_token_authority(claims, "rotation-operator")
         service_request = urllib.request.Request(
             self.keycloak_url(
                 "/realms/rss-device-security/protocol/openid-connect/token"
@@ -1441,6 +1530,18 @@ SELECT json_build_object(
         service_roles = service_claims.get("realm_access", {}).get("roles", [])
         if "deviceidentity-service" not in service_roles:
             raise ReferenceEnvironmentError("Keycloak service identity role differs")
+        self.verify_token_authority(service_claims, "deviceidentity-service")
+        desired_realm = render_fixture_placeholders(
+            json.loads((DEPLOY_ROOT / "keycloak/realm.json").read_text(encoding="utf-8")),
+            self.fixture,
+        )
+        for desired_client in desired_realm["clients"]:
+            actual_client = client_by_name[desired_client["clientId"]]
+            self.verify_client_protocol_mappers(
+                client_id=actual_client["id"],
+                desired=desired_client.get("protocolMappers", []),
+                token=admin_token,
+            )
         for role_name in ("rotation-operator", "deviceidentity-service"):
             _, role = self.keycloak_admin_request(
                 "GET",
@@ -1892,6 +1993,21 @@ SELECT json_build_object(
             "/realms/rss-device-security/roles/deviceidentity-service/composites",
             token=token,
             payload=[manage_users],
+        )
+        self.keycloak_admin_request(
+            "POST",
+            f"/realms/rss-device-security/clients/{clients[0]['id']}/protocol-mappers/models",
+            token=token,
+            payload={
+                "name": "rogue-privileged-role",
+                "protocol": "openid-connect",
+                "protocolMapper": "oidc-hardcoded-role-mapper",
+                "consentRequired": False,
+                "config": {
+                    "role": "realm-management.manage-users",
+                    "access.token.claim": "true",
+                },
+            },
         )
         with (self.state / "mosquitto/acl").open("a", encoding="utf-8") as acl:
             acl.write("topic readwrite #\n")
