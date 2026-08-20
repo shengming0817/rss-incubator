@@ -40,7 +40,19 @@ complete: this repository owns the consumer proof and RSS retains the Release Su
 
 The committed root `Cargo.lock` is the single dependency resolution for this workspace.
 
+The disposable Secure Device Rotation provider environment has one lifecycle entrypoint. It creates
+all credentials under the ignored `deploy/.state/<project>` directory and binds published ports to
+loopback only:
+
 ```sh
+python3 scripts/reference-environment.py smoke
+```
+
+See [`deploy/README.md`](deploy/README.md) for individual lifecycle commands, failure diagnosis, and
+the environment's External/T2-only acceptance boundary.
+
+```sh
+python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 cargo fmt --all -- --check
 cargo check --workspace --all-targets --locked
 cargo test --workspace --all-targets --locked

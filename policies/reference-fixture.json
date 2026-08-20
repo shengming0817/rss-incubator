@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "tenantId": "00000000-0000-0000-0000-000000000001",
+  "deviceId": "00000000-0000-0000-0000-000000000101",
+  "generation": 1,
+  "resourceFact": {
+    "resourceType": "device",
+    "classification": "managed",
+    "location": "reference-lab"
+  },
+  "rotationPolicy": {
+    "validitySeconds": 3600,
+    "renewBeforeSeconds": 600
+  },
+  "mqtt": {
+    "deviceUsername": "reference-device",
+    "serviceUsername": "deviceidentity-service",
+    "uplinkContracts": [
+      "identity.device-command-acked",
+      "identity.device-certificate-reported"
+    ],
+    "downlinkContracts": [
+      "identity.commands.apply-device-certificate",
+      "identity.device-ingress-receipted"
+    ]
+  }
+}

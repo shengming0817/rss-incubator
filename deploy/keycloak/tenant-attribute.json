@@ -1,0 +1,13 @@
+{
+  "name": "tenantId",
+  "displayName": "Tenant ID",
+  "validations": {
+    "length": {"min": 36, "max": 36}
+  },
+  "required": {"roles": ["user"]},
+  "permissions": {
+    "view": ["admin", "user"],
+    "edit": ["admin"]
+  },
+  "multivalued": false
+}

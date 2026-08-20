@@ -60,6 +60,45 @@ jobs:
       - name: Lint workspace
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  reference-environment:
+    name: reference-environment
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout incubator revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify Docker runtime
+        run: |
+          set -euo pipefail
+          docker version
+          docker compose version
+
+      - name: Run disposable reference environment journey
+        env:
+          REFERENCE_PROJECT: rss-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        run: python3 scripts/reference-environment.py --project "$REFERENCE_PROJECT" smoke
+
+      - name: Collect scoped logs after failure
+        if: ${{ failure() }}
+        env:
+          REFERENCE_PROJECT: rss-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set +e
+          state="deploy/.state/$REFERENCE_PROJECT"
+          if [[ -f "$state/runtime.env" ]]; then
+            docker compose --env-file "$state/runtime.env" \
+              --project-name "$REFERENCE_PROJECT" --file deploy/compose.yaml logs --no-color
+          fi
+
+      - name: Remove scoped runtime state
+        if: ${{ always() }}
+        env:
+          REFERENCE_PROJECT: rss-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        run: python3 scripts/reference-environment.py --project "$REFERENCE_PROJECT" down
+
   candidate-proof:
     name: candidate-proof
     if: ${{ github.event_name == 'workflow_dispatch' }}
