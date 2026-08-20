@@ -59,7 +59,7 @@
       "emailVerified": true,
       "email": "operator@reference.invalid",
       "attributes": {
-        "tenantId": ["00000000-0000-0000-0000-000000000001"]
+        "tenantId": ["{{tenantId}}"]
       },
       "requiredActions": [],
       "realmRoles": ["rotation-operator"]

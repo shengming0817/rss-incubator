@@ -29,6 +29,7 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
             ROOT / "deploy/keycloak/realm.json",
             ROOT / "deploy/keycloak/tenant-attribute.json",
             ROOT / "deploy/vault/deviceidentity-sign.hcl",
+            ROOT / "deploy/vault/roles.json",
             ROOT / "deploy/mosquitto/mosquitto.conf",
             ROOT / "deploy/postgres/bootstrap.sql",
         }
@@ -41,6 +42,9 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
             environment.update(
                 {
                     "REFERENCE_STATE": str(state),
+                    "REFERENCE_OWNER": "0" * 32,
+                    "HOST_UID": str(os.getuid()),
+                    "HOST_GID": str(os.getgid()),
                     "VAULT_ROOT_TOKEN": "unit-vault-token",
                     "POSTGRES_SUPERUSER_PASSWORD": "unit-postgres-password",
                     "KEYCLOAK_ADMIN_PASSWORD": "unit-keycloak-password",
@@ -76,16 +80,35 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
             self.assertNotIn("build", service)
             self.assertNotIn("rss", service["image"].lower())
             self.assertIn("healthcheck", service)
+            self.assertEqual("0" * 32, service["labels"]["rss.reference.owner"])
             for port in service.get("ports", []):
                 self.assertEqual("127.0.0.1", port.get("host_ip"))
                 self.assertNotEqual(1883, port["target"])
+        self.assertEqual(
+            f"{os.getuid()}:{os.getgid()}", model["services"]["vault"]["user"]
+        )
+        self.assertEqual(
+            f"{os.getuid()}:{os.getgid()}", model["services"]["mosquitto"]["user"]
+        )
+        self.assertEqual(f"{os.getuid()}:0", model["services"]["keycloak"]["user"])
+        self.assertEqual(
+            "false", model["services"]["keycloak"]["environment"]["KC_HTTP_ENABLED"]
+        )
+        self.assertEqual(8443, model["services"]["keycloak"]["ports"][0]["target"])
+        self.assertIn(
+            "<redacted-root-token>", " ".join(model["services"]["vault"]["command"])
+        )
         state_root = str(state)
         self.assertNotIn(
             state_root,
             {volume["source"] for volume in model["services"]["keycloak"].get("volumes", [])},
         )
         self.assertEqual(
-            {f"{state_root}/pki", f"{state_root}/mosquitto"},
+            {
+                f"{state_root}/pki",
+                f"{state_root}/mosquitto",
+                f"{state_root}/mosquitto-data",
+            },
             {
                 volume["source"]
                 for volume in model["services"]["mosquitto"]["volumes"]
@@ -126,7 +149,7 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
         )
         self.assertEqual(
             {
-                "identity.commands.apply-device-certificate",
+                "identity.apply-device-certificate",
                 "identity.device-ingress-receipted",
             },
             set(fixture["mqtt"]["downlinkContracts"]),
@@ -144,9 +167,21 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
 
         policy = (ROOT / "deploy/vault/deviceidentity-sign.hcl").read_text(encoding="utf-8")
         self.assertIn('path "device-pki/sign/mqtt-device"', policy)
-        self.assertIn('path "device-pki/sign/mqtt-service"', policy)
+        self.assertNotIn('path "device-pki/sign/mqtt-service"', policy)
+        self.assertNotIn('path "device-pki/sign/mosquitto-server"', policy)
         self.assertNotIn('path "device-pki/root', policy)
         self.assertNotIn('capabilities = ["sudo"]', policy)
+
+        vault_roles = json.loads(
+            (ROOT / "deploy/vault/roles.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            {"mosquitto-server", "keycloak-server", "mqtt-device", "mqtt-service"},
+            set(vault_roles["roles"]),
+        )
+        self.assertTrue(
+            all(not role["allow_ip_sans"] for role in vault_roles["roles"].values())
+        )
 
         realm = json.loads(
             (ROOT / "deploy/keycloak/realm.json").read_text(encoding="utf-8")
@@ -175,12 +210,23 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
     def test_secret_material_is_runtime_only(self):
         gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
         self.assertIn("/deploy/.state/", gitignore)
-        for base in (ROOT / "deploy", ROOT / "policies"):
-            for path in base.rglob("*"):
-                if path.is_file() and ".state" not in path.parts:
-                    contents = path.read_text(encoding="utf-8")
-                    self.assertNotIn("BEGIN PRIVATE KEY", contents, path)
-                    self.assertNotIn("BEGIN RSA PRIVATE KEY", contents, path)
+        module = load_reference_environment()
+        self.assertEqual([], module.tracked_secret_violations(module.git_tracked_entries()))
+
+    def test_secret_detector_has_synthetic_red_cases(self):
+        module = load_reference_environment()
+        private_key = b"-----BEGIN " + b"PRIVATE KEY-----\nsynthetic\n"
+        vault_token = b"token=" + b"hvs." + b"syntheticcredentialvalue"
+        password = b"password=" + (b"a" * 40)
+        violations = module.tracked_secret_violations(
+            {
+                "deploy/.state/forced/runtime.env": b"synthetic",
+                "README-secret.md": private_key,
+                "scripts/token.txt": vault_token,
+                "policies/password.txt": password,
+            }
+        )
+        self.assertEqual(4, len(violations), violations)
 
     def test_project_and_state_validation_rejects_unsafe_targets(self):
         module = load_reference_environment()
@@ -214,6 +260,20 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
         )
         self.assertTrue(module.ReferenceEnvironment.mqtt_was_denied(denied))
         self.assertFalse(module.ReferenceEnvironment.mqtt_was_denied(accepted))
+
+    def test_log_redaction_includes_persisted_runtime_token(self):
+        module = load_reference_environment()
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            environment = object.__new__(module.ReferenceEnvironment)
+            environment.state = state
+            environment.values = {"VAULT_ROOT_TOKEN": "a" * 48}
+            (state / "vault-runtime-token").write_text("runtime-token-value\n", encoding="utf-8")
+            redacted = environment.redact(
+                f"root={'a' * 48}; runtime=runtime-token-value"
+            )
+        self.assertNotIn("a" * 48, redacted)
+        self.assertNotIn("runtime-token-value", redacted)
 
 
 if __name__ == "__main__":

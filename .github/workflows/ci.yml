@@ -81,18 +81,6 @@ jobs:
           REFERENCE_PROJECT: rss-ci-${{ github.run_id }}-${{ github.run_attempt }}
         run: python3 scripts/reference-environment.py --project "$REFERENCE_PROJECT" smoke
 
-      - name: Collect scoped logs after failure
-        if: ${{ failure() }}
-        env:
-          REFERENCE_PROJECT: rss-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        run: |
-          set +e
-          state="deploy/.state/$REFERENCE_PROJECT"
-          if [[ -f "$state/runtime.env" ]]; then
-            docker compose --env-file "$state/runtime.env" \
-              --project-name "$REFERENCE_PROJECT" --file deploy/compose.yaml logs --no-color
-          fi
-
       - name: Remove scoped runtime state
         if: ${{ always() }}
         env:

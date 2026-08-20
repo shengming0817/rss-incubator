@@ -20,7 +20,7 @@
       "identity.device-certificate-reported"
     ],
     "downlinkContracts": [
-      "identity.commands.apply-device-certificate",
+      "identity.apply-device-certificate",
       "identity.device-ingress-receipted"
     ]
   }

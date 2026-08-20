@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
 import os
@@ -12,7 +15,7 @@ from pathlib import Path
 import re
 import secrets
 import shutil
-import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -28,6 +31,33 @@ FIXTURE_FILE = ROOT / "policies/reference-fixture.json"
 SENTINEL = ".rss-reference-environment.json"
 PROJECT_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}\Z")
 STATE_SCHEMA = 1
+RUNTIME_KEYS = {
+    "REFERENCE_STATE",
+    "REFERENCE_OWNER",
+    "HOST_UID",
+    "HOST_GID",
+    "VAULT_ROOT_TOKEN",
+    "POSTGRES_SUPERUSER_PASSWORD",
+    "KEYCLOAK_ADMIN_PASSWORD",
+    "KEYCLOAK_DB_PASSWORD",
+    "DEVICEIDENTITY_MIGRATOR_PASSWORD",
+    "DEVICEIDENTITY_APP_PASSWORD",
+    "DEVICEIDENTITY_CLIENT_SECRET",
+    "OPERATOR_PASSWORD",
+    "VAULT_PORT",
+    "KEYCLOAK_PORT",
+    "MQTT_PORT",
+    "MQTT_HEALTH_TOPIC",
+}
+SECRET_MARKERS = ("PASSWORD", "SECRET", "TOKEN")
+KEYCLOAK_BUILTIN_CLIENTS = {
+    "account",
+    "account-console",
+    "admin-cli",
+    "broker",
+    "realm-management",
+    "security-admin-console",
+}
 
 
 class ReferenceEnvironmentError(RuntimeError):
@@ -62,11 +92,10 @@ def write_sentinel(state: Path, project: str, *, deploy_root: Path = DEPLOY_ROOT
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     state.chmod(0o700)
     path = state / SENTINEL
-    path.write_text(
+    write_private_text(
+        path,
         json.dumps(sentinel_payload(project, deploy_root), sort_keys=True) + "\n",
-        encoding="utf-8",
     )
-    path.chmod(0o600)
 
 
 def validate_sentinel(
@@ -101,15 +130,24 @@ def run(
     timeout: int | None = None,
     redact: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(
-        command,
-        cwd=cwd,
-        env=env,
-        check=False,
-        capture_output=capture,
-        text=True,
-        timeout=timeout,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            env=env,
+            check=False,
+            capture_output=capture,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        display_command = " ".join(command)
+        for value in redact:
+            if value:
+                display_command = display_command.replace(value, "<redacted>")
+        raise ReferenceEnvironmentError(
+            f"command timed out: {display_command}"
+        ) from error
     if check and completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip()
         display_command = " ".join(command)
@@ -123,12 +161,6 @@ def run(
     return completed
 
 
-def choose_loopback_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.bind(("127.0.0.1", 0))
-        return listener.getsockname()[1]
-
-
 def read_env_file(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -137,14 +169,96 @@ def read_env_file(path: Path) -> dict[str, str]:
         key, separator, value = line.partition("=")
         if not separator or not key or "\n" in value or "\r" in value:
             raise ReferenceEnvironmentError(f"invalid runtime environment line in {path}")
+        if key in values:
+            raise ReferenceEnvironmentError(f"duplicate runtime environment key in {path}: {key}")
         values[key] = value
     return values
 
 
 def write_private_text(path: Path, contents: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path.write_text(contents, encoding="utf-8")
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            output.write(contents)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
     path.chmod(0o600)
+
+
+@contextmanager
+def project_lock(project: str):
+    validate_project_name(project)
+    lock_root = DEPLOY_ROOT / ".state/.locks"
+    lock_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_root.chmod(0o700)
+    lock_path = lock_root / f"{project}.lock"
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ReferenceEnvironmentError(
+                f"another lifecycle command owns project `{project}`"
+            ) from error
+        yield
+
+
+def render_fixture_placeholders(value: object, fixture: dict[str, object]) -> object:
+    replacements = {
+        "{{tenantId}}": str(fixture["tenantId"]),
+        "{{deviceId}}": str(fixture["deviceId"]),
+        "{{generation}}": str(fixture["generation"]),
+    }
+    if isinstance(value, str):
+        for placeholder, replacement in replacements.items():
+            value = value.replace(placeholder, replacement)
+        if "{{" in value or "}}" in value:
+            raise ReferenceEnvironmentError(f"unknown fixture placeholder: {value}")
+        return value
+    if isinstance(value, list):
+        return [render_fixture_placeholders(item, fixture) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: render_fixture_placeholders(item, fixture)
+            for key, item in value.items()
+        }
+    return value
+
+
+def tracked_secret_violations(entries: dict[str, bytes]) -> list[str]:
+    private_markers = (
+        b"-----BEGIN " + b"PRIVATE KEY-----",
+        b"-----BEGIN " + b"RSA PRIVATE KEY-----",
+        b"-----BEGIN " + b"OPENSSH PRIVATE KEY-----",
+    )
+    credential = re.compile(
+        rb"(?i)(password|secret|token)\s*[:=]\s*['\"]?(?:[0-9a-f]{32,}|hvs\.[A-Za-z0-9_-]{16,})"
+    )
+    violations = []
+    for name, contents in entries.items():
+        normalized = Path(name).as_posix()
+        if normalized == "deploy/.state" or normalized.startswith("deploy/.state/"):
+            violations.append(f"tracked runtime state: {normalized}")
+        if b"\0" in contents:
+            continue
+        if any(marker in contents for marker in private_markers):
+            violations.append(f"tracked private key: {normalized}")
+        if credential.search(contents):
+            violations.append(f"tracked credential-shaped value: {normalized}")
+    return violations
+
+
+def git_tracked_entries() -> dict[str, bytes]:
+    names = run(["/usr/bin/git", "ls-files", "-z"]).stdout.split("\0")
+    return {
+        name: (ROOT / name).read_bytes()
+        for name in names
+        if name and (ROOT / name).is_file()
+    }
 
 
 class ReferenceEnvironment:
@@ -153,14 +267,23 @@ class ReferenceEnvironment:
         self.state = state_directory(project)
         self.env_file = self.state / "runtime.env"
         self.fixture = json.loads(FIXTURE_FILE.read_text(encoding="utf-8"))
+        self.vault_config = render_fixture_placeholders(
+            json.loads((DEPLOY_ROOT / "vault/roles.json").read_text(encoding="utf-8")),
+            self.fixture,
+        )
         self.values: dict[str, str] = {}
+        self._keycloak_port: int | None = None
 
     def private_values(self) -> tuple[str, ...]:
-        return tuple(
+        values = [
             value
             for key, value in self.values.items()
-            if any(marker in key for marker in ("PASSWORD", "SECRET", "TOKEN"))
-        )
+            if any(marker in key for marker in SECRET_MARKERS)
+        ]
+        token_path = self.state / "vault-runtime-token"
+        if token_path.is_file():
+            values.append(token_path.read_text(encoding="utf-8").strip())
+        return tuple(values)
 
     def redact(self, text: str) -> str:
         for value in self.private_values():
@@ -175,6 +298,10 @@ class ReferenceEnvironment:
         run(["docker", "compose", "version"], timeout=15)
 
     def initialize_state(self) -> None:
+        if not self.state.exists() and any(self.project_resources().values()):
+            raise ReferenceEnvironmentError(
+                f"refusing to adopt existing Docker resources for project `{self.project}`"
+            )
         self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.state.chmod(0o700)
         if (self.state / SENTINEL).exists():
@@ -193,6 +320,9 @@ class ReferenceEnvironment:
             downlink = self.fixture["mqtt"]["downlinkContracts"][0]
             values = {
                 "REFERENCE_STATE": str(self.state),
+                "REFERENCE_OWNER": secrets.token_hex(16),
+                "HOST_UID": str(os.getuid()),
+                "HOST_GID": str(os.getgid()),
                 "VAULT_ROOT_TOKEN": secrets.token_hex(24),
                 "POSTGRES_SUPERUSER_PASSWORD": secrets.token_hex(24),
                 "KEYCLOAK_ADMIN_PASSWORD": secrets.token_hex(24),
@@ -201,17 +331,17 @@ class ReferenceEnvironment:
                 "DEVICEIDENTITY_APP_PASSWORD": secrets.token_hex(24),
                 "DEVICEIDENTITY_CLIENT_SECRET": secrets.token_hex(24),
                 "OPERATOR_PASSWORD": secrets.token_hex(18),
-                "VAULT_PORT": str(choose_loopback_port()),
-                "KEYCLOAK_PORT": str(choose_loopback_port()),
-                "MQTT_PORT": str(choose_loopback_port()),
+                "VAULT_PORT": "0",
+                "KEYCLOAK_PORT": "0",
+                "MQTT_PORT": "0",
                 "MQTT_HEALTH_TOPIC": f"rss/v1/{tenant}/{device}/{generation}/downlink/{downlink}",
             }
             write_private_text(
                 self.env_file,
                 "".join(f"{key}={value}\n" for key, value in sorted(values.items())),
             )
-        self.values = read_env_file(self.env_file)
-        for directory in ("vault-tls", "pki", "mosquitto"):
+        self.load_runtime_values()
+        for directory in ("vault-tls", "pki", "mosquitto", "mosquitto-data"):
             path = self.state / directory
             path.mkdir(exist_ok=True, mode=0o700)
             path.chmod(0o700)
@@ -220,7 +350,38 @@ class ReferenceEnvironment:
         validate_sentinel(self.state, self.project)
         if not self.env_file.is_file():
             raise ReferenceEnvironmentError("runtime environment is missing; run `up` first")
-        self.values = read_env_file(self.env_file)
+        self.load_runtime_values()
+
+    def load_runtime_values(self) -> None:
+        values = read_env_file(self.env_file)
+        if set(values) != RUNTIME_KEYS:
+            missing = sorted(RUNTIME_KEYS - set(values))
+            extra = sorted(set(values) - RUNTIME_KEYS)
+            raise ReferenceEnvironmentError(
+                f"runtime environment key closure differs; missing={missing}, extra={extra}"
+            )
+        if Path(values["REFERENCE_STATE"]).resolve() != self.state.resolve():
+            raise ReferenceEnvironmentError("runtime REFERENCE_STATE differs from canonical state")
+        if not re.fullmatch(r"[0-9a-f]{32}", values["REFERENCE_OWNER"]):
+            raise ReferenceEnvironmentError("runtime owner identity is invalid")
+        if values["HOST_UID"] != str(os.getuid()) or values["HOST_GID"] != str(os.getgid()):
+            raise ReferenceEnvironmentError("runtime host ownership differs from this process")
+        ports = []
+        for key in ("VAULT_PORT", "KEYCLOAK_PORT", "MQTT_PORT"):
+            try:
+                port = int(values[key])
+            except ValueError as error:
+                raise ReferenceEnvironmentError(f"runtime port is invalid: {key}") from error
+            if port != 0 and not 1024 <= port <= 65535:
+                raise ReferenceEnvironmentError(f"runtime port is out of range: {key}")
+            ports.append(port)
+        explicit_ports = [port for port in ports if port != 0]
+        if len(set(explicit_ports)) != len(explicit_ports):
+            raise ReferenceEnvironmentError("runtime ports must be distinct")
+        for key in RUNTIME_KEYS:
+            if any(marker in key for marker in SECRET_MARKERS) and len(values[key]) < 24:
+                raise ReferenceEnvironmentError(f"runtime secret is missing or too short: {key}")
+        self.values = values
 
     def compose_command(self, *arguments: str) -> list[str]:
         return [
@@ -279,25 +440,29 @@ class ReferenceEnvironment:
     def up(self) -> None:
         self.check_dependencies()
         self.initialize_state()
+        self._keycloak_port = None
         self.compose("config", "--quiet", timeout=30)
         self.compose("up", "--detach", "--wait", "--wait-timeout", "120", "vault", "postgres", timeout=150)
+        self.verify_resource_ownership()
 
     def bootstrap_vault(self) -> None:
         mounts = json.loads(self.vault(["secrets", "list", "-format=json"]).stdout)
-        if "device-pki/" not in mounts:
-            self.vault(["secrets", "enable", "-path=device-pki", "pki"])
+        mount = str(self.vault_config["mount"])
+        if f"{mount}/" not in mounts:
+            self.vault(["secrets", "enable", f"-path={mount}", "pki"])
 
-        ca = self.vault(["read", "-field=certificate", "device-pki/cert/ca"], check=False)
+        ca = self.vault(["read", "-field=certificate", f"{mount}/cert/ca"], check=False)
         if ca.returncode != 0 or "BEGIN CERTIFICATE" not in ca.stdout:
+            ca_config = self.vault_config["ca"]
             self.vault(
                 [
                     "write",
-                    "device-pki/root/generate/internal",
-                    "common_name=RSS Device Security Reference CA",
-                    "ttl=8760h",
+                    f"{mount}/root/generate/internal",
+                    f"common_name={ca_config['commonName']}",
+                    f"ttl={ca_config['ttl']}",
                 ]
             )
-            ca = self.vault(["read", "-field=certificate", "device-pki/cert/ca"])
+            ca = self.vault(["read", "-field=certificate", f"{mount}/cert/ca"])
 
         ca_path = self.state / "pki/ca.pem"
         previous_ca = ca_path.read_text(encoding="utf-8") if ca_path.exists() else None
@@ -308,39 +473,37 @@ class ReferenceEnvironment:
                     path.unlink()
         ca_path.write_text(ca_pem, encoding="utf-8")
         ca_path.chmod(0o644)
+        ca_subject = run(
+            [
+                "openssl",
+                "x509",
+                "-in",
+                str(ca_path),
+                "-noout",
+                "-subject",
+                "-nameopt",
+                "RFC2253",
+            ]
+        ).stdout.strip()
+        if ca_subject != f"subject=CN={self.vault_config['ca']['commonName']}":
+            raise ReferenceEnvironmentError("Vault CA identity differs from canonical configuration")
 
-        tenant = self.fixture["tenantId"]
-        device = self.fixture["deviceId"]
-        generation = self.fixture["generation"]
-        device_uri = f"urn:rss:mqtt-device:v1:{tenant}:{device}:{generation}"
-        roles = {
-            "reference-server": [
-                "allowed_domains=mosquitto,localhost",
-                "allow_bare_domains=true",
-                "allow_subdomains=false",
-                "allow_ip_sans=true",
-                "server_flag=true",
-                "client_flag=false",
-                "max_ttl=24h",
-            ],
-            "mqtt-device": [
-                "allowed_domains=reference-device",
-                "allow_bare_domains=true",
-                f"allowed_uri_sans={device_uri}",
-                "server_flag=false",
-                "client_flag=true",
-                "max_ttl=24h",
-            ],
-            "mqtt-service": [
-                "allowed_domains=deviceidentity-service",
-                "allow_bare_domains=true",
-                "server_flag=false",
-                "client_flag=true",
-                "max_ttl=24h",
-            ],
-        }
-        for name, fields in roles.items():
-            self.vault(["write", f"device-pki/roles/{name}", *fields])
+        roles = self.vault_config["roles"]
+        if not isinstance(roles, dict):
+            raise ReferenceEnvironmentError("Vault role configuration is invalid")
+        for name, desired in roles.items():
+            if not isinstance(desired, dict):
+                raise ReferenceEnvironmentError(f"Vault role configuration is invalid: {name}")
+            fields = []
+            for key, value in desired.items():
+                if isinstance(value, bool):
+                    rendered = str(value).lower()
+                elif isinstance(value, list):
+                    rendered = ",".join(str(item) for item in value)
+                else:
+                    rendered = str(value)
+                fields.append(f"{key}={rendered}")
+            self.vault(["write", f"{mount}/roles/{name}", *fields])
         self.vault(
             ["policy", "write", "deviceidentity-sign", "/reference-config/vault/deviceidentity-sign.hcl"]
         )
@@ -363,11 +526,20 @@ class ReferenceEnvironment:
         self.ensure_certificate(
             name="server",
             common_name="mosquitto",
-            role="reference-server",
+            role="mosquitto-server",
             san_kind="DNS",
-            san_value="mosquitto,DNS:localhost,IP:127.0.0.1",
-            token=runtime_token,
+            san_value="mosquitto,DNS:localhost",
+            token=self.values["VAULT_ROOT_TOKEN"],
         )
+        self.ensure_certificate(
+            name="keycloak",
+            common_name="localhost",
+            role="keycloak-server",
+            san_kind="DNS",
+            san_value="localhost",
+            token=self.values["VAULT_ROOT_TOKEN"],
+        )
+        device_uri = self.vault_config["roles"]["mqtt-device"]["allowed_uri_sans"][0]
         self.ensure_certificate(
             name="device",
             common_name="reference-device",
@@ -382,7 +554,7 @@ class ReferenceEnvironment:
             role="mqtt-service",
             san_kind="DNS",
             san_value="deviceidentity-service",
-            token=runtime_token,
+            token=self.values["VAULT_ROOT_TOKEN"],
         )
 
     def ensure_certificate(
@@ -400,11 +572,14 @@ class ReferenceEnvironment:
         csr = directory / f"{name}.csr"
         certificate = directory / f"{name}.crt"
         if key.exists() and csr.exists() and certificate.exists():
-            verify = run(
-                ["openssl", "verify", "-CAfile", str(directory / "ca.pem"), str(certificate)],
-                check=False,
-            )
-            if verify.returncode == 0:
+            if self.certificate_matches(
+                key=key,
+                certificate=certificate,
+                common_name=common_name,
+                role=role,
+                san_kind=san_kind,
+                san_value=san_value,
+            ):
                 return
             key.unlink(missing_ok=True)
             csr.unlink(missing_ok=True)
@@ -450,8 +625,91 @@ class ReferenceEnvironment:
             ).stdout
         )
         pem = response["data"]["certificate"].strip() + "\n"
-        certificate.write_text(pem, encoding="utf-8")
+        write_private_text(certificate, pem)
         certificate.chmod(0o644)
+
+    def certificate_matches(
+        self,
+        *,
+        key: Path,
+        certificate: Path,
+        common_name: str,
+        role: str,
+        san_kind: str,
+        san_value: str,
+    ) -> bool:
+        directory = self.state / "pki"
+        verify = run(
+            ["openssl", "verify", "-CAfile", str(directory / "ca.pem"), str(certificate)],
+            check=False,
+        )
+        if verify.returncode != 0:
+            return False
+        certificate_key = run(
+            ["openssl", "x509", "-in", str(certificate), "-pubkey", "-noout"]
+        ).stdout
+        private_key = run(
+            ["openssl", "pkey", "-in", str(key), "-pubout"]
+        ).stdout
+        if certificate_key != private_key:
+            return False
+        subject = run(
+            [
+                "openssl",
+                "x509",
+                "-in",
+                str(certificate),
+                "-noout",
+                "-subject",
+                "-nameopt",
+                "RFC2253",
+            ]
+        ).stdout.strip()
+        if subject != f"subject=CN={common_name}":
+            return False
+        san_output = run(
+            ["openssl", "x509", "-in", str(certificate), "-noout", "-ext", "subjectAltName"]
+        ).stdout
+        actual_sans = {
+            item.strip().replace(" ", "")
+            for line in san_output.splitlines()[1:]
+            for item in line.split(",")
+            if item.strip()
+        }
+        if san_kind == "URI":
+            expected_sans = {f"DNS:{common_name}", f"URI:{san_value}"}
+        else:
+            expected_sans = {
+                item if ":" in item else f"DNS:{item}"
+                for item in san_value.split(",")
+            }
+        if actual_sans != expected_sans:
+            return False
+        eku = run(
+            ["openssl", "x509", "-in", str(certificate), "-noout", "-ext", "extendedKeyUsage"]
+        ).stdout
+        desired_role = self.vault_config["roles"][role]
+        expected_eku = set()
+        if desired_role["server_flag"]:
+            expected_eku.add("TLS Web Server Authentication")
+        if desired_role["client_flag"]:
+            expected_eku.add("TLS Web Client Authentication")
+        actual_eku = {
+            item.strip()
+            for line in eku.splitlines()[1:]
+            for item in line.split(",")
+            if item.strip()
+        }
+        if actual_eku != expected_eku:
+            return False
+        dates = run(
+            ["openssl", "x509", "-in", str(certificate), "-noout", "-dates"]
+        ).stdout.splitlines()
+        not_after = datetime.strptime(dates[1].split("=", 1)[1], "%b %d %H:%M:%S %Y %Z").replace(
+            tzinfo=timezone.utc
+        )
+        remaining = (not_after - datetime.now(timezone.utc)).total_seconds()
+        return 0 < remaining <= 3700
 
     def bootstrap_postgres(self) -> None:
         self.compose_exec(
@@ -470,7 +728,23 @@ class ReferenceEnvironment:
         )
 
     def keycloak_url(self, path: str) -> str:
-        return f"http://127.0.0.1:{self.values['KEYCLOAK_PORT']}{path}"
+        if self._keycloak_port is None:
+            configured = int(self.values["KEYCLOAK_PORT"])
+            if configured:
+                self._keycloak_port = configured
+            else:
+                mapping = self.compose("port", "keycloak", "8443", timeout=15).stdout.strip()
+                try:
+                    self._keycloak_port = int(mapping.rsplit(":", 1)[1])
+                except (IndexError, ValueError) as error:
+                    raise ReferenceEnvironmentError(
+                        f"cannot resolve Keycloak loopback port: {mapping}"
+                    ) from error
+        return f"https://localhost:{self._keycloak_port}{path}"
+
+    def keycloak_open(self, request: urllib.request.Request | str):
+        context = ssl.create_default_context(cafile=str(self.state / "pki/ca.pem"))
+        return urllib.request.urlopen(request, timeout=10, context=context)
 
     def keycloak_admin_token(self) -> str:
         request = urllib.request.Request(
@@ -485,7 +759,7 @@ class ReferenceEnvironment:
             ).encode(),
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with self.keycloak_open(request) as response:
             return json.load(response)["access_token"]
 
     def keycloak_admin_request(
@@ -508,7 +782,7 @@ class ReferenceEnvironment:
             },
         )
         try:
-            with urllib.request.urlopen(request, timeout=10) as response:
+            with self.keycloak_open(request) as response:
                 body = response.read()
                 return response.status, json.loads(body) if body else None
         except urllib.error.HTTPError as error:
@@ -519,8 +793,50 @@ class ReferenceEnvironment:
                 f"Keycloak Admin API {method} {path} failed ({error.code}): {self.redact(detail)}"
             ) from error
 
+    def reconcile_realm_role_mapping(
+        self, *, user_id: str, desired_role: str, token: str
+    ) -> None:
+        path = f"/realms/rss-device-security/users/{user_id}/role-mappings/realm"
+        _, current = self.keycloak_admin_request("GET", path, token=token)
+        if not isinstance(current, list):
+            raise ReferenceEnvironmentError("Keycloak direct realm-role mapping is invalid")
+        expected = {desired_role}
+        extras = [role for role in current if role.get("name") not in expected]
+        if extras:
+            self.keycloak_admin_request(
+                "DELETE", path, token=token, payload=extras
+            )
+        present = {role.get("name") for role in current} - {
+            role.get("name") for role in extras
+        }
+        if desired_role not in present:
+            _, role = self.keycloak_admin_request(
+                "GET",
+                f"/realms/rss-device-security/roles/{urllib.parse.quote(desired_role, safe='')}",
+                token=token,
+            )
+            self.keycloak_admin_request("POST", path, token=token, payload=[role])
+
+    def verify_realm_role_mapping(
+        self, *, user_id: str, desired_role: str, token: str
+    ) -> None:
+        _, current = self.keycloak_admin_request(
+            "GET",
+            f"/realms/rss-device-security/users/{user_id}/role-mappings/realm",
+            token=token,
+        )
+        actual = {role.get("name") for role in current} if isinstance(current, list) else set()
+        expected = {desired_role}
+        if actual != expected:
+            raise ReferenceEnvironmentError(
+                f"Keycloak direct realm-role closure differs for {user_id}: {actual}"
+            )
+
     def bootstrap_keycloak(self) -> None:
-        desired = json.loads((DEPLOY_ROOT / "keycloak/realm.json").read_text(encoding="utf-8"))
+        desired = render_fixture_placeholders(
+            json.loads((DEPLOY_ROOT / "keycloak/realm.json").read_text(encoding="utf-8")),
+            self.fixture,
+        )
         token = self.keycloak_admin_token()
         status, _ = self.keycloak_admin_request(
             "GET", "/realms/rss-device-security", token=token, allowed=(404,)
@@ -599,14 +915,10 @@ class ReferenceEnvironment:
         )
         if not isinstance(service_account, dict) or "id" not in service_account:
             raise ReferenceEnvironmentError("Keycloak service account identity is invalid")
-        _, service_role = self.keycloak_admin_request(
-            "GET", "/realms/rss-device-security/roles/deviceidentity-service", token=token
-        )
-        self.keycloak_admin_request(
-            "POST",
-            f"/realms/rss-device-security/users/{service_account['id']}/role-mappings/realm",
+        self.reconcile_realm_role_mapping(
+            user_id=service_account["id"],
+            desired_role="deviceidentity-service",
             token=token,
-            payload=[service_role],
         )
 
         _, user_profile = self.keycloak_admin_request(
@@ -666,14 +978,10 @@ class ReferenceEnvironment:
                 "value": self.values["OPERATOR_PASSWORD"],
             },
         )
-        _, role = self.keycloak_admin_request(
-            "GET", "/realms/rss-device-security/roles/rotation-operator", token=token
-        )
-        self.keycloak_admin_request(
-            "POST",
-            f"/realms/rss-device-security/users/{identifier}/role-mappings/realm",
+        self.reconcile_realm_role_mapping(
+            user_id=identifier,
+            desired_role="rotation-operator",
             token=token,
-            payload=[role],
         )
 
     def generate_mosquitto_acl(self) -> None:
@@ -710,38 +1018,112 @@ class ReferenceEnvironment:
 
     def verify_vault(self) -> None:
         runtime_token = (self.state / "vault-runtime-token").read_text(encoding="utf-8").strip()
-        for role in ("reference-server", "mqtt-device", "mqtt-service"):
-            self.vault(["read", f"device-pki/roles/{role}"])
+        mount = str(self.vault_config["mount"])
+        for role, desired in self.vault_config["roles"].items():
+            result = json.loads(
+                self.vault(["read", "-format=json", f"{mount}/roles/{role}"]).stdout
+            )["data"]
+            expected = dict(desired)
+            expected["max_ttl"] = 24 * 60 * 60
+            for key, value in expected.items():
+                if result.get(key) != value:
+                    raise ReferenceEnvironmentError(
+                        f"Vault role `{role}` property differs: {key}={result.get(key)!r}"
+                    )
+            for dangerous in ("allow_any_name", "allow_glob_domains"):
+                if result.get(dangerous) is not False:
+                    raise ReferenceEnvironmentError(
+                        f"Vault role `{role}` enables {dangerous}"
+                    )
         forbidden = self.vault(["secrets", "list"], token=runtime_token, check=False)
         if forbidden.returncode == 0:
             raise ReferenceEnvironmentError("Vault runtime token can administer secret engines")
-        for arguments, message in (
-            (
-                [
-                    "write",
-                    "device-pki/sign/mqtt-device",
-                    "common_name=reference-device",
-                    "uri_sans=urn:rss:mqtt-device:v1:outside-boundary",
-                    "ttl=1h",
-                ],
-                "Vault accepted an out-of-scope device URI SAN",
-            ),
-            (
-                [
-                    "write",
-                    "device-pki/sign/mqtt-device",
-                    "common_name=reference-device",
-                    "ttl=25h",
-                ],
-                "Vault accepted a certificate TTL above the role maximum",
-            ),
-            (
-                ["write", "device-pki/root/generate/internal", "common_name=forbidden"],
-                "Vault runtime token can replace the certificate authority",
-            ),
-        ):
-            if self.vault(arguments, token=runtime_token, check=False).returncode == 0:
-                raise ReferenceEnvironmentError(message)
+        verification = self.state / "pki/.vault-negative"
+        verification.mkdir(mode=0o700, exist_ok=True)
+        try:
+            device_uri = self.vault_config["roles"]["mqtt-device"]["allowed_uri_sans"][0]
+            for name, uri in (
+                ("legal", device_uri),
+                ("outside", "urn:rss:mqtt-device:v1:outside-boundary"),
+            ):
+                run(
+                    [
+                        "openssl",
+                        "req",
+                        "-new",
+                        "-newkey",
+                        "rsa:2048",
+                        "-nodes",
+                        "-keyout",
+                        str(verification / f"{name}.key"),
+                        "-out",
+                        str(verification / f"{name}.csr"),
+                        "-subj",
+                        "/CN=reference-device",
+                        "-addext",
+                        f"subjectAltName=URI:{uri}",
+                    ],
+                    timeout=30,
+                )
+            legal_csr = "/reference-state/pki/.vault-negative/legal.csr"
+            outside_csr = "/reference-state/pki/.vault-negative/outside.csr"
+            checks = (
+                (
+                    [
+                        "write",
+                        f"{mount}/sign/mqtt-device",
+                        f"csr=@{outside_csr}",
+                        "common_name=reference-device",
+                        "ttl=1h",
+                    ],
+                    "Vault accepted an out-of-scope device URI SAN",
+                ),
+                (
+                    [
+                        "write",
+                        f"{mount}/sign/mqtt-service",
+                        f"csr=@{legal_csr}",
+                        "common_name=deviceidentity-service",
+                    ],
+                    "Vault runtime token can sign service identities",
+                ),
+                (
+                    [
+                        "write",
+                        f"{mount}/sign/mosquitto-server",
+                        f"csr=@{legal_csr}",
+                        "common_name=mosquitto",
+                    ],
+                    "Vault runtime token can sign broker identities",
+                ),
+                (
+                    ["write", f"{mount}/root/generate/internal", "common_name=forbidden"],
+                    "Vault runtime token can replace the certificate authority",
+                ),
+            )
+            for arguments, message in checks:
+                if self.vault(arguments, token=runtime_token, check=False).returncode == 0:
+                    raise ReferenceEnvironmentError(message)
+            bounded = json.loads(
+                self.vault(
+                    [
+                        "write",
+                        "-format=json",
+                        f"{mount}/sign/mqtt-device",
+                        f"csr=@{legal_csr}",
+                        "common_name=reference-device",
+                        "ttl=25h",
+                    ],
+                    token=runtime_token,
+                ).stdout
+            )
+            remaining = int(bounded["data"]["expiration"]) - int(time.time())
+            if not 0 < remaining <= 24 * 60 * 60:
+                raise ReferenceEnvironmentError(
+                    "Vault issued a certificate above the role TTL maximum"
+                )
+        finally:
+            shutil.rmtree(verification, ignore_errors=True)
 
     def verify_postgres(self) -> None:
         query = """
@@ -758,6 +1140,83 @@ ORDER BY rolname;
         lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         if len(lines) != 3 or any(line.split("|")[1:] != ["f", "f", "f", "f", "f"] for line in lines):
             raise ReferenceEnvironmentError(f"PostgreSQL role closure differs: {lines}")
+        closure_query = """
+SELECT json_build_object(
+  'owners', (
+    SELECT json_object_agg(datname, pg_get_userbyid(datdba))
+    FROM pg_database WHERE datname IN ('keycloak', 'deviceidentity')
+  ),
+  'managedMemberships', (
+    SELECT count(*) FROM pg_auth_members membership
+    JOIN pg_roles member ON member.oid = membership.member
+    WHERE member.rolname IN ('keycloak_owner', 'deviceidentity_migrator', 'deviceidentity_app')
+  ),
+  'publicDatabasePrivileges', (
+    SELECT count(*) FROM pg_database database,
+      LATERAL aclexplode(COALESCE(database.datacl, acldefault('d', database.datdba))) acl
+    WHERE database.datname IN ('keycloak', 'deviceidentity') AND acl.grantee = 0
+  ),
+  'appConnect', has_database_privilege('deviceidentity_app', 'deviceidentity', 'CONNECT'),
+  'appTemporary', has_database_privilege('deviceidentity_app', 'deviceidentity', 'TEMP')
+)::text;
+"""
+        closure = self.compose_exec(
+            "postgres",
+            [
+                "psql",
+                "--username=postgres",
+                "--dbname=postgres",
+                "--tuples-only",
+                "--no-align",
+                "--command",
+                closure_query,
+            ],
+            environment={"PGPASSWORD": self.values["POSTGRES_SUPERUSER_PASSWORD"]},
+        )
+        postgres_state = json.loads(closure.stdout.strip())
+        expected_state = {
+            "owners": {
+                "keycloak": "keycloak_owner",
+                "deviceidentity": "deviceidentity_migrator",
+            },
+            "managedMemberships": 0,
+            "publicDatabasePrivileges": 0,
+            "appConnect": True,
+            "appTemporary": False,
+        }
+        if postgres_state != expected_state:
+            raise ReferenceEnvironmentError(
+                f"PostgreSQL ownership/ACL closure differs: {postgres_state}"
+            )
+        schema_query = """
+SELECT json_build_object(
+  'owner', pg_get_userbyid(nspowner),
+  'usage', has_schema_privilege('deviceidentity_app', 'public', 'USAGE'),
+  'create', has_schema_privilege('deviceidentity_app', 'public', 'CREATE')
+)::text FROM pg_namespace WHERE nspname = 'public';
+"""
+        schema = self.compose_exec(
+            "postgres",
+            [
+                "psql",
+                "--username=postgres",
+                "--dbname=deviceidentity",
+                "--tuples-only",
+                "--no-align",
+                "--command",
+                schema_query,
+            ],
+            environment={"PGPASSWORD": self.values["POSTGRES_SUPERUSER_PASSWORD"]},
+        )
+        schema_state = json.loads(schema.stdout.strip())
+        if schema_state != {
+            "owner": "deviceidentity_migrator",
+            "usage": True,
+            "create": False,
+        }:
+            raise ReferenceEnvironmentError(
+                f"PostgreSQL schema closure differs: {schema_state}"
+            )
         ddl = self.compose_exec(
             "postgres",
             ["psql", "--username=deviceidentity_app", "--dbname=deviceidentity", "--command", "CREATE TABLE forbidden(id integer)"],
@@ -788,20 +1247,45 @@ ORDER BY rolname;
         )
         if not isinstance(clients, list):
             raise ReferenceEnvironmentError("Keycloak client inventory is invalid")
-        expected = {"rotation-control", "deviceidentity"}
-        actual = {item["clientId"] for item in clients if item["clientId"] in expected}
+        expected = KEYCLOAK_BUILTIN_CLIENTS | {"rotation-control", "deviceidentity"}
+        actual = {item["clientId"] for item in clients}
         if actual != expected:
             raise ReferenceEnvironmentError(f"Keycloak client closure differs: {actual}")
-        port = self.values["KEYCLOAK_PORT"]
-        discovery_url = (
-            f"http://127.0.0.1:{port}/realms/rss-device-security/.well-known/openid-configuration"
+        client_by_name = {item["clientId"]: item for item in clients}
+        query = urllib.parse.urlencode({"username": "reference-operator", "exact": "true"})
+        _, operators = self.keycloak_admin_request(
+            "GET", f"/realms/rss-device-security/users?{query}", token=admin_token
         )
-        with urllib.request.urlopen(discovery_url, timeout=10) as response:
+        if not isinstance(operators, list) or len(operators) != 1:
+            raise ReferenceEnvironmentError("Keycloak operator identity closure differs")
+        self.verify_realm_role_mapping(
+            user_id=operators[0]["id"],
+            desired_role="rotation-operator",
+            token=admin_token,
+        )
+        _, service_account = self.keycloak_admin_request(
+            "GET",
+            f"/realms/rss-device-security/clients/{client_by_name['deviceidentity']['id']}/service-account-user",
+            token=admin_token,
+        )
+        if not isinstance(service_account, dict) or "id" not in service_account:
+            raise ReferenceEnvironmentError("Keycloak service account identity closure differs")
+        self.verify_realm_role_mapping(
+            user_id=service_account["id"],
+            desired_role="deviceidentity-service",
+            token=admin_token,
+        )
+        discovery_url = self.keycloak_url(
+            "/realms/rss-device-security/.well-known/openid-configuration"
+        )
+        with self.keycloak_open(discovery_url) as response:
             discovery = json.load(response)
         if not discovery["issuer"].endswith("/realms/rss-device-security"):
             raise ReferenceEnvironmentError("Keycloak issuer differs")
         token_request = urllib.request.Request(
-            f"http://127.0.0.1:{port}/realms/rss-device-security/protocol/openid-connect/token",
+            self.keycloak_url(
+                "/realms/rss-device-security/protocol/openid-connect/token"
+            ),
             data=urllib.parse.urlencode(
                 {
                     "grant_type": "password",
@@ -812,7 +1296,7 @@ ORDER BY rolname;
             ).encode(),
             method="POST",
         )
-        with urllib.request.urlopen(token_request, timeout=10) as response:
+        with self.keycloak_open(token_request) as response:
             token = json.load(response)["access_token"]
         payload = token.split(".")[1]
         payload += "=" * (-len(payload) % 4)
@@ -820,7 +1304,9 @@ ORDER BY rolname;
         if claims.get("tenantId") != self.fixture["tenantId"]:
             raise ReferenceEnvironmentError("Keycloak tenant claim differs")
         service_request = urllib.request.Request(
-            f"http://127.0.0.1:{port}/realms/rss-device-security/protocol/openid-connect/token",
+            self.keycloak_url(
+                "/realms/rss-device-security/protocol/openid-connect/token"
+            ),
             data=urllib.parse.urlencode(
                 {
                     "grant_type": "client_credentials",
@@ -830,7 +1316,7 @@ ORDER BY rolname;
             ).encode(),
             method="POST",
         )
-        with urllib.request.urlopen(service_request, timeout=10) as response:
+        with self.keycloak_open(service_request) as response:
             service_token = json.load(response)["access_token"]
         service_payload = service_token.split(".")[1]
         service_payload += "=" * (-len(service_payload) % 4)
@@ -846,6 +1332,116 @@ ORDER BY rolname;
     def mqtt_was_denied(result: subprocess.CompletedProcess[str]) -> bool:
         output = f"{result.stdout}\n{result.stderr}"
         return result.returncode != 0 or "Not authorized" in output or "RC:135" in output
+
+    def mqtt_round_trip(
+        self,
+        *,
+        common: list[str],
+        subscriber_auth: list[str],
+        publisher_auth: list[str],
+        topic: str,
+        message: str,
+    ) -> None:
+        subscriber = subprocess.Popen(
+            self.compose_command(
+                "exec",
+                "--no-TTY",
+                "mosquitto",
+                "mosquitto_sub",
+                *common,
+                *subscriber_auth,
+                "-q",
+                "1",
+                "-C",
+                "1",
+                "-W",
+                "10",
+                "-t",
+                topic,
+            ),
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            time.sleep(0.5)
+            self.mqtt_command(
+                [
+                    "mosquitto_pub",
+                    *common,
+                    *publisher_auth,
+                    "-q",
+                    "1",
+                    "-t",
+                    topic,
+                    "-m",
+                    message,
+                ]
+            )
+            stdout, stderr = subscriber.communicate(timeout=12)
+        except Exception:
+            subscriber.terminate()
+            subscriber.communicate(timeout=5)
+            raise
+        if subscriber.returncode != 0 or stdout.strip() != message:
+            raise ReferenceEnvironmentError(
+                f"MQTT authorized round trip failed: {self.redact(stderr.strip())}"
+            )
+
+    def mqtt_expect_no_delivery(
+        self,
+        *,
+        common: list[str],
+        identity: list[str],
+        topic: str,
+    ) -> None:
+        subscriber = subprocess.Popen(
+            self.compose_command(
+                "exec",
+                "--no-TTY",
+                "mosquitto",
+                "mosquitto_sub",
+                *common,
+                *identity,
+                "-q",
+                "1",
+                "-C",
+                "1",
+                "-W",
+                "2",
+                "-t",
+                topic,
+            ),
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            time.sleep(0.5)
+            self.mqtt_command(
+                [
+                    "mosquitto_pub",
+                    *common,
+                    *identity,
+                    "-q",
+                    "1",
+                    "-t",
+                    topic,
+                    "-m",
+                    "must-not-be-delivered",
+                ]
+            )
+            stdout, stderr = subscriber.communicate(timeout=5)
+        except Exception:
+            subscriber.terminate()
+            subscriber.communicate(timeout=5)
+            raise
+        if stdout.strip() or "Timed out" not in stderr:
+            raise ReferenceEnvironmentError(
+                f"MQTT forbidden subscription received data: {self.redact(stdout.strip())}"
+            )
 
     def ensure_untrusted_client_certificate(self) -> None:
         key = self.state / "pki/untrusted.key"
@@ -885,7 +1481,7 @@ ORDER BY rolname;
             "-V",
             "mqttv5",
             "-h",
-            "127.0.0.1",
+            "localhost",
             "-p",
             "8883",
             "--cafile",
@@ -893,8 +1489,20 @@ ORDER BY rolname;
         ]
         device_auth = ["--cert", "/reference-state/pki/device.crt", "--key", "/reference-state/pki/device.key"]
         service_auth = ["--cert", "/reference-state/pki/service.crt", "--key", "/reference-state/pki/service.key"]
-        self.mqtt_command(["mosquitto_pub", *common, *device_auth, "-q", "1", "-t", uplink, "-m", "ack"])
-        self.mqtt_command(["mosquitto_pub", *common, *service_auth, "-q", "1", "-t", downlink, "-m", "command"])
+        self.mqtt_round_trip(
+            common=common,
+            subscriber_auth=service_auth,
+            publisher_auth=device_auth,
+            topic=uplink,
+            message="ack",
+        )
+        self.mqtt_round_trip(
+            common=common,
+            subscriber_auth=device_auth,
+            publisher_auth=service_auth,
+            topic=downlink,
+            message="command",
+        )
         no_cert = self.mqtt_command(
             ["mosquitto_pub", *common, "-q", "1", "-t", uplink, "-m", "forbidden"], check=False
         )
@@ -950,6 +1558,12 @@ ORDER BY rolname;
                 raise ReferenceEnvironmentError(
                     f"Mosquitto accepted a cross-{boundary} topic"
                 )
+        self.mqtt_expect_no_delivery(
+            common=common, identity=device_auth, topic=uplink
+        )
+        self.mqtt_expect_no_delivery(
+            common=common, identity=service_auth, topic=downlink
+        )
 
     def verify(self) -> None:
         self.require_state()
@@ -996,9 +1610,10 @@ ORDER BY rolname;
         if len(roles) != 3:
             raise ReferenceEnvironmentError("PostgreSQL logical role identity closure differs")
         vault_roles = {}
-        for role in ("reference-server", "mqtt-device", "mqtt-service"):
+        mount = str(self.vault_config["mount"])
+        for role in self.vault_config["roles"]:
             result = json.loads(
-                self.vault(["read", "-format=json", f"device-pki/roles/{role}"]).stdout
+                self.vault(["read", "-format=json", f"{mount}/roles/{role}"]).stdout
             )
             vault_roles[role] = result["data"]
         return {
@@ -1010,6 +1625,53 @@ ORDER BY rolname;
                 (self.state / "mosquitto/acl").read_bytes()
             ).hexdigest(),
         }
+
+    def inject_managed_drift(self) -> None:
+        self.vault(
+            [
+                "write",
+                f"{self.vault_config['mount']}/roles/mqtt-device",
+                "allowed_domains=reference-device",
+                "allow_any_name=true",
+                "client_flag=true",
+                "server_flag=false",
+                "max_ttl=24h",
+            ]
+        )
+        self.compose_exec(
+            "postgres",
+            [
+                "psql",
+                "--username=postgres",
+                "--dbname=postgres",
+                "--set=ON_ERROR_STOP=1",
+                "--command=GRANT pg_read_all_data TO deviceidentity_app",
+            ],
+            environment={"PGPASSWORD": self.values["POSTGRES_SUPERUSER_PASSWORD"]},
+        )
+        token = self.keycloak_admin_token()
+        query = urllib.parse.urlencode({"clientId": "deviceidentity"})
+        _, clients = self.keycloak_admin_request(
+            "GET", f"/realms/rss-device-security/clients?{query}", token=token
+        )
+        if not isinstance(clients, list) or len(clients) != 1:
+            raise ReferenceEnvironmentError("cannot inject Keycloak managed drift")
+        _, service_account = self.keycloak_admin_request(
+            "GET",
+            f"/realms/rss-device-security/clients/{clients[0]['id']}/service-account-user",
+            token=token,
+        )
+        _, extra_role = self.keycloak_admin_request(
+            "GET", "/realms/rss-device-security/roles/rotation-operator", token=token
+        )
+        self.keycloak_admin_request(
+            "POST",
+            f"/realms/rss-device-security/users/{service_account['id']}/role-mappings/realm",
+            token=token,
+            payload=[extra_role],
+        )
+        with (self.state / "mosquitto/acl").open("a", encoding="utf-8") as acl:
+            acl.write("topic readwrite #\n")
 
     def project_resources(self) -> dict[str, list[str]]:
         label = f"label=com.docker.compose.project={self.project}"
@@ -1023,6 +1685,27 @@ ORDER BY rolname;
             for kind, command in commands.items()
         }
 
+    def verify_resource_ownership(self) -> None:
+        expected = self.values["REFERENCE_OWNER"]
+        resources = self.project_resources()
+        inspect_commands = {
+            "containers": ["docker", "inspect"],
+            "networks": ["docker", "network", "inspect"],
+            "volumes": ["docker", "volume", "inspect"],
+        }
+        for kind, identifiers in resources.items():
+            for identifier in identifiers:
+                payload = json.loads(run([*inspect_commands[kind], identifier]).stdout)[0]
+                labels = (
+                    payload.get("Config", {}).get("Labels", {})
+                    if kind == "containers"
+                    else payload.get("Labels", {})
+                ) or {}
+                if labels.get("rss.reference.owner") != expected:
+                    raise ReferenceEnvironmentError(
+                        f"refusing foreign {kind[:-1]} in project namespace: {identifier}"
+                    )
+
     def down(self) -> None:
         resources = self.project_resources()
         if not self.state.exists():
@@ -1032,6 +1715,7 @@ ORDER BY rolname;
                 )
             return
         self.require_state()
+        self.verify_resource_ownership()
         self.compose("down", "--volumes", "--remove-orphans", "--timeout", "10", timeout=90)
         remaining = self.project_resources()
         if any(remaining.values()):
@@ -1044,25 +1728,53 @@ ORDER BY rolname;
             for key, value in self.values.items()
             if any(marker in key for marker in ("PASSWORD", "SECRET", "TOKEN"))
         }
-        material = {
-            f"pki/{path.name}": hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in sorted((self.state / "pki").iterdir())
-            if path.suffix in {".key", ".crt", ".pem"}
+        expected_material = {
+            "pki/ca.pem",
+            "pki/server.key",
+            "pki/server.crt",
+            "pki/keycloak.key",
+            "pki/keycloak.crt",
+            "pki/device.key",
+            "pki/device.crt",
+            "pki/service.key",
+            "pki/service.crt",
+            "pki/untrusted.key",
+            "pki/untrusted.crt",
+            "vault-tls/vault-ca.pem",
+            "vault-tls/vault-cert.pem",
+            "vault-tls/vault-key.pem",
         }
+        material = {}
+        for directory_name in ("pki", "vault-tls"):
+            for path in sorted((self.state / directory_name).iterdir()):
+                if path.suffix in {".key", ".crt", ".pem"}:
+                    material[f"{directory_name}/{path.name}"] = hashlib.sha256(
+                        path.read_bytes()
+                    ).hexdigest()
+        if set(material) != expected_material:
+            raise ReferenceEnvironmentError(
+                f"runtime cryptographic material closure differs: {sorted(material)}"
+            )
         return {**runtime, **material}
 
     def logs(self) -> None:
         if self.env_file.exists():
             result = self.compose("logs", "--no-color", check=False, timeout=30)
             if result.stdout:
-                print(result.stdout, file=sys.stderr)
+                print(self.redact(result.stdout), file=sys.stderr)
             if result.stderr:
-                print(result.stderr, file=sys.stderr)
+                print(self.redact(result.stderr), file=sys.stderr)
 
     def smoke(self) -> None:
         first_fingerprint: dict[str, str] | None = None
         primary_error: BaseException | None = None
-        neighbor_volume = f"{self.project}-neighbor-{secrets.token_hex(4)}"
+        neighbor_suffix = secrets.token_hex(4)
+        neighbor_project = f"{self.project}-neighbor"
+        neighbor = {
+            "container": f"{self.project}-neighbor-container-{neighbor_suffix}",
+            "network": f"{self.project}-neighbor-network-{neighbor_suffix}",
+            "volume": f"{self.project}-neighbor-volume-{neighbor_suffix}",
+        }
         try:
             self.down()
             run(
@@ -1071,8 +1783,38 @@ ORDER BY rolname;
                     "volume",
                     "create",
                     "--label",
-                    f"com.docker.compose.project={self.project}-neighbor",
-                    neighbor_volume,
+                    f"com.docker.compose.project={neighbor_project}",
+                    neighbor["volume"],
+                ]
+            )
+            run(
+                [
+                    "docker",
+                    "network",
+                    "create",
+                    "--label",
+                    f"com.docker.compose.project={neighbor_project}",
+                    neighbor["network"],
+                ]
+            )
+            run(
+                [
+                    "docker",
+                    "run",
+                    "--detach",
+                    "--name",
+                    neighbor["container"],
+                    "--network",
+                    neighbor["network"],
+                    "--mount",
+                    f"source={neighbor['volume']},target=/proof",
+                    "--label",
+                    f"com.docker.compose.project={neighbor_project}",
+                    "--entrypoint",
+                    "/bin/sh",
+                    "hashicorp/vault:2.0.3@sha256:a296a888b118615dc01d5f1a6846e6d4a7277946caaed5b447008fff5fe06b54",
+                    "-c",
+                    "while :; do sleep 60; done",
                 ]
             )
             self.up()
@@ -1080,6 +1822,7 @@ ORDER BY rolname;
             self.verify()
             before = self.fingerprints()
             before_identities = self.logical_snapshot()
+            self.inject_managed_drift()
             self.bootstrap()
             self.verify()
             after = self.fingerprints()
@@ -1090,7 +1833,9 @@ ORDER BY rolname;
                 raise ReferenceEnvironmentError("idempotent bootstrap changed logical identities")
             first_fingerprint = after
             self.down()
-            run(["docker", "volume", "inspect", neighbor_volume])
+            run(["docker", "inspect", neighbor["container"]])
+            run(["docker", "network", "inspect", neighbor["network"]])
+            run(["docker", "volume", "inspect", neighbor["volume"]])
             self.up()
             self.bootstrap()
             self.verify()
@@ -1117,17 +1862,21 @@ ORDER BY rolname;
             except Exception as error:
                 print(f"final teardown failed: {error}", file=sys.stderr)
                 cleanup_error = error
-            cleanup = run(
-                ["docker", "volume", "rm", neighbor_volume], check=False, timeout=30
+            cleanup_commands = (
+                ["docker", "rm", "--force", neighbor["container"]],
+                ["docker", "network", "rm", neighbor["network"]],
+                ["docker", "volume", "rm", neighbor["volume"]],
             )
-            if cleanup.returncode != 0:
-                print(
-                    f"neighbor proof cleanup failed: {cleanup.stderr.strip()}",
-                    file=sys.stderr,
-                )
-                cleanup_error = ReferenceEnvironmentError(
-                    "failed to remove the adjacent-project proof volume"
-                )
+            for command in cleanup_commands:
+                cleanup = run(command, check=False, timeout=30)
+                if cleanup.returncode != 0 and "No such" not in cleanup.stderr:
+                    print(
+                        f"neighbor proof cleanup failed: {cleanup.stderr.strip()}",
+                        file=sys.stderr,
+                    )
+                    cleanup_error = ReferenceEnvironmentError(
+                        "failed to remove adjacent-project proof resources"
+                    )
             if primary_error is None and cleanup_error is not None:
                 raise cleanup_error
 
@@ -1145,9 +1894,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
-    environment = ReferenceEnvironment(args.project)
     try:
-        getattr(environment, args.command)()
+        with project_lock(args.project):
+            environment = ReferenceEnvironment(args.project)
+            getattr(environment, args.command)()
     except (ReferenceEnvironmentError, OSError, subprocess.SubprocessError, urllib.error.URLError) as error:
         print(f"reference environment failed: {error}", file=sys.stderr)
         return 1
