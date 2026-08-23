@@ -1180,7 +1180,12 @@ mod tests {
         Audience, IdTokenClaims, JsonWebKeyId, PrivateSigningKey, StandardClaims,
         SubjectIdentifier, core::CoreRsaPrivateSigningKey,
     };
-    use std::{collections::VecDeque, sync::Mutex};
+    use rand::thread_rng;
+    use rsa::{RsaPrivateKey, pkcs1::EncodeRsaPrivateKey, pkcs8::LineEnding};
+    use std::{
+        collections::VecDeque,
+        sync::{Mutex, OnceLock},
+    };
     use tempfile::tempdir;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
@@ -1202,11 +1207,17 @@ mod tests {
         authorized_party: Option<ClientId>,
         tenant: &str,
     ) -> (RotationIdToken, CoreJsonWebKeySet) {
-        let key = CoreRsaPrivateSigningKey::from_pem(
-            include_str!("../tests/test-rsa-private.pem"),
-            Some(JsonWebKeyId::new("test-key".to_owned())),
-        )
-        .expect("test key");
+        static TEST_RSA_PEM: OnceLock<String> = OnceLock::new();
+        let pem = TEST_RSA_PEM.get_or_init(|| {
+            RsaPrivateKey::new(&mut thread_rng(), 2_048)
+                .expect("ephemeral test key")
+                .to_pkcs1_pem(LineEnding::LF)
+                .expect("encode test key")
+                .to_string()
+        });
+        let key =
+            CoreRsaPrivateSigningKey::from_pem(pem, Some(JsonWebKeyId::new("test-key".to_owned())))
+                .expect("test key");
         let claims = IdTokenClaims::new(
             IssuerUrl::new("https://issuer.example/".to_owned()).expect("issuer"),
             audiences,
