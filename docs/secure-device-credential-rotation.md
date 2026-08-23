@@ -52,12 +52,14 @@ path, alias, local generated copy, or lifecycle change in this product skeleton.
 
 `rotation-model` contains product-owned opaque references, positive generation/fence values, and
 distinct schema-aligned projections for acceptance, command acknowledgement, credential report,
-and application receipt. It preserves the public contracts' closed outcomes, reasons, fence,
-sequence, digest, and timestamp discriminants without copying wire DTOs. Construction validates
-product shape only; authenticated provenance remains the future client's ingress responsibility.
-These values grant no identity, authorization, readiness, or authoritative transition. The model
-deliberately has no `Ready` type or predicate, allow/deny decision, L4 state machine, reconcile
-behavior, transport DTO, secret material, or provider API.
+and application receipt. Acceptance retains its authorization-receipt correlation. Committed,
+duplicate, and stale application outcomes require that correlation plus the desired generation;
+rejected outcomes cannot carry accepted lineage. The model preserves the public contracts' closed
+outcomes, reasons, fence, sequence, digest, and timestamp discriminants without copying wire DTOs.
+Construction validates product shape only; authenticated provenance remains the future client's
+ingress responsibility. These values grant no identity, authorization, readiness, or authoritative
+transition. The model deliberately has no `Ready` type or predicate, allow/deny decision, L4 state
+machine, reconcile behavior, transport DTO, secret material, or provider API.
 
 ## Implementation handoff
 
@@ -90,6 +92,7 @@ It may consume only stable RSS Release Surface artifacts.
 | Risk | Current carrier | Strength and claim |
 | --- | --- | --- |
 | ACK, report, and application receipt become interchangeable | Separate Rust structs with no conversion or readiness API | Rust type-system Hard |
+| Acceptance or accepted application outcome loses authorization lineage, or rejection acquires it | Required acceptance field plus `ApplicationReceiptLineage` in a closed outcome enum | Rust private-field/constructor/enum Hard |
 | Rotation model imports RSS, source/workspace, transport, or provider coupling | Package-scoped negative dependency policy over every Cargo dependency table | CI policy Hard for declared forbidden edges |
 | Source coupling enters candidate consumption | Independent repository, committed root lock, existing candidate proof | Physical/Cargo Hard plus proof Medium |
 | Product scope, owner, public-waist choice, and T3 prohibition drift | Accepted upstream ADR plus review of this scope document | Policy/review fact; not represented as machine enforcement |
