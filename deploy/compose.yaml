@@ -31,13 +31,15 @@ services:
         source: ${REFERENCE_STATE:?runtime state path is required}/vault-tls
         target: /reference-state/vault-tls
       - type: bind
-        source: ${REFERENCE_STATE:?runtime state path is required}/pki
-        target: /reference-state/pki
+        source: ${REFERENCE_STATE:?runtime state path is required}/csr
+        target: /reference-state/csr
+        read_only: true
       - type: bind
         source: ./vault
         target: /reference-config/vault
         read_only: true
     security_opt: [no-new-privileges:true]
+    networks: [pki, vault-control]
     labels:
       rss.reference.owner: ${REFERENCE_OWNER:?runtime owner is required}
 
@@ -47,8 +49,22 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?runtime PostgreSQL password is required}
       POSTGRES_DB: postgres
+    entrypoint: [/bin/bash, -euc]
+    command:
+      - >-
+        install -d -m 0700 -o postgres -g postgres /var/lib/postgresql/tls;
+        install -m 0644 -o postgres -g postgres /reference-state/postgres/ca.pem /var/lib/postgresql/tls/ca.pem;
+        install -m 0644 -o postgres -g postgres /reference-state/postgres/server.crt /var/lib/postgresql/tls/server.crt;
+        install -m 0600 -o postgres -g postgres /reference-state/postgres/server.key /var/lib/postgresql/tls/server.key;
+        exec /usr/local/bin/docker-entrypoint.sh postgres
+        -c ssl=on
+        -c ssl_ca_file=/var/lib/postgresql/tls/ca.pem
+        -c ssl_cert_file=/var/lib/postgresql/tls/server.crt
+        -c ssl_key_file=/var/lib/postgresql/tls/server.key
+        -c ssl_min_protocol_version=TLSv1.3
+        -c hba_file=/reference-config/postgres/pg_hba.conf
     healthcheck:
-      test: [CMD-SHELL, "pg_isready -U postgres -d postgres"]
+      test: [CMD-SHELL, "PGSSLMODE=verify-full PGSSLROOTCERT=/var/lib/postgresql/tls/ca.pem pg_isready -h postgres -U postgres -d postgres"]
       interval: 2s
       timeout: 2s
       retries: 45
@@ -58,7 +74,20 @@ services:
         source: ./postgres
         target: /reference-config/postgres
         read_only: true
+      - type: bind
+        source: ${REFERENCE_STATE:?runtime state path is required}/pki/ca.pem
+        target: /reference-state/postgres/ca.pem
+        read_only: true
+      - type: bind
+        source: ${REFERENCE_STATE:?runtime state path is required}/pki/postgres.crt
+        target: /reference-state/postgres/server.crt
+        read_only: true
+      - type: bind
+        source: ${REFERENCE_STATE:?runtime state path is required}/pki/postgres.key
+        target: /reference-state/postgres/server.key
+        read_only: true
     security_opt: [no-new-privileges:true]
+    networks: [identity-database]
     labels:
       rss.reference.owner: ${REFERENCE_OWNER:?runtime owner is required}
 
@@ -80,14 +109,22 @@ services:
       KC_DB_URL_DATABASE: keycloak
       KC_DB_USERNAME: keycloak_owner
       KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?runtime Keycloak database password is required}
+      KC_DB_TLS_MODE: verify-server
+      KC_DB_TLS_TRUST_STORE_FILE: /reference-state/pki/ca.pem
       KC_HEALTH_ENABLED: "true"
       KC_HTTP_ENABLED: "false"
+      KC_HTTP_MANAGEMENT_SCHEME: http
       KC_HOSTNAME_STRICT: "false"
     depends_on:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: [CMD, /bin/bash, -c, "exec 3<>/dev/tcp/127.0.0.1/9000"]
+      test:
+        - CMD-SHELL
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/9000;
+          printf 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3;
+          grep -Eq '"status"[[:space:]]*:[[:space:]]*"UP"' <&3
       interval: 3s
       timeout: 2s
       retries: 60
@@ -114,6 +151,7 @@ services:
         target: /reference-state/pki/keycloak.key
         read_only: true
     security_opt: [no-new-privileges:true]
+    networks: [identity-database, keycloak-control]
     labels:
       rss.reference.owner: ${REFERENCE_OWNER:?runtime owner is required}
 
@@ -161,6 +199,7 @@ services:
         target: /reference-state/mosquitto
         read_only: true
     security_opt: [no-new-privileges:true]
+    networks: [broker, broker-control]
     labels:
       rss.reference.owner: ${REFERENCE_OWNER:?runtime owner is required}
 
@@ -170,6 +209,24 @@ volumes:
       rss.reference.owner: ${REFERENCE_OWNER:?runtime owner is required}
 
 networks:
-  default:
+  pki:
+    internal: true
+    labels:
+      rss.reference.owner: ${REFERENCE_OWNER:?runtime owner is required}
+  identity-database:
+    internal: true
+    labels:
+      rss.reference.owner: ${REFERENCE_OWNER:?runtime owner is required}
+  broker:
+    internal: true
+    labels:
+      rss.reference.owner: ${REFERENCE_OWNER:?runtime owner is required}
+  vault-control:
+    labels:
+      rss.reference.owner: ${REFERENCE_OWNER:?runtime owner is required}
+  keycloak-control:
+    labels:
+      rss.reference.owner: ${REFERENCE_OWNER:?runtime owner is required}
+  broker-control:
     labels:
       rss.reference.owner: ${REFERENCE_OWNER:?runtime owner is required}

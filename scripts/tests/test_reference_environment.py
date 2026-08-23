@@ -1,4 +1,7 @@
+import ast
+from contextlib import redirect_stderr
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -33,6 +36,7 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
             ROOT / "deploy/vault/roles.json",
             ROOT / "deploy/mosquitto/mosquitto.conf",
             ROOT / "deploy/postgres/bootstrap.sql",
+            ROOT / "deploy/postgres/pg_hba.conf",
         }
         self.assertEqual([], sorted(str(path.relative_to(ROOT)) for path in expected if not path.is_file()))
 
@@ -118,7 +122,19 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
             },
         )
         self.assertEqual(
-            {f"{state_root}/pki", f"{state_root}/vault-tls"},
+            {
+                f"{state_root}/pki/ca.pem",
+                f"{state_root}/pki/postgres.crt",
+                f"{state_root}/pki/postgres.key",
+            },
+            {
+                volume["source"]
+                for volume in model["services"]["postgres"].get("volumes", [])
+                if volume["source"].startswith(state_root)
+            },
+        )
+        self.assertEqual(
+            {f"{state_root}/csr", f"{state_root}/vault-tls"},
             {
                 volume["source"]
                 for volume in model["services"]["vault"]["volumes"]
@@ -137,6 +153,34 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
                 if volume["source"].startswith(state_root)
             },
         )
+        self.assertEqual(
+            {"identity-database", "keycloak-control"},
+            set(model["services"]["keycloak"]["networks"]),
+        )
+        self.assertEqual(
+            {"identity-database"}, set(model["services"]["postgres"]["networks"])
+        )
+        self.assertEqual(
+            {"pki", "vault-control"}, set(model["services"]["vault"]["networks"])
+        )
+        self.assertEqual(
+            {"broker", "broker-control"},
+            set(model["services"]["mosquitto"]["networks"]),
+        )
+        self.assertEqual(
+            "verify-server",
+            model["services"]["keycloak"]["environment"]["KC_DB_TLS_MODE"],
+        )
+        self.assertEqual(
+            "/reference-state/pki/ca.pem",
+            model["services"]["keycloak"]["environment"]["KC_DB_TLS_TRUST_STORE_FILE"],
+        )
+        postgres_command = " ".join(model["services"]["postgres"]["command"])
+        self.assertIn("ssl=on", postgres_command)
+        self.assertIn("ssl_min_protocol_version=TLSv1.3", postgres_command)
+        keycloak_health = " ".join(model["services"]["keycloak"]["healthcheck"]["test"])
+        self.assertIn("/health/ready", keycloak_health)
+        self.assertIn('"status"[[:space:]]*:[[:space:]]*"UP"', keycloak_health)
         lifecycle = SCRIPT.read_text(encoding="utf-8")
         for image in expected_images.values():
             self.assertNotIn(image, lifecycle)
@@ -183,18 +227,24 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
         self.assertNotIn("listener 1883", mosquitto)
 
         policy = (ROOT / "deploy/vault/deviceidentity-sign.hcl").read_text(encoding="utf-8")
-        self.assertIn('path "device-pki/sign/mqtt-device"', policy)
+        self.assertIn('path "{{mount}}/sign/mqtt-device"', policy)
         self.assertIn('"ttl" = []', policy)
-        self.assertNotIn('path "device-pki/sign/mqtt-service"', policy)
-        self.assertNotIn('path "device-pki/sign/mosquitto-server"', policy)
-        self.assertNotIn('path "device-pki/root', policy)
+        self.assertNotIn('path "{{mount}}/sign/mqtt-service"', policy)
+        self.assertNotIn('path "{{mount}}/sign/mosquitto-server"', policy)
+        self.assertNotIn('/root', policy)
         self.assertNotIn('capabilities = ["sudo"]', policy)
 
         vault_roles = json.loads(
             (ROOT / "deploy/vault/roles.json").read_text(encoding="utf-8")
         )
         self.assertEqual(
-            {"mosquitto-server", "keycloak-server", "mqtt-device", "mqtt-service"},
+            {
+                "mosquitto-server",
+                "keycloak-server",
+                "postgres-server",
+                "mqtt-device",
+                "mqtt-service",
+            },
             set(vault_roles["roles"]),
         )
         self.assertTrue(
@@ -204,6 +254,10 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
         realm = json.loads(
             (ROOT / "deploy/keycloak/realm.json").read_text(encoding="utf-8")
         )
+        rotation = next(
+            client for client in realm["clients"] if client["clientId"] == "rotation-control"
+        )
+        self.assertFalse(rotation["directAccessGrantsEnabled"])
         self.assertEqual("rss-device-security", realm["realm"])
         self.assertEqual(
             {"rotation-control", "deviceidentity"},
@@ -215,6 +269,7 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
         )
 
         postgres = (ROOT / "deploy/postgres/bootstrap.sql").read_text(encoding="utf-8")
+        postgres_hba = (ROOT / "deploy/postgres/pg_hba.conf").read_text(encoding="utf-8")
         for forbidden in (
             "SUPERUSER",
             "CREATEDB",
@@ -224,6 +279,8 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
         ):
             self.assertIn(f"NO{forbidden}", postgres)
         self.assertIn("REVOKE CREATE ON SCHEMA public FROM PUBLIC", postgres)
+        self.assertIn("hostnossl all all all reject", postgres_hba)
+        self.assertIn("hostssl all all all scram-sha-256", postgres_hba)
 
     def test_secret_material_is_runtime_only(self):
         gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
@@ -308,8 +365,109 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
         accepted = subprocess.CompletedProcess(
             ["mosquitto_pub"], 0, stdout="", stderr=""
         )
+        infrastructure_failure = subprocess.CompletedProcess(
+            ["mosquitto_pub"], 1, stdout="", stderr="Error: Connection refused"
+        )
         self.assertTrue(module.ReferenceEnvironment.mqtt_was_denied(denied))
         self.assertFalse(module.ReferenceEnvironment.mqtt_was_denied(accepted))
+        self.assertFalse(module.ReferenceEnvironment.mqtt_was_denied(infrastructure_failure))
+
+    def test_missing_state_reports_the_reachable_up_instruction(self):
+        module = load_reference_environment()
+        with tempfile.TemporaryDirectory() as directory:
+            environment = object.__new__(module.ReferenceEnvironment)
+            environment.project = "valid-project"
+            environment.state = Path(directory) / "missing"
+            environment.env_file = environment.state / "runtime.env"
+            with self.assertRaisesRegex(module.ReferenceEnvironmentError, "run `up` first"):
+                environment.require_state()
+
+    def test_logs_command_fails_when_compose_logs_fails(self):
+        module = load_reference_environment()
+        with tempfile.TemporaryDirectory() as directory:
+            environment = object.__new__(module.ReferenceEnvironment)
+            environment.state = Path(directory)
+            environment.values = {}
+            environment.require_state = lambda: None
+            environment.compose = lambda *args, **kwargs: subprocess.CompletedProcess(
+                ["docker", "compose", "logs"], 1, stdout="", stderr="daemon unavailable"
+            )
+            with redirect_stderr(io.StringIO()), self.assertRaises(
+                module.ReferenceEnvironmentError
+            ):
+                environment.logs()
+
+    def test_mqtt_cli_mounts_only_the_requested_identity_files(self):
+        module = load_reference_environment()
+        with tempfile.TemporaryDirectory() as directory:
+            environment = object.__new__(module.ReferenceEnvironment)
+            environment.state = Path(directory)
+            pki = environment.state / "pki"
+            pki.mkdir()
+            for name in ("ca.pem", "device.crt", "device.key"):
+                (pki / name).touch()
+            environment.compose = lambda *args, **kwargs: subprocess.CompletedProcess(
+                ["docker", "compose", "ps"], 0, stdout="a" * 64, stderr=""
+            )
+            environment.service_image = lambda service: "canonical-mosquitto-image"
+            command = environment.mqtt_command_line(
+                [
+                    "mosquitto_pub",
+                    "--cafile",
+                    "/reference-state/pki/ca.pem",
+                    "--cert",
+                    "/reference-state/pki/device.crt",
+                    "--key",
+                    "/reference-state/pki/device.key",
+                ]
+            )
+        mounts = {
+            command[index + 1]
+            for index, argument in enumerate(command)
+            if argument == "--mount"
+        }
+        self.assertEqual(3, len(mounts))
+        self.assertFalse(any("source=" + directory + "/pki,target=" in item for item in mounts))
+
+    def test_docker_discovery_is_bounded(self):
+        module = load_reference_environment()
+        environment = object.__new__(module.ReferenceEnvironment)
+        environment.project = "valid-project"
+        completed = subprocess.CompletedProcess(["docker"], 0, stdout="", stderr="")
+        with mock.patch.object(module, "run", return_value=completed) as execute:
+            self.assertEqual(
+                {"containers": [], "networks": [], "volumes": []},
+                environment.project_resources(),
+            )
+        self.assertTrue(execute.call_args_list)
+        self.assertTrue(all(call.kwargs.get("timeout") == 15 for call in execute.call_args_list))
+
+    def test_provider_identities_have_one_loaded_owner(self):
+        lifecycle = SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn('"/realms/rss-device-security', lifecycle)
+        self.assertNotIn('"device-pki/', lifecycle)
+
+    def test_json_parser_maps_malformed_provider_output_to_domain_error(self):
+        module = load_reference_environment()
+        with self.assertRaisesRegex(module.ReferenceEnvironmentError, "Vault role inventory"):
+            module.parse_json("not-json", source="Vault role inventory")
+        with self.assertRaisesRegex(module.ReferenceEnvironmentError, "Keycloak clients"):
+            module.parse_json('{"wrong":"shape"}', source="Keycloak clients", expected_type=list)
+
+    def test_managed_lifecycle_functions_stay_below_complexity_budget(self):
+        tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+        managed = {
+            "bootstrap_vault",
+            "bootstrap_keycloak",
+            "verify_keycloak",
+            "load_runtime_values",
+            "certificate_matches",
+        }
+        branching = (ast.If, ast.For, ast.While, ast.Try, ast.With, ast.BoolOp)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in managed:
+                complexity = 1 + sum(isinstance(child, branching) for child in ast.walk(node))
+                self.assertLessEqual(complexity, 15, f"{node.name} complexity={complexity}")
 
     def test_log_redaction_includes_persisted_runtime_token(self):
         module = load_reference_environment()

@@ -17,7 +17,8 @@ python3 scripts/reference-environment.py --project rss-device-security-reference
 ```
 
 `up` creates a mode-0700 `deploy/.state/<project>` directory, random runtime credentials, and the
-base providers. `bootstrap` converges Vault PKI, database roles, the Keycloak realm, and the exact
+isolated Vault base provider. `bootstrap` signs provider certificates, starts PostgreSQL with
+TLS-only host authentication, then converges database roles, the Keycloak realm, and the exact
 Mosquitto ACL. `verify` performs provider-native positive and negative authorization checks. `down`
 removes only Compose resources with the validated project identity and then removes the matching
 sentinel-protected state directory. A repeated `down` succeeds.
@@ -35,14 +36,21 @@ teardown. The script always collects Compose logs after a failure and attempts s
 
 ## Fixed identities and boundaries
 
-- Keycloak realm `rss-device-security`; clients `rotation-control` and `deviceidentity`.
-- Vault PKI mount `device-pki`; server, device, and service roles with bounded SANs, EKUs, and TTLs.
+- Keycloak realm `rss-device-security`; clients `rotation-control` and `deviceidentity`. The operator
+  journey uses Authorization Code with PKCE; the public client rejects password grants.
+- Vault PKI mount `device-pki`; server, database, device, and service roles with bounded SANs, EKUs,
+  and TTLs. Vault receives CSRs only and never sees generated leaf private keys.
 - PostgreSQL databases `keycloak` and empty `deviceidentity`; migrator and serving roles remain
-  separate, and this fixture never imports RSS migrations.
+  separate, and this fixture never imports RSS migrations. PostgreSQL rejects plaintext TCP;
+  Keycloak verifies the database server certificate and hostname.
 - Mosquitto accepts MQTTS client certificates only. Device and service identities receive opposite,
   exact topic directions; wildcard topics are absent.
 - `policies/reference-fixture.json` supplies disposable tenant/device/generation coordinates and
   policy inputs. It neither writes an RSS database nor becomes a production authority or contract.
+
+Provider traffic is split across internal PKI, identity-database, and broker trust zones. Separate
+single-provider control networks expose only the documented loopback ports; providers do not share
+a general-purpose bridge.
 
 All passwords, tokens, private keys, CAs, and leaf certificates remain under ignored
 `deploy/.state/`. Never copy that directory into source control or reuse its values outside this

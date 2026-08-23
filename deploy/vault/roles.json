@@ -25,6 +25,16 @@
       "ttl": "{{validitySeconds}}s",
       "max_ttl": "24h"
     },
+    "postgres-server": {
+      "allowed_domains": ["postgres"],
+      "allow_bare_domains": true,
+      "allow_subdomains": false,
+      "allow_ip_sans": false,
+      "server_flag": true,
+      "client_flag": false,
+      "ttl": "{{validitySeconds}}s",
+      "max_ttl": "24h"
+    },
     "mqtt-device": {
       "allowed_domains": ["reference-device"],
       "allowed_uri_sans": ["urn:rss:mqtt-device:v1:{{tenantId}}:{{deviceId}}:{{generation}}"],

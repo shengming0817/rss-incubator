@@ -1,10 +1,10 @@
-path "device-pki/sign/mqtt-device" {
+path "{{mount}}/sign/mqtt-device" {
   capabilities = ["create", "update"]
   denied_parameters = {
     "ttl" = []
   }
 }
 
-path "device-pki/cert/ca" {
+path "{{mount}}/cert/ca" {
   capabilities = ["read"]
 }

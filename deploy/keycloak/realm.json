@@ -17,7 +17,7 @@
       "name": "Rotation Control",
       "enabled": true,
       "publicClient": true,
-      "directAccessGrantsEnabled": true,
+      "directAccessGrantsEnabled": false,
       "standardFlowEnabled": true,
       "redirectUris": ["http://127.0.0.1:8765/callback"],
       "attributes": {"pkce.code.challenge.method": "S256"},

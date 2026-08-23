@@ -33,6 +33,8 @@ ALTER DATABASE keycloak OWNER TO keycloak_owner;
 ALTER DATABASE deviceidentity OWNER TO deviceidentity_migrator;
 REVOKE ALL ON DATABASE keycloak FROM PUBLIC;
 REVOKE ALL ON DATABASE deviceidentity FROM PUBLIC;
+REVOKE CONNECT ON DATABASE keycloak FROM deviceidentity_migrator, deviceidentity_app;
+REVOKE CONNECT ON DATABASE deviceidentity FROM keycloak_owner;
 GRANT CONNECT ON DATABASE keycloak TO keycloak_owner;
 
 GRANT CONNECT ON DATABASE deviceidentity TO deviceidentity_app;
