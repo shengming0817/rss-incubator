@@ -52,20 +52,24 @@ path, alias, local generated copy, or lifecycle change in this product skeleton.
 
 `rotation-model` contains product-owned opaque references, positive generation/fence values, and
 distinct schema-aligned projections for acceptance, command acknowledgement, credential report,
-and application receipt. Acceptance retains its authorization-receipt correlation. Committed,
+and application receipt. ACK, report, and receipt each require their own event-envelope identity;
+command and ingress-envelope correlations remain distinct types. Acceptance retains its
+authorization-receipt correlation. Committed,
 duplicate, and stale application outcomes require that correlation plus the desired generation;
 rejected outcomes cannot carry accepted lineage. The model preserves the public contracts' closed
 outcomes, reasons, fence, sequence, digest, and timestamp discriminants without copying wire DTOs.
-Construction validates product shape only; authenticated provenance remains the future client's
-ingress responsibility. These values grant no identity, authorization, readiness, or authoritative
+Construction validates product shape only; authenticated provenance remains outside the mapper.
+The non-publishable `rss-device-security-client` performs exhaustive canonical DTO mappings and
+device UUID correlation only. These values grant no identity, authorization, readiness, or authoritative
 transition. The model deliberately has no `Ready` type or predicate, allow/deny decision, L4 state
 machine, reconcile behavior, transport DTO, secret material, or provider API.
 
 ## Implementation handoff
 
-The sequence below is the single implementation path; no item is implemented by this skeleton:
+The sequence below is the single implementation path. #2119 is implemented here; later items remain
+separate owners:
 
-1. **Azure PBI #2119** creates `crates/rss-device-security-client` and maps only the exact registry
+1. **Azure PBI #2119** created `crates/rss-device-security-client` and maps only the exact registry
    contract candidate into product facts.
 2. **Azure PBI #2120** creates the disposable Keycloak, Vault, Mosquitto, and PostgreSQL reference
    environment without production secrets or mutable RSS image tags.
@@ -92,7 +96,8 @@ It may consume only stable RSS Release Surface artifacts.
 | Risk | Current carrier | Strength and claim |
 | --- | --- | --- |
 | ACK, report, and application receipt become interchangeable | Separate Rust structs with no conversion or readiness API | Rust type-system Hard |
-| Acceptance or accepted application outcome loses authorization lineage, or rejection acquires it | Required acceptance field plus `ApplicationReceiptLineage` in a closed outcome enum | Rust private-field/constructor/enum Hard |
+| ACK, report, receipt event IDs, command IDs, and ingress-envelope IDs become interchangeable | Required fields with distinct opaque Rust types | Rust type-system Hard |
+| Acceptance or accepted application outcome loses authorization lineage, or rejection acquires it | Required acceptance field plus `ReceiptLineage` in a closed outcome enum | Rust private-field/constructor/enum Hard |
 | Rotation model imports RSS, source/workspace, transport, or provider coupling | Package-scoped negative dependency policy over every Cargo dependency table | CI policy Hard for declared forbidden edges |
 | Source coupling enters candidate consumption | Independent repository, committed root lock, existing candidate proof | Physical/Cargo Hard plus proof Medium |
 | Product scope, owner, public-waist choice, and T3 prohibition drift | Accepted upstream ADR plus review of this scope document | Policy/review fact; not represented as machine enforcement |

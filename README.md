@@ -11,11 +11,15 @@ handler, and exercises product-owned host admission. Together they prove only th
 product-consumption seams work; they are not accepted products, official profiles, maturity claims,
 or production gates.
 
+The non-publishable `crates/rss-device-security-client` package is the minimal external T2 mapping
+seam for the canonical device-security contract candidate. It owns no network, authentication,
+authorization, retry, readiness, or device-state behavior.
+
 ## Incubating products
 
 The [Secure Device Credential Rotation](docs/secure-device-credential-rotation.md) skeleton is an
 accepted incubation scope. Its `rotation-model` package contains only transport-neutral product
-correlation and observation facts. The future registry client, control CLI, reference device agent,
+correlation and observation facts. The public mapping client, future control CLI, reference device agent,
 reference deployment, and external T2 journey retain separate implementation owners.
 
 The rotation product does not absorb `rss-consumer-smoke`. The observability smoke remains an
@@ -47,8 +51,8 @@ complete: this repository owns the consumer proof and RSS retains the Release Su
 ## Local policy verification
 
 The committed root `Cargo.lock` is the single dependency resolution for this workspace. Before the
-Platform candidate packages are published, the regular workspace excludes only
-`platform-authoring-smoke`; the candidate proof atomically re-enrolls it only in its isolated
+Platform and device-security candidate packages are published, the regular workspace excludes the
+candidate consumers; the candidate proof derives and atomically re-enrolls all exclusions only in its isolated
 snapshot. A fresh clone and the pull-request/push lane run:
 
 The disposable Secure Device Rotation provider environment has one lifecycle entrypoint. It creates
@@ -65,8 +69,7 @@ the environment's External/T2-only acceptance boundary.
 ```sh
 python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 cargo fmt --all -- --check
-find crates/platform-authoring-smoke -type f -name '*.rs' -exec rustfmt --edition 2024 --check {} +
-python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+find crates -type f -name '*.rs' -exec rustfmt --edition 2024 --check {} +
 cargo check --workspace --all-targets --locked
 cargo test --workspace --all-targets --locked
 cargo test --workspace --doc --locked
@@ -80,14 +83,15 @@ the proof executes the equivalent of the following inside its temporary snapshot
 ```text
 cargo check --workspace --all-targets --locked
 cargo test --workspace --all-targets --locked
+cargo test --workspace --doc --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
 GitHub Actions runs the policy, formatting, check, test, documentation, and lint gates for the
-regular workspace on every pull request and push to `main`. The three Platform candidate packages
-are intentionally absent from crates.io, so those events must not resolve
-`platform-authoring-smoke`. A manual candidate run uses the exact immutable RSS bundle, activates
-that excluded member only in its temporary snapshot, and delegates the complete workspace metadata,
+regular workspace on every pull request and push to `main`. Candidate packages are intentionally
+absent from crates.io, so those events must not resolve the excluded consumers. A manual candidate
+run uses the exact immutable RSS bundle, activates all excluded members only in its temporary snapshot,
+and delegates the complete workspace metadata,
 build, test, and lint execution to the isolated candidate-proof job.
 
 ## Candidate artifact proof
@@ -101,8 +105,9 @@ python3 scripts/candidate-proof.py --bundle /absolute/path/to/rss-candidate-bund
 ```
 
 The bundle carries the complete RSS Release Surface exact-set. Before Cargo resolution, the proof
-statically discovers the subset directly consumed by this workspace, rewrites only a committed-HEAD
-temporary snapshot, and then runs Cargo fmt, metadata, check, test, and clippy with
+statically discovers the subset directly consumed by this workspace, enforces the device-security
+client's single exact RSS edge, rewrites only a committed-HEAD temporary snapshot, and then runs
+Cargo fmt, metadata, check, test, doctest, and clippy with
 `--locked --offline`. It rejects checksum or
 archive-VCS drift, missing or extra registry entries, path/Git/workspace RSS dependencies, internal
 RSS packages, and any change to the real checkout. The committed root `Cargo.lock` remains the
