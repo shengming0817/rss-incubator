@@ -520,13 +520,17 @@ impl ReqwestHttpPort {
         request: reqwest::RequestBuilder,
         limit: Duration,
     ) -> Result<HttpReply, AppError> {
-        let response = timeout(limit, request.send())
-            .await
-            .map_err(|_| AppError::transport("request_timeout", true))?
-            .map_err(|_| AppError::transport("request_failed", true))?;
-        let status = response.status().as_u16();
-        let body = bounded_bytes(response).await?;
-        Ok(HttpReply { status, body })
+        timeout(limit, async {
+            let response = request
+                .send()
+                .await
+                .map_err(|_| AppError::transport("request_failed", true))?;
+            let status = response.status().as_u16();
+            let body = bounded_bytes(response).await?;
+            Ok(HttpReply { status, body })
+        })
+        .await
+        .map_err(|_| AppError::transport("request_timeout", true))?
     }
 }
 
@@ -608,11 +612,11 @@ async fn authenticate(
         return Err(AppError::auth("issuer_mismatch"));
     }
     let authorization_endpoint = Url::parse(&discovery.authorization_endpoint)
-        .map_err(|_| AppError::auth(INVALID_DISCOVERY))?;
-    let token_endpoint =
-        Url::parse(&discovery.token_endpoint).map_err(|_| AppError::auth(INVALID_DISCOVERY))?;
+        .map_err(|_| AppError::untrusted(INVALID_DISCOVERY))?;
+    let token_endpoint = Url::parse(&discovery.token_endpoint)
+        .map_err(|_| AppError::untrusted(INVALID_DISCOVERY))?;
     let jwks_uri =
-        Url::parse(&discovery.jwks_uri).map_err(|_| AppError::auth(INVALID_DISCOVERY))?;
+        Url::parse(&discovery.jwks_uri).map_err(|_| AppError::untrusted(INVALID_DISCOVERY))?;
     secure_remote_url(&authorization_endpoint, false)?;
     secure_remote_url(&token_endpoint, false)?;
     secure_remote_url(&jwks_uri, false)?;
@@ -649,9 +653,7 @@ async fn authenticate(
             LOGIN_TIMEOUT,
         )
         .await?;
-    if response.status != StatusCode::OK.as_u16() {
-        return Err(AppError::auth("token_exchange_rejected"));
-    }
+    classify_token_response(response.status)?;
     let token: TokenWire = serde_json::from_slice(&response.body)
         .map_err(|_| AppError::untrusted("malformed_json"))?;
     let jwks: JwkSet = fetch_json(http, jwks_uri, LOGIN_TIMEOUT).await?;
@@ -659,6 +661,18 @@ async fn authenticate(
     Ok(TokenSet {
         access_token: token.access_token,
     })
+}
+
+fn classify_token_response(status: u16) -> Result<(), AppError> {
+    match status {
+        200 => Ok(()),
+        400 | 401 | 403 => Err(AppError::auth("token_exchange_rejected")),
+        429 | 500..=599 => Err(AppError::transport(
+            "token_upstream_rejected",
+            status >= 500,
+        )),
+        _ => Err(AppError::untrusted("token_status_unknown")),
+    }
 }
 
 async fn receive_callback(
@@ -1343,6 +1357,79 @@ mod tests {
             .exit_code(),
             6
         );
+    }
+
+    #[tokio::test]
+    async fn oidc_token_statuses_and_invalid_discovery_endpoints_keep_exit_classes() {
+        for (status, exit) in [(400, 3), (401, 3), (403, 3), (429, 5), (503, 5), (418, 6)] {
+            let fake = FakeHttp::new(vec![
+                Ok(reply(
+                    200,
+                    &json!({"issuer":"https://issuer.example/","authorization_endpoint":"https://issuer.example/authorize","token_endpoint":"https://issuer.example/token","jwks_uri":"https://issuer.example/jwks"}),
+                )),
+                Ok(reply(status, &json!({"provider":"secret-bait"}))),
+            ]);
+            let error = authenticate(
+                &auth(),
+                &fake,
+                &FakeBrowser,
+                &FakeClock,
+                &FakeCallback,
+                &FakeVerifier,
+            )
+            .await
+            .expect_err("token status");
+            assert_eq!(error.exit_code(), exit, "status {status}");
+            assert!(!error.render().to_string().contains("secret-bait"));
+        }
+
+        let invalid_discovery = FakeHttp::new(vec![Ok(reply(
+            200,
+            &json!({"issuer":"https://issuer.example/","authorization_endpoint":"not a URL","token_endpoint":"https://issuer.example/token","jwks_uri":"https://issuer.example/jwks"}),
+        ))]);
+        assert_eq!(
+            authenticate(
+                &auth(),
+                &invalid_discovery,
+                &FakeBrowser,
+                &FakeClock,
+                &FakeCallback,
+                &FakeVerifier,
+            )
+            .await
+            .expect_err("invalid discovery endpoint")
+            .exit_code(),
+            6
+        );
+    }
+
+    #[tokio::test]
+    async fn http_deadline_includes_response_body_consumption() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.expect("request");
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n")
+                .await
+                .expect("headers");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let result = ReqwestHttpPort::new(None)
+            .expect("http")
+            .get(
+                Url::parse(&format!("http://{address}/slow")).expect("url"),
+                Duration::from_millis(50),
+            )
+            .await;
+        let Err(result) = result else {
+            panic!("body should time out");
+        };
+        assert_eq!(result.code, "request_timeout");
+        assert_eq!(result.exit_code(), 5);
+        server.abort();
     }
 
     #[tokio::test]
