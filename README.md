@@ -51,7 +51,19 @@ Platform candidate packages are published, the regular workspace excludes only
 `platform-authoring-smoke`; the candidate proof atomically re-enrolls it only in its isolated
 snapshot. A fresh clone and the pull-request/push lane run:
 
+The disposable Secure Device Rotation provider environment has one lifecycle entrypoint. It creates
+all credentials under the ignored `deploy/.state/<project>` directory and binds published ports to
+loopback only:
+
 ```sh
+python3 scripts/reference-environment.py smoke
+```
+
+See [`deploy/README.md`](deploy/README.md) for individual lifecycle commands, failure diagnosis, and
+the environment's External/T2-only acceptance boundary.
+
+```sh
+python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 cargo fmt --all -- --check
 find crates/platform-authoring-smoke -type f -name '*.rs' -exec rustfmt --edition 2024 --check {} +
 python3 -m unittest discover -s scripts/tests -p 'test_*.py'
