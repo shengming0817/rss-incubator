@@ -66,6 +66,91 @@ class ReferenceEnvironmentError(RuntimeError):
     """A fail-closed reference environment error."""
 
 
+def json_path(parent: str, key: object) -> str:
+    if isinstance(key, str):
+        return f"{parent}.{key}"
+    return f"{parent}[{key!r}]"
+
+
+class SourcedJsonDict(dict):
+    def __init__(self, *args, source: str, path: str = "$", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.source = source
+        self.path = path
+
+    def __getitem__(self, key):
+        try:
+            return super().__getitem__(key)
+        except (KeyError, TypeError) as error:
+            missing = json_path(self.path, key)
+            raise ReferenceEnvironmentError(
+                f"{self.source} returned an invalid JSON field at {missing}"
+            ) from error
+
+
+class SourcedJsonList(list):
+    def __init__(self, *args, source: str, path: str = "$", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.source = source
+        self.path = path
+
+    def __getitem__(self, key):
+        try:
+            return super().__getitem__(key)
+        except (IndexError, TypeError) as error:
+            missing = json_path(self.path, key)
+            raise ReferenceEnvironmentError(
+                f"{self.source} returned an invalid JSON field at {missing}"
+            ) from error
+
+
+def source_json(value: object, *, source: str, path: str = "$") -> object:
+    if isinstance(value, dict):
+        return SourcedJsonDict(
+            {
+                key: source_json(item, source=source, path=json_path(path, key))
+                for key, item in value.items()
+            },
+            source=source,
+            path=path,
+        )
+    if isinstance(value, list):
+        return SourcedJsonList(
+            [
+                source_json(item, source=source, path=json_path(path, index))
+                for index, item in enumerate(value)
+            ],
+            source=source,
+            path=path,
+        )
+    return value
+
+
+def json_value(
+    payload: object,
+    *path: str | int,
+    source: str,
+    expected_type: type | tuple[type, ...] | None = None,
+) -> object:
+    value = payload
+    location = "$"
+    for key in path:
+        location = json_path(location, key)
+        if isinstance(value, dict) and isinstance(key, str) and key in value:
+            value = value[key]
+        elif isinstance(value, list) and isinstance(key, int) and 0 <= key < len(value):
+            value = value[key]
+        else:
+            raise ReferenceEnvironmentError(
+                f"{source} returned an invalid JSON field at {location}"
+            )
+    if expected_type is not None and not isinstance(value, expected_type):
+        raise ReferenceEnvironmentError(
+            f"{source} returned an invalid JSON field at {location}"
+        )
+    return value
+
+
 def parse_json(
     contents: str | bytes,
     *,
@@ -78,7 +163,7 @@ def parse_json(
         raise ReferenceEnvironmentError(f"{source} returned malformed JSON") from error
     if expected_type is not None and not isinstance(payload, expected_type):
         raise ReferenceEnvironmentError(f"{source} returned an invalid JSON shape")
-    return payload
+    return source_json(payload, source=source)
 
 
 class LoginFormParser(HTMLParser):
@@ -266,12 +351,18 @@ def render_fixture_placeholders(value: object, fixture: dict[str, object]) -> ob
             raise ReferenceEnvironmentError(f"unknown fixture placeholder: {value}")
         return value
     if isinstance(value, list):
-        return [render_fixture_placeholders(item, fixture) for item in value]
+        rendered = [render_fixture_placeholders(item, fixture) for item in value]
+        if isinstance(value, SourcedJsonList):
+            return source_json(rendered, source=value.source, path=value.path)
+        return rendered
     if isinstance(value, dict):
-        return {
+        rendered = {
             key: render_fixture_placeholders(item, fixture)
             for key, item in value.items()
         }
+        if isinstance(value, SourcedJsonDict):
+            return source_json(rendered, source=value.source, path=value.path)
+        return rendered
     return value
 
 
@@ -666,7 +757,13 @@ class ReferenceEnvironment:
                 source="Vault runtime token",
                 expected_type=dict,
             )
-            runtime_token = token["auth"]["client_token"]
+            runtime_token = json_value(
+                token,
+                "auth",
+                "client_token",
+                source="Vault runtime token",
+                expected_type=str,
+            )
             write_private_text(token_path, runtime_token + "\n")
         return str(runtime_token)
 
@@ -772,7 +869,15 @@ class ReferenceEnvironment:
             source=f"Vault certificate response for {role}",
             expected_type=dict,
         )
-        pem = response["data"]["certificate"].strip() + "\n"
+        pem = str(
+            json_value(
+                response,
+                "data",
+                "certificate",
+                source=f"Vault certificate response for {role}",
+                expected_type=str,
+            )
+        ).strip() + "\n"
         write_private_text(certificate, pem)
         certificate.chmod(0o644)
 
@@ -918,7 +1023,14 @@ class ReferenceEnvironment:
                         source="Keycloak admin token",
                         expected_type=dict,
                     )
-                    return str(payload["access_token"])
+                    return str(
+                        json_value(
+                            payload,
+                            "access_token",
+                            source="Keycloak admin token",
+                            expected_type=str,
+                        )
+                    )
             except (urllib.error.HTTPError, urllib.error.URLError) as error:
                 retryable = not isinstance(error, urllib.error.HTTPError) or error.code == 503
                 if not retryable or time.monotonic() >= deadline:
@@ -1450,7 +1562,14 @@ class ReferenceEnvironment:
             token = parse_json(
                 response.read(), source="Keycloak PKCE token", expected_type=dict
             )
-        return str(token["access_token"])
+        return str(
+            json_value(
+                token,
+                "access_token",
+                source="Keycloak PKCE token",
+                expected_type=str,
+            )
+        )
 
     def generate_mosquitto_acl(self) -> None:
         uplinks, downlinks = self.canonical_mqtt_topics()
@@ -1507,7 +1626,12 @@ class ReferenceEnvironment:
                 source=f"Vault role {role}",
                 expected_type=dict,
             )
-            result = payload["data"]
+            result = json_value(
+                payload,
+                "data",
+                source=f"Vault role {role}",
+                expected_type=dict,
+            )
             expected = dict(desired)
             expected["max_ttl"] = duration_seconds(str(desired["max_ttl"]))
             expected["ttl"] = duration_seconds(str(desired["ttl"]))
@@ -1882,7 +2006,13 @@ SELECT json_build_object(
             discovery = parse_json(
                 response.read(), source="Keycloak discovery", expected_type=dict
             )
-        if not discovery["issuer"].endswith(f"{self.realm_path_prefix}"):
+        issuer = json_value(
+            discovery,
+            "issuer",
+            source="Keycloak discovery",
+            expected_type=str,
+        )
+        if not str(issuer).endswith(f"{self.realm_path_prefix}"):
             raise ReferenceEnvironmentError("Keycloak issuer differs")
         password_request = urllib.request.Request(
             self.keycloak_url(
@@ -1933,7 +2063,14 @@ SELECT json_build_object(
             service_response = parse_json(
                 response.read(), source="Keycloak service token", expected_type=dict
             )
-            service_token = service_response["access_token"]
+            service_token = str(
+                json_value(
+                    service_response,
+                    "access_token",
+                    source="Keycloak service token",
+                    expected_type=str,
+                )
+            )
         service_payload = service_token.split(".")[1]
         service_payload += "=" * (-len(service_payload) % 4)
         service_claims = parse_json(
@@ -2359,7 +2496,12 @@ SELECT json_build_object(
                 source=f"Vault logical role {role}",
                 expected_type=dict,
             )
-            vault_roles[role] = result["data"]
+            vault_roles[role] = json_value(
+                result,
+                "data",
+                source=f"Vault logical role {role}",
+                expected_type=dict,
+            )
         return {
             "keycloakClients": client_ids,
             "keycloakOperator": users[0]["id"],

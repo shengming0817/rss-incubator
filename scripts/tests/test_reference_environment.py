@@ -454,6 +454,47 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(module.ReferenceEnvironmentError, "Keycloak clients"):
             module.parse_json('{"wrong":"shape"}', source="Keycloak clients", expected_type=list)
 
+    def test_json_parser_preserves_source_for_missing_nested_provider_fields(self):
+        module = load_reference_environment()
+        payload = module.parse_json(
+            '{"auth":{}}', source="Vault runtime token", expected_type=dict
+        )
+        with self.assertRaisesRegex(
+            module.ReferenceEnvironmentError,
+            r"Vault runtime token.*\$\.auth\.client_token",
+        ):
+            payload["auth"]["client_token"]
+
+        wrong_shape = module.parse_json(
+            '{"auth":[]}', source="Vault runtime token", expected_type=dict
+        )
+        with self.assertRaisesRegex(
+            module.ReferenceEnvironmentError,
+            r"Vault runtime token.*\$\.auth\.client_token",
+        ):
+            module.json_value(
+                wrong_shape,
+                "auth",
+                "client_token",
+                source="Vault runtime token",
+                expected_type=str,
+            )
+
+        scalar_shape = module.parse_json(
+            '{"auth":"wrong"}', source="Vault runtime token", expected_type=dict
+        )
+        with self.assertRaisesRegex(
+            module.ReferenceEnvironmentError,
+            r"Vault runtime token.*\$\.auth\.client_token",
+        ):
+            module.json_value(
+                scalar_shape,
+                "auth",
+                "client_token",
+                source="Vault runtime token",
+                expected_type=str,
+            )
+
     def test_managed_lifecycle_functions_stay_below_complexity_budget(self):
         tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
         managed = {
