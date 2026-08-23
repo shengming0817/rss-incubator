@@ -102,7 +102,7 @@ pub enum MqttEvent {
     Unsubscribed,
     Command(Box<CommandDelivery>),
     OutboundAcknowledged { event_id: String },
-    InboundAcknowledged { command_id: String },
+    InboundAcknowledged { settlement_token: Option<String> },
     TransportProgress,
 }
 
@@ -113,7 +113,7 @@ pub struct MqttSession {
     topics: TopicSet,
     awaiting_packet_id: VecDeque<String>,
     packet_events: HashMap<u16, String>,
-    inbound_acknowledgements: HashMap<u16, String>,
+    inbound_acknowledgements: HashMap<u16, Option<String>>,
     recovery_command_topic: Option<String>,
 }
 
@@ -231,13 +231,14 @@ impl MqttSession {
     pub async fn acknowledge_command(
         &mut self,
         delivery: &CommandDelivery,
+        settlement_token: Option<String>,
     ) -> Result<(), MqttError> {
         self.client
             .ack(&delivery.publish)
             .await
             .map_err(|error| MqttError::Request(Box::new(error)))?;
         self.inbound_acknowledgements
-            .insert(delivery.publish.pkid, delivery.command_id.clone());
+            .insert(delivery.publish.pkid, settlement_token);
         Ok(())
     }
 
@@ -277,11 +278,11 @@ impl MqttSession {
                 Ok(MqttEvent::TransportProgress)
             }
             Event::Outgoing(Outgoing::PubAck(packet_id)) => {
-                let command_id = self
+                let settlement_token = self
                     .inbound_acknowledgements
                     .remove(&packet_id)
                     .ok_or(MqttError::UnknownPubAck)?;
-                Ok(MqttEvent::InboundAcknowledged { command_id })
+                Ok(MqttEvent::InboundAcknowledged { settlement_token })
             }
             _ => Ok(MqttEvent::TransportProgress),
         }

@@ -65,7 +65,7 @@ async fn persistent_session_queues_offline_command_and_manual_ack_is_explicit() 
     assert_eq!(delivery.command_id(), "offline-command-1");
     assert_eq!(delivery.payload(), br#"{"probe":"persistent-session"}"#);
     reconnected
-        .acknowledge_command(&delivery)
+        .acknowledge_command(&delivery, None)
         .await
         .expect("manual PUBACK enqueue");
     let _ = timeout(Duration::from_secs(5), reconnected.poll())

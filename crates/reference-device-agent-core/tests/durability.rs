@@ -35,6 +35,13 @@ fn accepted_command_is_durable_and_report_waits_for_ack_and_new_session() {
         ApplyOutcome::Accepted
     );
     assert!(agent.rotation_in_flight());
+    let settlement_token = agent
+        .pending_settlement_token(&command)
+        .expect("settlement token")
+        .to_owned();
+    agent
+        .mark_pending_inbound_settled(&settlement_token)
+        .expect("inbound PUBACK outgoing");
     let ack = agent.next_outbound().expect("durable ACK");
     assert!(matches!(ack, OutboundFact::CommandAcknowledged { .. }));
     agent.confirm_outbound(ack.event_id()).expect("confirm ACK");
@@ -113,6 +120,9 @@ fn committed_rotation_recognizes_only_its_old_delivery_after_restart() {
             .expect("redelivery replay"),
         ApplyOutcome::Duplicate
     );
+    reopened
+        .mark_pending_inbound_absent()
+        .expect("unsubscribe barrier without another redelivery");
     let unrelated = fixture.command(
         "another-command",
         &fixture.artifact_id,
@@ -141,6 +151,38 @@ fn committed_rotation_recognizes_only_its_old_delivery_after_restart() {
     assert!(matches!(
         reopened.delivery_identity(&old_topic, "command-0001"),
         Err(AgentError::UnexpectedDelivery)
+    ));
+}
+
+#[test]
+fn report_is_durably_blocked_until_exact_inbound_settlement() {
+    let fixture = Fixture::new();
+    let (mut agent, command) = fixture.agent_and_command();
+    agent
+        .apply_command(&fixture.command_topic(), &command, NOW)
+        .expect("accept rotation");
+    let ack = agent.next_outbound().expect("ACK");
+    agent.confirm_outbound(ack.event_id()).expect("ACK PUBACK");
+    agent
+        .mark_current_credential_connected(CredentialRevision::try_from(2).expect("revision"))
+        .expect("reconnect");
+    assert!(agent.next_outbound().is_none());
+    assert!(!agent.pending_inbound_settled());
+    assert!(matches!(
+        agent.mark_pending_inbound_settled("reference-settlement-wrong"),
+        Err(AgentError::UnexpectedDelivery)
+    ));
+
+    drop(agent);
+    let mut reopened = fixture.open_agent();
+    assert!(!reopened.pending_inbound_settled());
+    assert!(reopened.next_outbound().is_none());
+    reopened
+        .mark_pending_inbound_absent()
+        .expect("unsubscribe barrier");
+    assert!(matches!(
+        reopened.next_outbound(),
+        Some(OutboundFact::CertificateReported { .. })
     ));
 }
 
@@ -409,6 +451,13 @@ fn stale_fence_is_checked_before_stale_generation() {
             .expect("accept"),
         ApplyOutcome::Accepted
     );
+    let settlement_token = agent
+        .pending_settlement_token(&accepted)
+        .expect("settlement token")
+        .to_owned();
+    agent
+        .mark_pending_inbound_settled(&settlement_token)
+        .expect("inbound PUBACK outgoing");
     let ack = agent.next_outbound().expect("ACK");
     agent.confirm_outbound(ack.event_id()).expect("ACK PUBACK");
     agent

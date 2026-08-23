@@ -256,6 +256,8 @@ impl StateV1 {
             let valid = !pending.command_id.is_empty()
                 && Sha256Digest::try_from(pending.fingerprint.clone()).is_ok()
                 && pending.topic == TopicSet::new(&identity).command()
+                && pending.settlement_token
+                    == settlement_token(&pending.topic, &pending.command_id, &pending.fingerprint)
                 && self.last_command.as_ref().is_some_and(|last| {
                     last.command_id == pending.command_id && last.fingerprint == pending.fingerprint
                 });
@@ -356,13 +358,21 @@ impl StateV1 {
             .iter()
             .any(|entry| entry.report_payload().is_some())
     }
-    pub fn pending_inbound(&self) -> Option<(&str, &str, u64)> {
+    pub fn pending_inbound(&self) -> Option<(&str, &str, u64, &str, bool)> {
         self.pending_inbound.as_ref().map(|pending| {
             (
                 pending.topic.as_str(),
                 pending.command_id.as_str(),
                 pending.credential_generation,
+                pending.settlement_token.as_str(),
+                pending.settled,
             )
+        })
+    }
+    pub fn pending_settlement_token(&self, command_id: &str, fingerprint: &str) -> Option<&str> {
+        self.pending_inbound.as_ref().and_then(|pending| {
+            (pending.command_id == command_id && pending.fingerprint == fingerprint)
+                .then_some(pending.settlement_token.as_str())
         })
     }
     pub fn last_command(&self) -> Option<&StoredCommand> {
@@ -428,16 +438,20 @@ impl StateV1 {
             fingerprint,
             acknowledgement: acknowledgement.clone(),
         });
+        let pending_topic = TopicSet::new(&previous_identity).command().to_owned();
+        let pending_fingerprint = self
+            .last_command
+            .as_ref()
+            .expect("stored command")
+            .fingerprint
+            .clone();
         self.pending_inbound = Some(StoredInboundSettlement {
-            topic: TopicSet::new(&previous_identity).command().to_owned(),
+            settlement_token: settlement_token(&pending_topic, command_id, &pending_fingerprint),
+            topic: pending_topic,
             command_id: command_id.to_owned(),
-            fingerprint: self
-                .last_command
-                .as_ref()
-                .expect("stored command")
-                .fingerprint
-                .clone(),
+            fingerprint: pending_fingerprint,
             credential_generation: previous_identity.credential_generation().get(),
+            settled: false,
         });
         self.outbox.push(StoredOutbound::Ack {
             event_id: ack_event,
@@ -549,7 +563,18 @@ impl StateV1 {
     }
 
     pub fn next_outbound(&self) -> Option<OutboundFact> {
-        self.outbox.iter().find_map(StoredOutbound::ready_fact)
+        self.outbox.iter().find_map(|entry| {
+            if matches!(entry, StoredOutbound::ReportReady { .. })
+                && !self
+                    .pending_inbound
+                    .as_ref()
+                    .is_some_and(|pending| pending.settled)
+            {
+                None
+            } else {
+                entry.ready_fact()
+            }
+        })
     }
 
     pub fn confirm_outbound(&mut self, event_id: &str) -> bool {
@@ -560,6 +585,14 @@ impl StateV1 {
         else {
             return false;
         };
+        if matches!(self.outbox[index], StoredOutbound::ReportReady { .. })
+            && !self
+                .pending_inbound
+                .as_ref()
+                .is_some_and(|pending| pending.settled)
+        {
+            return false;
+        }
         let confirmed = self.outbox.remove(index);
         if let StoredOutbound::Ack { payload, .. } = &confirmed
             && let Some(revision) = payload.activates_revision
@@ -588,6 +621,19 @@ impl StateV1 {
         self.reconnect_revision = None;
         true
     }
+
+    pub fn mark_inbound_settled(&mut self, token: Option<&str>) -> bool {
+        let Some(pending) = self.pending_inbound.as_mut() else {
+            return false;
+        };
+        if let Some(token) = token
+            && token != pending.settlement_token
+        {
+            return false;
+        }
+        pending.settled = true;
+        true
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -597,6 +643,8 @@ struct StoredInboundSettlement {
     command_id: String,
     fingerprint: String,
     credential_generation: u64,
+    settlement_token: String,
+    settled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -872,6 +920,15 @@ fn event_id(kind: &str, command_id: &str) -> String {
     hasher.update([0]);
     hasher.update(command_id.as_bytes());
     format!("reference-{kind}-{:x}", hasher.finalize())
+}
+
+fn settlement_token(topic: &str, command_id: &str, fingerprint: &str) -> String {
+    let mut source = topic.to_owned();
+    source.push('\0');
+    source.push_str(command_id);
+    source.push('\0');
+    source.push_str(fingerprint);
+    event_id("settlement", &source)
 }
 
 #[allow(clippy::too_many_arguments)]

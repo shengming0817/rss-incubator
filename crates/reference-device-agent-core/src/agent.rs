@@ -260,14 +260,49 @@ impl ReferenceDeviceAgent {
 
     #[must_use]
     pub fn pending_command_topic(&self) -> Option<&str> {
-        self.state.pending_inbound().map(|(topic, _, _)| topic)
+        self.state
+            .pending_inbound()
+            .map(|(topic, _, _, _, _)| topic)
     }
 
     #[must_use]
     pub fn pending_command_id(&self) -> Option<&str> {
         self.state
             .pending_inbound()
-            .map(|(_, command_id, _)| command_id)
+            .map(|(_, command_id, _, _, _)| command_id)
+    }
+
+    #[must_use]
+    pub fn pending_inbound_settled(&self) -> bool {
+        self.state
+            .pending_inbound()
+            .is_none_or(|(_, _, _, _, settled)| settled)
+    }
+
+    #[must_use]
+    pub fn pending_settlement_token(&self, command: &DeviceCommand) -> Option<&str> {
+        let fingerprint = command_fingerprint(command);
+        self.state
+            .pending_settlement_token(command.command_id().expose(), &fingerprint)
+    }
+
+    /// Persists the exact outgoing PUBACK fact for the pending old delivery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the token does not identify the durable pending delivery or state
+    /// persistence fails.
+    pub fn mark_pending_inbound_settled(&mut self, token: &str) -> Result<(), AgentError> {
+        self.persist_inbound_settlement(Some(token))
+    }
+
+    /// Persists that the recovery unsubscribe barrier completed without a redelivery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no delivery is pending or state persistence fails.
+    pub fn mark_pending_inbound_absent(&mut self) -> Result<(), AgentError> {
+        self.persist_inbound_settlement(None)
     }
 
     /// Selects the exact identity permitted to decode a current or recovery delivery.
@@ -285,7 +320,7 @@ impl ReferenceDeviceAgent {
         if TopicSet::new(&current).accepts_command(topic) {
             return Ok(current);
         }
-        let Some((pending_topic, pending_command, generation)) = self.state.pending_inbound()
+        let Some((pending_topic, pending_command, generation, _, _)) = self.state.pending_inbound()
         else {
             return Err(AgentError::UnexpectedDelivery);
         };
@@ -385,6 +420,14 @@ impl ReferenceDeviceAgent {
         self.store.persist(&candidate)?;
         self.state = candidate;
         Ok(())
+    }
+
+    fn persist_inbound_settlement(&mut self, token: Option<&str>) -> Result<(), AgentError> {
+        let mut candidate = self.state.clone();
+        if !candidate.mark_inbound_settled(token) {
+            return Err(AgentError::UnexpectedDelivery);
+        }
+        self.persist_candidate(candidate)
     }
 }
 

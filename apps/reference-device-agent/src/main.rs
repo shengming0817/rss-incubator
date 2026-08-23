@@ -82,14 +82,14 @@ async fn run_session(
     let mut connected_at = None;
     let mut unsubscribe_pending = false;
     let mut pending_command_ack = None;
-    let mut rotation_command_id = agent.pending_command_id().map(str::to_owned);
-    let mut rotation_inbound_flushed = recovery_topic.is_none();
+    let mut recovery_delivery_observed = false;
     let mut reconnect_ready = false;
 
     loop {
         if connected
             && publish_pending.is_none()
             && !reconnect_ready
+            && !unsubscribe_pending
             && let Some(outbound) = agent.next_outbound()
         {
             let encoded = encode_outbound(&session_identity, outbound)?;
@@ -110,10 +110,10 @@ async fn run_session(
             *retry_delay = Duration::from_secs(1);
         }
         match event? {
-            MqttEvent::Connected { session_present } => {
+            MqttEvent::Connected { session_present: _ } => {
                 connected = true;
                 connected_at = Some(tokio::time::Instant::now());
-                subscribed = session_present;
+                subscribed = false;
                 let reconnecting = agent.reconnect_revision()?;
                 if let Some(revision) = reconnecting {
                     agent.mark_current_credential_connected(revision)?;
@@ -127,25 +127,28 @@ async fn run_session(
             }
             MqttEvent::Subscribed => subscribed = true,
             MqttEvent::Command(delivery) => {
-                let delivered_command_id = delivery.command_id().to_owned();
+                if recovery_topic.as_deref() == Some(delivery.topic()) {
+                    recovery_delivery_observed = true;
+                }
                 let identity = agent.delivery_identity(delivery.topic(), delivery.command_id())?;
                 let command = decode_command(&identity, delivery.command_id(), delivery.payload())?;
                 let outcome = agent.apply_command(delivery.topic(), &command, now())?;
+                let settlement_token = agent.pending_settlement_token(&command).map(str::to_owned);
                 if outcome == ApplyOutcome::Accepted {
-                    rotation_command_id = Some(delivered_command_id);
                     session.unsubscribe_command().await?;
                     unsubscribe_pending = true;
-                    rotation_inbound_flushed = false;
-                    pending_command_ack = Some(delivery);
+                    pending_command_ack = Some((delivery, settlement_token));
                 } else {
-                    session.acknowledge_command(&delivery).await?;
+                    session
+                        .acknowledge_command(&delivery, settlement_token)
+                        .await?;
                 }
             }
             MqttEvent::OutboundAcknowledged { event_id } => {
                 let kind = publish_pending.take().ok_or(AgentError::UnknownOutbound)?;
                 agent.confirm_outbound(&event_id)?;
                 if agent.reconnect_revision()?.is_some() {
-                    if !unsubscribe_pending && rotation_inbound_flushed {
+                    if !unsubscribe_pending && agent.pending_inbound_settled() {
                         return Ok(());
                     }
                     reconnect_ready = true;
@@ -160,22 +163,34 @@ async fn run_session(
             MqttEvent::Unsubscribed if pending_command_ack.is_some() => {
                 subscribed = false;
                 unsubscribe_pending = false;
-                let delivery = pending_command_ack.take().expect("checked pending ACK");
-                session.acknowledge_command(&delivery).await?;
+                let (delivery, settlement_token) =
+                    pending_command_ack.take().expect("checked pending ACK");
+                session
+                    .acknowledge_command(&delivery, settlement_token)
+                    .await?;
             }
             MqttEvent::Unsubscribed => {
                 subscribed = false;
                 unsubscribe_pending = false;
-                if recovery_topic.is_some() {
-                    rotation_inbound_flushed = true;
+                if recovery_topic.is_some()
+                    && !recovery_delivery_observed
+                    && !agent.pending_inbound_settled()
+                {
+                    agent.mark_pending_inbound_absent()?;
                 }
-                if reconnect_ready && rotation_inbound_flushed {
-                    return Ok(());
+                match unsubscribe_completion(
+                    reconnect_ready,
+                    agent.pending_inbound_settled(),
+                    agent.rotation_in_flight(),
+                ) {
+                    UnsubscribeCompletion::Exit => return Ok(()),
+                    UnsubscribeCompletion::Subscribe => session.subscribe().await?,
+                    UnsubscribeCompletion::Wait => {}
                 }
             }
-            MqttEvent::InboundAcknowledged { command_id } => {
-                if rotation_command_id.as_deref() == Some(&command_id) {
-                    rotation_inbound_flushed = true;
+            MqttEvent::InboundAcknowledged { settlement_token } => {
+                if let Some(settlement_token) = settlement_token {
+                    agent.mark_pending_inbound_settled(&settlement_token)?;
                     if reconnect_ready && !unsubscribe_pending {
                         return Ok(());
                     }
@@ -183,6 +198,27 @@ async fn run_session(
             }
             MqttEvent::TransportProgress => {}
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnsubscribeCompletion {
+    Exit,
+    Subscribe,
+    Wait,
+}
+
+const fn unsubscribe_completion(
+    reconnect_ready: bool,
+    inbound_flushed: bool,
+    rotation_in_flight: bool,
+) -> UnsubscribeCompletion {
+    if reconnect_ready && inbound_flushed {
+        UnsubscribeCompletion::Exit
+    } else if !rotation_in_flight {
+        UnsubscribeCompletion::Subscribe
+    } else {
+        UnsubscribeCompletion::Wait
     }
 }
 
@@ -199,4 +235,37 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_unsubscribe_and_report_puback_orders_restore_intake() {
+        // UnsubAck before report PUBACK: remain blocked; report PUBACK then subscribes in its arm.
+        assert_eq!(
+            unsubscribe_completion(false, true, true),
+            UnsubscribeCompletion::Wait
+        );
+        // Report PUBACK before UnsubAck: the UnsubAck arm must restore the canonical subscription.
+        assert_eq!(
+            unsubscribe_completion(false, true, false),
+            UnsubscribeCompletion::Subscribe
+        );
+    }
+
+    #[test]
+    fn accepted_command_ack_orders_exit_only_after_unsubscribe_and_inbound_puback() {
+        // Outbound ACK PUBACK -> UnsubAck -> inbound PUBACK.
+        assert_eq!(
+            unsubscribe_completion(true, false, true),
+            UnsubscribeCompletion::Wait
+        );
+        // UnsubAck -> inbound PUBACK -> outbound ACK PUBACK reaches the same closed exit state.
+        assert_eq!(
+            unsubscribe_completion(true, true, true),
+            UnsubscribeCompletion::Exit
+        );
+    }
 }
