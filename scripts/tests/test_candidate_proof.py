@@ -442,9 +442,12 @@ class CandidateBundleTests(unittest.TestCase):
             )
 
     def test_device_security_client_has_one_exact_unaliased_normal_rss_edge(self):
+        repository = Path("/snapshot")
         package = {
             "name": candidate_proof.DEVICE_SECURITY_CLIENT,
-            "manifest_path": "crates/rss-device-security-client/Cargo.toml",
+            "manifest_path": str(
+                repository / candidate_proof.DEVICE_SECURITY_CLIENT_MANIFEST
+            ),
         }
         valid = {
             "name": candidate_proof.DEVICE_SECURITY_CONTRACT,
@@ -457,7 +460,9 @@ class CandidateBundleTests(unittest.TestCase):
             "features": [],
             "target": None,
         }
-        candidate_proof.validate_device_security_dependency_policy([(package, valid)])
+        candidate_proof.validate_device_security_dependency_policy(
+            repository, [(package, valid)]
+        )
 
         invalid = []
         for field, value in (
@@ -474,13 +479,27 @@ class CandidateBundleTests(unittest.TestCase):
             with self.subTest(dependencies=dependencies), self.assertRaises(
                 candidate_proof.ProofError
             ):
-                candidate_proof.validate_device_security_dependency_policy(dependencies)
+                candidate_proof.validate_device_security_dependency_policy(
+                    repository, dependencies
+                )
+
+        decoy = dict(package, manifest_path="/snapshot/crates/decoy/Cargo.toml")
+        renamed = dict(package, name="renamed-device-security-client")
+        for dependencies in (
+            [(decoy, valid)],
+            [(decoy, valid), (renamed, valid)],
+        ):
+            with self.assertRaises(candidate_proof.ProofError):
+                candidate_proof.validate_device_security_dependency_policy(
+                    repository, dependencies
+                )
 
     def test_static_manifest_discovery_rejects_forbidden_and_bundle_external_rss(self):
         cases = [
             'rss-platform = { version = "=0.3.0", path = "../rss" }\n',
             'rss-platform = { git = "https://invalid", rev = "deadbeef" }\n',
             'rss-platform = { workspace = true }\n',
+            'rss-platform = { version = "=0.3.0", registry = "attacker" }\n',
             'rss-internal = "=0.1.0"\n',
         ]
         for declaration in cases:
@@ -1102,21 +1121,35 @@ class CandidateBundleTests(unittest.TestCase):
                 return commands, snapshots
 
         commands, snapshots = run_once(fail_test=False)
-        matrix = {args[1]: args for args, _cwd in commands if len(args) > 1}
-        for command in ("check", "test", "clippy"):
-            self.assertIn(command, matrix)
+        command_args = [args for args, _cwd in commands]
+        matrix = {
+            args[1]: args
+            for args in command_args
+            if len(args) > 1 and args[1] in {"check", "clippy"}
+        }
+        all_targets_test = (
+            "cargo", "test", "--workspace", "--all-targets", "--locked", "--offline"
+        )
+        doctest = ("cargo", "test", "--workspace", "--doc", "--locked", "--offline")
+        self.assertIn(all_targets_test, command_args)
+        self.assertIn(doctest, command_args)
+        for command in ("check", "clippy"):
             self.assertIn("--locked", matrix[command])
             self.assertIn("--offline", matrix[command])
-        self.assertEqual(matrix["update"], ("cargo", "update", "--workspace"))
+        self.assertIn(("cargo", "update", "--workspace"), command_args)
         self.assertTrue(snapshots)
         self.assertTrue(snapshots[0].parent.name.startswith("rss-incubator-candidate-"))
         self.assertTrue(all(cwd == snapshots[0] for _args, cwd in commands))
-        command_args = [args for args, _cwd in commands]
         updated = command_args.index(("cargo", "update", "--workspace"))
         self.assertEqual(command_args[updated + 1], ("cargo", "fetch", "--locked"))
         first_matrix = min(
             command_args.index(matrix[subcommand])
-            for subcommand in ("check", "test", "clippy")
+            for subcommand in ("check", "clippy")
+        )
+        first_matrix = min(
+            first_matrix,
+            command_args.index(all_targets_test),
+            command_args.index(doctest),
         )
         self.assertLess(updated + 1, first_matrix)
         failed_commands, _ = run_once(fail_test=True)

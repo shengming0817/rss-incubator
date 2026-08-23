@@ -223,16 +223,7 @@ fn report_preserves_every_public_field() {
     let report = map_report(
         &context(),
         event("report-event-1"),
-        ReportPayload {
-            artifact_digest: parsed::<ReportDigest>(HASH),
-            device_id: device_id(),
-            device_sequence: 11,
-            expires_at: Some(1800),
-            fence_epoch: nz(4),
-            observed_at: 1700,
-            observed_generation: nz(8),
-            state_hash: parsed::<ReportHash>(HASH),
-        },
+        report_payload(device_id(), 11),
     )
     .expect("valid report");
     assert_eq!(report.event().expose(), "report-event-1");
@@ -339,6 +330,51 @@ fn boundary_rejects_device_mismatch_negative_sequence_and_invalid_reference() {
         map_acknowledgement(&context(), event("ack-event-4"), invalid),
         Err(MappingError::InvalidProductReference(_))
     ));
+
+    let mut mismatched_ack = received_ack_payload(1);
+    mismatched_ack.device_id = parsed(OTHER_DEVICE);
+    assert!(matches!(
+        map_acknowledgement(
+            &context(),
+            event("ack-event-mismatch"),
+            AckPayload::ReceivedPayload(mismatched_ack)
+        ),
+        Err(MappingError::DeviceMismatch { .. })
+    ));
+    assert!(matches!(
+        map_report(
+            &context(),
+            event("report-event-mismatch"),
+            report_payload(parsed(OTHER_DEVICE), 1)
+        ),
+        Err(MappingError::DeviceMismatch { .. })
+    ));
+    assert_eq!(
+        map_report(
+            &context(),
+            event("report-event-negative"),
+            report_payload(device_id(), -1)
+        ),
+        Err(MappingError::NegativeDeviceSequence(-1))
+    );
+
+    for mut receipt in [
+        committed_receipt(),
+        duplicate_receipt(),
+        stale_receipt(StaleReason::GenerationStale),
+        rejected_receipt(ReceiptRejectionReason::NotAccepted),
+    ] {
+        match &mut receipt {
+            ReceiptPayload::CommittedPayload(payload) => payload.device_id = parsed(OTHER_DEVICE),
+            ReceiptPayload::DuplicatePayload(payload) => payload.device_id = parsed(OTHER_DEVICE),
+            ReceiptPayload::StalePayload(payload) => payload.device_id = parsed(OTHER_DEVICE),
+            ReceiptPayload::RejectedPayload(payload) => payload.device_id = parsed(OTHER_DEVICE),
+        }
+        assert!(matches!(
+            map_receipt(&context(), event("receipt-event-mismatch"), receipt),
+            Err(MappingError::DeviceMismatch { .. })
+        ));
+    }
 }
 
 fn context() -> MappingContext {
@@ -412,6 +448,19 @@ fn rejected_ack(reason: RejectedReason) -> AckPayload {
         reason,
         result: RejectedResult::Rejected,
     })
+}
+
+fn report_payload(device: Uuid, sequence: i64) -> ReportPayload {
+    ReportPayload {
+        artifact_digest: parsed::<ReportDigest>(HASH),
+        device_id: device,
+        device_sequence: sequence,
+        expires_at: Some(1800),
+        fence_epoch: nz(4),
+        observed_at: 1700,
+        observed_generation: nz(8),
+        state_hash: parsed::<ReportHash>(HASH),
+    }
 }
 
 fn committed_receipt() -> ReceiptPayload {

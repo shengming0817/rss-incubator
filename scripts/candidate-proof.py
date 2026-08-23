@@ -36,6 +36,7 @@ CANDIDATE_REGISTRY_URL = "https://rss-candidate.invalid/index"
 CANDIDATE_SOURCE = f"registry+{CANDIDATE_REGISTRY_URL}"
 DEVICE_SECURITY_CLIENT = "rss-device-security-client"
 DEVICE_SECURITY_CONTRACT = "rss-device-security-contracts"
+DEVICE_SECURITY_CLIENT_MANIFEST = Path("crates/rss-device-security-client/Cargo.toml")
 
 
 class ProofError(RuntimeError):
@@ -428,7 +429,7 @@ def manifest_rss_dependencies(repository: Path, bundle_names: set[str]):
                 if canonical not in bundle_names:
                     raise ProofError(f"RSS dependency `{declared_name}` is outside the Release Surface bundle")
                 if isinstance(specification, dict) and any(
-                    key in specification for key in ("path", "git", "workspace")
+                    key in specification for key in ("path", "git", "workspace", "registry")
                 ):
                     raise ProofError(f"RSS dependency `{declared_name}` must be declared from a registry")
                 version = specification.get("version") if isinstance(specification, dict) else specification
@@ -454,12 +455,28 @@ def manifest_rss_dependencies(repository: Path, bundle_names: set[str]):
     return dependencies
 
 
-def validate_device_security_dependency_policy(dependencies):
+def validate_device_security_dependency_policy(repository: Path, dependencies):
+    expected_manifest = (repository / DEVICE_SECURITY_CLIENT_MANIFEST).resolve()
+    named_client_manifests = {
+        Path(package["manifest_path"]).resolve()
+        for package, _dependency in dependencies
+        if package["name"] == DEVICE_SECURITY_CLIENT
+    }
+    if named_client_manifests != {expected_manifest}:
+        raise ProofError(
+            "rss-device-security-client package identity must be bound to its canonical manifest"
+        )
     device_security_dependencies = [
         dependency
         for package, dependency in dependencies
-        if package["name"] == DEVICE_SECURITY_CLIENT
+        if Path(package["manifest_path"]).resolve() == expected_manifest
     ]
+    if any(
+        package["name"] != DEVICE_SECURITY_CLIENT
+        for package, _dependency in dependencies
+        if Path(package["manifest_path"]).resolve() == expected_manifest
+    ):
+        raise ProofError("canonical device-security client manifest has an unexpected package name")
     if len(device_security_dependencies) != 1:
         raise ProofError(
             "rss-device-security-client must declare exactly one direct RSS dependency"
@@ -901,7 +918,7 @@ def execute(repository: Path, bundle_root: Path):
         dependencies = manifest_rss_dependencies(
             snapshot, {package.name for package in bundle.packages}
         )
-        validate_device_security_dependency_policy(dependencies)
+        validate_device_security_dependency_policy(snapshot, dependencies)
         config = snapshot / ".cargo/config.toml"
         config.parent.mkdir(parents=True, exist_ok=True)
         config.write_text(
