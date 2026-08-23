@@ -102,6 +102,11 @@ opaque_reference!(
     "Opaque reference to a device command issued outside this model."
 );
 opaque_reference!(
+    EventRef,
+    "event_ref",
+    "Opaque identity of an event envelope observed outside this model."
+);
+opaque_reference!(
     IngressEnvelopeRef,
     "ingress_envelope_ref",
     "Opaque correlation reference for a receipted inbound envelope."
@@ -403,6 +408,7 @@ impl CommandAckPosition {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandAcknowledgement {
     coordinates: RotationCoordinates,
+    event: EventRef,
     command: CommandRef,
     position: CommandAckPosition,
     outcome: CommandAcknowledgementOutcome,
@@ -413,16 +419,24 @@ impl CommandAcknowledgement {
     #[must_use]
     pub const fn new(
         coordinates: RotationCoordinates,
+        event: EventRef,
         command: CommandRef,
         position: CommandAckPosition,
         outcome: CommandAcknowledgementOutcome,
     ) -> Self {
         Self {
             coordinates,
+            event,
             command,
             position,
             outcome,
         }
+    }
+
+    /// Returns the independent ACK event-envelope identity.
+    #[must_use]
+    pub const fn event(&self) -> &EventRef {
+        &self.event
     }
 
     /// Returns the rotation coordinates.
@@ -499,6 +513,7 @@ impl ReportPosition {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CredentialReport {
     coordinates: RotationCoordinates,
+    event: EventRef,
     position: ReportPosition,
     state_hash: StateHash,
     artifact_digest: ArtifactDigest,
@@ -510,6 +525,7 @@ impl CredentialReport {
     #[must_use]
     pub const fn new(
         coordinates: RotationCoordinates,
+        event: EventRef,
         position: ReportPosition,
         state_hash: StateHash,
         artifact_digest: ArtifactDigest,
@@ -517,11 +533,18 @@ impl CredentialReport {
     ) -> Self {
         Self {
             coordinates,
+            event,
             position,
             state_hash,
             artifact_digest,
             expires_at,
         }
+    }
+
+    /// Returns the independent report event-envelope identity.
+    #[must_use]
+    pub const fn event(&self) -> &EventRef {
+        &self.event
     }
 
     /// Returns the rotation coordinates.
@@ -597,12 +620,12 @@ pub enum ApplicationRejectionReason {
 
 /// Authorization lineage required for an accepted application outcome.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ApplicationReceiptLineage {
+pub struct ReceiptLineage {
     authorization_receipt: AuthorizationReceiptRef,
     desired_generation: Generation,
 }
 
-impl ApplicationReceiptLineage {
+impl ReceiptLineage {
     /// Creates lineage without treating the correlation reference as an authorization capability.
     #[must_use]
     pub const fn new(
@@ -634,10 +657,10 @@ impl ApplicationReceiptLineage {
 ///
 /// ```compile_fail
 /// use rotation_model::{
-///     ApplicationReceiptLineage, ApplicationReceiptOutcome, ApplicationRejectionReason,
+///     ApplicationReceiptOutcome, ApplicationRejectionReason, ReceiptLineage,
 /// };
 ///
-/// fn rejected_cannot_carry_lineage(lineage: ApplicationReceiptLineage) {
+/// fn rejected_cannot_carry_lineage(lineage: ReceiptLineage) {
 ///     let _ = ApplicationReceiptOutcome::Rejected(
 ///         lineage,
 ///         ApplicationRejectionReason::NotAccepted,
@@ -647,12 +670,12 @@ impl ApplicationReceiptLineage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApplicationReceiptOutcome {
     /// The inbound observation was committed with accepted lineage.
-    Committed(ApplicationReceiptLineage),
+    Committed(ReceiptLineage),
     /// The inbound observation was already committed with the same accepted lineage.
-    Duplicate(ApplicationReceiptLineage),
+    Duplicate(ReceiptLineage),
     /// The inbound observation was stale for the attached reason and accepted lineage.
     Stale {
-        lineage: ApplicationReceiptLineage,
+        lineage: ReceiptLineage,
         reason: ApplicationStaleReason,
     },
     /// The inbound observation was rejected before accepted lineage was available.
@@ -663,6 +686,7 @@ pub enum ApplicationReceiptOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApplicationReceiptObservation {
     coordinates: RotationCoordinates,
+    event: EventRef,
     ingress_envelope: IngressEnvelopeRef,
     outcome: ApplicationReceiptOutcome,
     committed_at: UnixTimestamp,
@@ -673,16 +697,24 @@ impl ApplicationReceiptObservation {
     #[must_use]
     pub const fn new(
         coordinates: RotationCoordinates,
+        event: EventRef,
         ingress_envelope: IngressEnvelopeRef,
         outcome: ApplicationReceiptOutcome,
         committed_at: UnixTimestamp,
     ) -> Self {
         Self {
             coordinates,
+            event,
             ingress_envelope,
             outcome,
             committed_at,
         }
+    }
+
+    /// Returns the independent receipt event-envelope identity.
+    #[must_use]
+    pub const fn event(&self) -> &EventRef {
+        &self.event
     }
 
     /// Returns the rotation coordinates.

@@ -1,13 +1,13 @@
 use std::any::TypeId;
 
 use rotation_model::{
-    AcceptanceCondition, ApplicationReceiptLineage, ApplicationReceiptObservation,
-    ApplicationReceiptOutcome, ApplicationRejectionReason, ApplicationStaleReason, ArtifactDigest,
-    AuthorizationReceiptRef, CommandAckPosition, CommandAcknowledgement,
-    CommandAcknowledgementOutcome, CommandRef, CommandRejectionReason, CredentialReport, DeviceRef,
-    DeviceSequence, FenceEpoch, Generation, IngressEnvelopeRef, PrincipalRef, ReportPosition,
-    RotationAccepted, RotationCoordinates, RotationId, RotationIntent, RotationModelError,
-    StateHash, TenantRef, UnixTimestamp,
+    AcceptanceCondition, ApplicationReceiptObservation, ApplicationReceiptOutcome,
+    ApplicationRejectionReason, ApplicationStaleReason, ArtifactDigest, AuthorizationReceiptRef,
+    CommandAckPosition, CommandAcknowledgement, CommandAcknowledgementOutcome, CommandRef,
+    CommandRejectionReason, CredentialReport, DeviceRef, DeviceSequence, EventRef, FenceEpoch,
+    Generation, IngressEnvelopeRef, PrincipalRef, ReceiptLineage, ReportPosition, RotationAccepted,
+    RotationCoordinates, RotationId, RotationIntent, RotationModelError, StateHash, TenantRef,
+    UnixTimestamp,
 };
 
 #[test]
@@ -87,6 +87,7 @@ fn accepted_rotation_matches_the_public_acceptance_shape() {
 fn acknowledgement_preserves_fence_sequence_outcome_and_time() {
     let acknowledged = CommandAcknowledgement::new(
         coordinates(),
+        EventRef::try_from("ack-event-11").expect("fixed ACK event reference"),
         CommandRef::try_from("command-3").expect("fixed command reference"),
         CommandAckPosition::new(
             Generation::try_from(8).expect("positive generation"),
@@ -97,6 +98,7 @@ fn acknowledgement_preserves_fence_sequence_outcome_and_time() {
         CommandAcknowledgementOutcome::Rejected(CommandRejectionReason::FenceEpochStale),
     );
 
+    assert_eq!(acknowledged.event().expose(), "ack-event-11");
     assert_eq!(acknowledged.command().expose(), "command-3");
     assert_eq!(acknowledged.desired_generation().get(), 8);
     assert_eq!(acknowledged.fence_epoch().get(), 2);
@@ -112,6 +114,7 @@ fn acknowledgement_preserves_fence_sequence_outcome_and_time() {
 fn credential_report_preserves_observed_state_discriminants() {
     let report = CredentialReport::new(
         coordinates(),
+        EventRef::try_from("report-event-12").expect("fixed report event reference"),
         ReportPosition::new(
             Generation::try_from(8).expect("positive generation"),
             FenceEpoch::try_from(2).expect("positive fence"),
@@ -123,6 +126,7 @@ fn credential_report_preserves_observed_state_discriminants() {
         Some(UnixTimestamp::new(1_725_100_000)),
     );
 
+    assert_eq!(report.event().expose(), "report-event-12");
     assert_eq!(report.observed_generation().get(), 8);
     assert_eq!(report.fence_epoch().get(), 2);
     assert_eq!(report.device_sequence().get(), 14);
@@ -149,6 +153,7 @@ fn lineaged_application_receipts_preserve_receipt_generation_and_reason() {
     for outcome in outcomes {
         let receipt = ApplicationReceiptObservation::new(
             coordinates(),
+            EventRef::try_from("receipt-event-13").expect("fixed receipt event reference"),
             IngressEnvelopeRef::try_from("envelope-5").expect("fixed ingress envelope"),
             outcome,
             UnixTimestamp::new(1_725_000_020),
@@ -169,6 +174,7 @@ fn lineaged_application_receipts_preserve_receipt_generation_and_reason() {
         );
         assert_eq!(lineage.desired_generation().get(), 8);
         assert_eq!(receipt.ingress_envelope().expose(), "envelope-5");
+        assert_eq!(receipt.event().expose(), "receipt-event-13");
         assert_eq!(receipt.committed_at().get(), 1_725_000_020);
 
         let formatted = format!("{receipt:?}");
@@ -181,6 +187,7 @@ fn lineaged_application_receipts_preserve_receipt_generation_and_reason() {
 fn rejected_application_receipt_carries_only_its_rejection_reason() {
     let receipt = ApplicationReceiptObservation::new(
         coordinates(),
+        EventRef::try_from("receipt-event-14").expect("fixed receipt event reference"),
         IngressEnvelopeRef::try_from("envelope-6").expect("fixed ingress envelope"),
         ApplicationReceiptOutcome::Rejected(ApplicationRejectionReason::NotAccepted),
         UnixTimestamp::new(1_725_000_030),
@@ -212,6 +219,37 @@ fn acknowledgement_report_and_receipt_are_distinct_fact_types() {
     );
 }
 
+#[test]
+fn event_command_and_ingress_envelope_identities_are_distinct_types() {
+    assert_ne!(TypeId::of::<EventRef>(), TypeId::of::<CommandRef>());
+    assert_ne!(TypeId::of::<EventRef>(), TypeId::of::<IngressEnvelopeRef>());
+    assert_ne!(
+        TypeId::of::<CommandRef>(),
+        TypeId::of::<IngressEnvelopeRef>()
+    );
+}
+
+#[test]
+fn event_identities_are_redacted_with_their_facts() {
+    let acknowledged = CommandAcknowledgement::new(
+        coordinates(),
+        EventRef::try_from("secret-ack-event").expect("fixed event reference"),
+        CommandRef::try_from("secret-command").expect("fixed command reference"),
+        CommandAckPosition::new(
+            Generation::try_from(8).expect("positive generation"),
+            FenceEpoch::try_from(2).expect("positive fence"),
+            DeviceSequence::new(13),
+            UnixTimestamp::new(1_725_000_000),
+        ),
+        CommandAcknowledgementOutcome::Received,
+    );
+
+    let formatted = format!("{acknowledged:?}");
+    assert!(!formatted.contains("secret-ack-event"));
+    assert!(!formatted.contains("secret-command"));
+    assert!(formatted.contains("[REDACTED]"));
+}
+
 fn coordinates() -> RotationCoordinates {
     RotationCoordinates::new(
         RotationId::try_from("rotation-17").expect("fixed rotation ID"),
@@ -225,8 +263,8 @@ fn authorization_receipt() -> AuthorizationReceiptRef {
         .expect("fixed authorization receipt reference")
 }
 
-fn application_lineage() -> ApplicationReceiptLineage {
-    ApplicationReceiptLineage::new(
+fn application_lineage() -> ReceiptLineage {
+    ReceiptLineage::new(
         authorization_receipt(),
         Generation::try_from(8).expect("positive generation"),
     )

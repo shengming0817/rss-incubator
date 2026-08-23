@@ -34,7 +34,9 @@ MATERIALIZED_FIXTURE = Path("crates/rss-conformance-candidate-fixture")
 CONFORMANCE_VERSION_TOKEN = "__RSS_CONFORMANCE_VERSION__"
 CANDIDATE_REGISTRY_URL = "https://rss-candidate.invalid/index"
 CANDIDATE_SOURCE = f"registry+{CANDIDATE_REGISTRY_URL}"
-CANDIDATE_WORKSPACE_MEMBER = "crates/platform-authoring-smoke"
+DEVICE_SECURITY_CLIENT = "rss-device-security-client"
+DEVICE_SECURITY_CONTRACT = "rss-device-security-contracts"
+DEVICE_SECURITY_CLIENT_MANIFEST = Path("crates/rss-device-security-client/Cargo.toml")
 
 
 class ProofError(RuntimeError):
@@ -360,29 +362,47 @@ def workspace_member_manifests(repository: Path):
     return sorted(manifests)
 
 
-def activate_candidate_workspace_member(repository: Path):
+def candidate_workspace_members(repository: Path):
     manifest_path = repository / "Cargo.toml"
     try:
         manifest = manifest_path.read_text(encoding="utf-8")
         parsed = tomllib.loads(manifest)
     except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
-        raise ProofError(f"cannot activate candidate workspace member: {error}") from error
+        raise ProofError(f"cannot inspect candidate workspace exclusions: {error}") from error
     workspace = parsed.get("workspace")
     excludes = workspace.get("exclude") if isinstance(workspace, dict) else None
-    if excludes != [CANDIDATE_WORKSPACE_MEMBER]:
-        raise ProofError("workspace candidate exclusion differs")
-    exclusion = f'exclude = ["{CANDIDATE_WORKSPACE_MEMBER}"]'
+    if (
+        not isinstance(excludes, list)
+        or not excludes
+        or not all(isinstance(item, str) for item in excludes)
+        or excludes != sorted(set(excludes))
+    ):
+        raise ProofError("workspace candidate exclusions must be a non-empty sorted unique array")
+    exclusion = "exclude = [\n" + "".join(f'    "{item}",\n' for item in excludes) + "]"
     if manifest.count(exclusion) != 1:
-        raise ProofError("workspace candidate exclusion is not canonical")
-    candidate_manifest = repository / CANDIDATE_WORKSPACE_MEMBER / "Cargo.toml"
-    if not candidate_manifest.is_file() or candidate_manifest.is_symlink():
-        raise ProofError("candidate workspace member manifest is missing or unsafe")
+        raise ProofError("workspace candidate exclusions are not canonical")
+    candidates = []
+    for member in excludes:
+        relative = Path(member)
+        if relative.is_absolute() or ".." in relative.parts or any(char in member for char in "*?["):
+            raise ProofError(f"workspace candidate exclusion is unsafe: {member}")
+        candidate_manifest = repository / relative / "Cargo.toml"
+        if not candidate_manifest.is_file() or candidate_manifest.is_symlink():
+            raise ProofError(f"candidate workspace member manifest is missing or unsafe: {member}")
+        candidates.append(candidate_manifest)
+    return manifest, exclusion, candidates
+
+
+def activate_candidate_workspace_members(repository: Path):
+    manifest_path = repository / "Cargo.toml"
+    manifest, exclusion, candidate_manifests = candidate_workspace_members(repository)
     manifest_path.write_text(
         manifest.replace(exclusion, "exclude = []"),
         encoding="utf-8",
     )
-    if candidate_manifest not in workspace_member_manifests(repository):
-        raise ProofError("candidate workspace member was not activated")
+    activated = workspace_member_manifests(repository)
+    if not all(candidate in activated for candidate in candidate_manifests):
+        raise ProofError("candidate workspace members were not atomically activated")
 
 
 def manifest_rss_dependencies(repository: Path, bundle_names: set[str]):
@@ -409,7 +429,7 @@ def manifest_rss_dependencies(repository: Path, bundle_names: set[str]):
                 if canonical not in bundle_names:
                     raise ProofError(f"RSS dependency `{declared_name}` is outside the Release Surface bundle")
                 if isinstance(specification, dict) and any(
-                    key in specification for key in ("path", "git", "workspace")
+                    key in specification for key in ("path", "git", "workspace", "registry")
                 ):
                     raise ProofError(f"RSS dependency `{declared_name}` must be declared from a registry")
                 version = specification.get("version") if isinstance(specification, dict) else specification
@@ -433,6 +453,46 @@ def manifest_rss_dependencies(repository: Path, bundle_names: set[str]):
     if not dependencies:
         raise ProofError("workspace manifests declare no RSS candidate consumers")
     return dependencies
+
+
+def validate_device_security_dependency_policy(repository: Path, dependencies):
+    expected_manifest = (repository / DEVICE_SECURITY_CLIENT_MANIFEST).resolve()
+    named_client_manifests = {
+        Path(package["manifest_path"]).resolve()
+        for package, _dependency in dependencies
+        if package["name"] == DEVICE_SECURITY_CLIENT
+    }
+    if named_client_manifests != {expected_manifest}:
+        raise ProofError(
+            "rss-device-security-client package identity must be bound to its canonical manifest"
+        )
+    device_security_dependencies = [
+        dependency
+        for package, dependency in dependencies
+        if Path(package["manifest_path"]).resolve() == expected_manifest
+    ]
+    if any(
+        package["name"] != DEVICE_SECURITY_CLIENT
+        for package, _dependency in dependencies
+        if Path(package["manifest_path"]).resolve() == expected_manifest
+    ):
+        raise ProofError("canonical device-security client manifest has an unexpected package name")
+    if len(device_security_dependencies) != 1:
+        raise ProofError(
+            "rss-device-security-client must declare exactly one direct RSS dependency"
+        )
+    device_security_dependency = device_security_dependencies[0]
+    if (
+        device_security_dependency["name"] != DEVICE_SECURITY_CONTRACT
+        or device_security_dependency["kind"] is not None
+        or device_security_dependency["rename"] is not None
+        or device_security_dependency["optional"]
+        or device_security_dependency["target"] is not None
+    ):
+        raise ProofError(
+            "rss-device-security-client RSS dependency policy differs from "
+            "the canonical rss-device-security-contracts edge"
+        )
 
 
 def validate_manifest_dependency_sources(metadata, bundle_names: set[str]):
@@ -853,10 +913,11 @@ def execute(repository: Path, bundle_root: Path):
         initialize_registry(registry)
         env = command_env(temp_root)
 
-        activate_candidate_workspace_member(snapshot)
+        activate_candidate_workspace_members(snapshot)
         dependencies = manifest_rss_dependencies(
             snapshot, {package.name for package in bundle.packages}
         )
+        validate_device_security_dependency_policy(snapshot, dependencies)
         config = snapshot / ".cargo/config.toml"
         config.parent.mkdir(parents=True, exist_ok=True)
         config.write_text(
@@ -914,6 +975,12 @@ def execute(repository: Path, bundle_root: Path):
                 env,
                 f"candidate workspace {subcommand}",
             )
+        run_visible(
+            ["cargo", "test", "--workspace", "--doc", "--locked", "--offline"],
+            snapshot,
+            env,
+            "candidate workspace doctest",
+        )
         lock_sha = hashlib.sha256((snapshot / "Cargo.lock").read_bytes()).hexdigest()
         incubator_revision = run_capture(
             ["/usr/bin/git", "rev-parse", "HEAD"],

@@ -49,7 +49,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Check candidate formatting
-        run: find crates/platform-authoring-smoke -type f -name '*.rs' -exec rustfmt --edition 2024 --check {} +
+        run: find crates -type f -name '*.rs' -exec rustfmt --edition 2024 --check {} +
 
       - name: Check workspace
         run: cargo check --workspace --all-targets --locked
@@ -199,7 +199,7 @@ jobs:
             echo "- Artifact digest: \`$RSS_ARTIFACT_DIGEST\`"
             echo "- Candidate lock SHA-256: \`$(jq -r '.candidateLockSha256' <<< "$RSS_PROOF_SUMMARY")\`"
             echo '- Registry-only resolution: verified'
-            echo '- Candidate matrix: `cargo check`, `cargo test`, and `cargo clippy` passed with `--locked --offline`'
+            echo '- Candidate matrix: `cargo check`, `cargo test`, `cargo test --doc`, and `cargo clippy` passed with `--locked --offline`'
             echo '- Release Surface packages:'
             jq -r '.rssRevision as $revision | .packages[] | "  - `\(.name)@\(.version)` — checksum `\(.checksum)` — archive VCS `\($revision)`"' <<< "$RSS_PROOF_SUMMARY"
             echo '- Consumed RSS packages:'

@@ -172,7 +172,10 @@ class CandidateBundleTests(unittest.TestCase):
 
         self.assertEqual(
             excluded_members,
-            {candidate_proof.CANDIDATE_WORKSPACE_MEMBER},
+            {
+                "crates/platform-authoring-smoke",
+                "crates/rss-device-security-client",
+            },
         )
         self.assertTrue(excluded_members < repository_members)
         for command in (
@@ -183,7 +186,7 @@ class CandidateBundleTests(unittest.TestCase):
         ):
             self.assertIn(command, ci_job)
         self.assertIn(
-            "find crates/platform-authoring-smoke -type f -name '*.rs' "
+            "find crates -type f -name '*.rs' "
             "-exec rustfmt --edition 2024 --check {} +",
             ci_job,
         )
@@ -195,33 +198,30 @@ class CandidateBundleTests(unittest.TestCase):
     def test_candidate_workspace_activation_is_exact_and_snapshot_local(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = Path(directory)
-            candidate = (
-                repository
-                / candidate_proof.CANDIDATE_WORKSPACE_MEMBER
-                / "Cargo.toml"
-            )
-            candidate.parent.mkdir(parents=True)
-            candidate.write_text(
-                '[package]\nname = "candidate"\nversion = "0.0.0"\n',
-                encoding="utf-8",
-            )
+            candidates = []
+            for member in ("crates/candidate-a", "crates/candidate-b"):
+                candidate = repository / member / "Cargo.toml"
+                candidate.parent.mkdir(parents=True)
+                candidate.write_text(
+                    f'[package]\nname = "{candidate.parent.name}"\nversion = "0.0.0"\n',
+                    encoding="utf-8",
+                )
+                candidates.append(candidate)
             root_manifest = repository / "Cargo.toml"
             root_manifest.write_text(
                 '[workspace]\nmembers = ["crates/*"]\n'
-                f'exclude = ["{candidate_proof.CANDIDATE_WORKSPACE_MEMBER}"]\n',
+                'exclude = [\n    "crates/candidate-a",\n    "crates/candidate-b",\n]\n',
                 encoding="utf-8",
             )
 
-            candidate_proof.activate_candidate_workspace_member(repository)
+            candidate_proof.activate_candidate_workspace_members(repository)
 
             workspace = tomllib.loads(root_manifest.read_text(encoding="utf-8"))[
                 "workspace"
             ]
             self.assertEqual(workspace["exclude"], [])
-            self.assertIn(
-                candidate,
-                candidate_proof.workspace_member_manifests(repository),
-            )
+            activated = candidate_proof.workspace_member_manifests(repository)
+            self.assertTrue(all(candidate in activated for candidate in candidates))
 
             root_manifest.write_text(
                 '[workspace]\nmembers = ["crates/*"]\nexclude = []\n',
@@ -229,9 +229,9 @@ class CandidateBundleTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(
                 candidate_proof.ProofError,
-                "workspace candidate exclusion differs",
+                "workspace candidate exclusions must be a non-empty sorted unique array",
             ):
-                candidate_proof.activate_candidate_workspace_member(repository)
+                candidate_proof.activate_candidate_workspace_members(repository)
 
     def test_valid_bundle_is_generic_and_sorted(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -441,11 +441,67 @@ class CandidateBundleTests(unittest.TestCase):
                 identities,
             )
 
+    def test_device_security_client_has_one_exact_unaliased_normal_rss_edge(self):
+        repository = Path("/snapshot")
+        package = {
+            "name": candidate_proof.DEVICE_SECURITY_CLIENT,
+            "manifest_path": str(
+                repository / candidate_proof.DEVICE_SECURITY_CLIENT_MANIFEST
+            ),
+        }
+        valid = {
+            "name": candidate_proof.DEVICE_SECURITY_CONTRACT,
+            "req": "=0.1.0",
+            "source": "registry+manifest",
+            "kind": None,
+            "rename": None,
+            "optional": False,
+            "uses_default_features": True,
+            "features": [],
+            "target": None,
+        }
+        candidate_proof.validate_device_security_dependency_policy(
+            repository, [(package, valid)]
+        )
+        candidate_proof.validate_device_security_dependency_policy(
+            repository, [(package, dict(valid, req="=0.1.1"))]
+        )
+
+        invalid = []
+        for field, value in (
+            ("name", "rss-platform"),
+            ("kind", "dev"),
+            ("rename", "contracts"),
+            ("optional", True),
+            ("target", "cfg(unix)"),
+        ):
+            invalid.append([(package, dict(valid, **{field: value}))])
+        invalid.extend(([], [(package, valid), (package, dict(valid))]))
+        for dependencies in invalid:
+            with self.subTest(dependencies=dependencies), self.assertRaises(
+                candidate_proof.ProofError
+            ):
+                candidate_proof.validate_device_security_dependency_policy(
+                    repository, dependencies
+                )
+
+        decoy = dict(package, manifest_path="/snapshot/crates/decoy/Cargo.toml")
+        renamed = dict(package, name="renamed-device-security-client")
+        for dependencies in (
+            [(decoy, valid)],
+            [(decoy, valid), (renamed, valid)],
+        ):
+            with self.assertRaises(candidate_proof.ProofError):
+                candidate_proof.validate_device_security_dependency_policy(
+                    repository, dependencies
+                )
+
     def test_static_manifest_discovery_rejects_forbidden_and_bundle_external_rss(self):
         cases = [
             'rss-platform = { version = "=0.3.0", path = "../rss" }\n',
             'rss-platform = { git = "https://invalid", rev = "deadbeef" }\n',
             'rss-platform = { workspace = true }\n',
+            'rss-platform = { version = "=0.3.0", registry = "attacker" }\n',
             'rss-internal = "=0.1.0"\n',
         ]
         for declaration in cases:
@@ -976,15 +1032,11 @@ class CandidateBundleTests(unittest.TestCase):
 
             def materialize(_repository, destination):
                 (destination / "crates/consumer").mkdir(parents=True)
-                candidate = (
-                    destination
-                    / candidate_proof.CANDIDATE_WORKSPACE_MEMBER
-                    / "Cargo.toml"
-                )
+                candidate = destination / "crates/platform-authoring-smoke/Cargo.toml"
                 candidate.parent.mkdir(parents=True)
                 (destination / "Cargo.toml").write_text(
                     '[workspace]\nmembers = ["crates/*"]\n'
-                    f'exclude = ["{candidate_proof.CANDIDATE_WORKSPACE_MEMBER}"]\n',
+                    'exclude = [\n    "crates/platform-authoring-smoke",\n]\n',
                     encoding="utf-8",
                 )
                 (destination / "Cargo.lock").write_text(
@@ -1044,8 +1096,24 @@ class CandidateBundleTests(unittest.TestCase):
                 mock.patch.object(candidate_proof, "run_capture", return_value=("b" * 40).encode()),
                 mock.patch.object(candidate_proof, "materialize_conformance_fixture"),
                 mock.patch.object(candidate_proof, "validate_conformance_fixture_dependency"),
+                mock.patch.object(
+                    candidate_proof,
+                    "manifest_rss_dependencies",
+                    return_value=[
+                        (
+                            {
+                                "name": "consumer",
+                                "manifest_path": "crates/consumer/Cargo.toml",
+                            },
+                            baseline_dependency,
+                        )
+                    ],
+                ),
+                mock.patch.object(
+                    candidate_proof, "validate_device_security_dependency_policy"
+                ),
             )
-            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patches[8], patches[9], patches[10]:
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patches[8], patches[9], patches[10], patches[11], patches[12]:
                 if fail_test:
                     with self.assertRaises(candidate_proof.ProofError):
                         candidate_proof.execute(Path("/real-checkout"), bundle.root)
@@ -1055,21 +1123,35 @@ class CandidateBundleTests(unittest.TestCase):
                 return commands, snapshots
 
         commands, snapshots = run_once(fail_test=False)
-        matrix = {args[1]: args for args, _cwd in commands if len(args) > 1}
-        for command in ("check", "test", "clippy"):
-            self.assertIn(command, matrix)
+        command_args = [args for args, _cwd in commands]
+        matrix = {
+            args[1]: args
+            for args in command_args
+            if len(args) > 1 and args[1] in {"check", "clippy"}
+        }
+        all_targets_test = (
+            "cargo", "test", "--workspace", "--all-targets", "--locked", "--offline"
+        )
+        doctest = ("cargo", "test", "--workspace", "--doc", "--locked", "--offline")
+        self.assertIn(all_targets_test, command_args)
+        self.assertIn(doctest, command_args)
+        for command in ("check", "clippy"):
             self.assertIn("--locked", matrix[command])
             self.assertIn("--offline", matrix[command])
-        self.assertEqual(matrix["update"], ("cargo", "update", "--workspace"))
+        self.assertIn(("cargo", "update", "--workspace"), command_args)
         self.assertTrue(snapshots)
         self.assertTrue(snapshots[0].parent.name.startswith("rss-incubator-candidate-"))
         self.assertTrue(all(cwd == snapshots[0] for _args, cwd in commands))
-        command_args = [args for args, _cwd in commands]
         updated = command_args.index(("cargo", "update", "--workspace"))
         self.assertEqual(command_args[updated + 1], ("cargo", "fetch", "--locked"))
         first_matrix = min(
             command_args.index(matrix[subcommand])
-            for subcommand in ("check", "test", "clippy")
+            for subcommand in ("check", "clippy")
+        )
+        first_matrix = min(
+            first_matrix,
+            command_args.index(all_targets_test),
+            command_args.index(doctest),
         )
         self.assertLess(updated + 1, first_matrix)
         failed_commands, _ = run_once(fail_test=True)
