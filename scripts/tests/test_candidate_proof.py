@@ -442,6 +442,43 @@ class CandidateBundleTests(unittest.TestCase):
                 identities,
             )
 
+    def test_canonical_local_device_security_client_edge_is_not_an_rss_source_edge(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            app = repository / "apps/rotation-control"
+            client = repository / candidate_proof.DEVICE_SECURITY_CLIENT_MANIFEST
+            app.mkdir(parents=True)
+            client.parent.mkdir(parents=True)
+            (repository / "Cargo.toml").write_text(
+                '[workspace]\nmembers = ["apps/*", "crates/*"]\n', encoding="utf-8"
+            )
+            (app / "Cargo.toml").write_text(
+                '[package]\nname = "rotation-control"\nversion = "0.0.0"\n'
+                '[dependencies]\nrss-device-security-client = '
+                '{ path = "../../crates/rss-device-security-client" }\n',
+                encoding="utf-8",
+            )
+            client.write_text(
+                '[package]\nname = "rss-device-security-client"\nversion = "0.0.0"\n'
+                '[dependencies]\nrss-device-security-contracts = "=0.1.0"\n',
+                encoding="utf-8",
+            )
+            dependencies = candidate_proof.manifest_rss_dependencies(
+                repository, {candidate_proof.DEVICE_SECURITY_CONTRACT}
+            )
+            self.assertEqual(len(dependencies), 1)
+            self.assertEqual(dependencies[0][0]["name"], candidate_proof.DEVICE_SECURITY_CLIENT)
+
+            (app / "Cargo.toml").write_text(
+                '[package]\nname = "rotation-control"\nversion = "0.0.0"\n'
+                '[dependencies]\nrss-device-security-client = { path = "../../impostor" }\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(candidate_proof.ProofError, "outside the Release Surface"):
+                candidate_proof.manifest_rss_dependencies(
+                    repository, {candidate_proof.DEVICE_SECURITY_CONTRACT}
+                )
+
     def test_device_security_client_has_one_exact_unaliased_normal_rss_edge(self):
         repository = Path("/snapshot")
         package = {

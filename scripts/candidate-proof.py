@@ -406,6 +406,16 @@ def activate_candidate_workspace_members(repository: Path):
     return candidate_manifests
 
 
+def is_local_device_security_client_dependency(repository: Path, manifest_path: Path, name, specification):
+    if name != DEVICE_SECURITY_CLIENT or not isinstance(specification, dict):
+        return False
+    dependency_path = specification.get("path")
+    if not isinstance(dependency_path, str):
+        return False
+    resolved = (manifest_path.parent / dependency_path / "Cargo.toml").resolve()
+    return resolved == (repository / DEVICE_SECURITY_CLIENT_MANIFEST).resolve()
+
+
 def manifest_rss_dependencies(repository: Path, bundle_names: set[str]):
     dependencies = []
     for manifest_path in workspace_member_manifests(repository):
@@ -424,6 +434,10 @@ def manifest_rss_dependencies(repository: Path, bundle_names: set[str]):
                     if isinstance(specification, dict)
                     else alias
                 )
+                if is_local_device_security_client_dependency(
+                    repository, manifest_path, declared_name, specification
+                ):
+                    continue
                 if not is_rss_package_name(declared_name):
                     continue
                 canonical = canonical_package_name(declared_name)
@@ -514,6 +528,11 @@ def validate_manifest_dependency_sources(metadata, bundle_names: set[str]):
                     if isinstance(specification, dict)
                     else alias
                 )
+                repository = Path(metadata.get("workspace_root", "."))
+                if is_local_device_security_client_dependency(
+                    repository, manifest_path, declared_name, specification
+                ):
+                    continue
                 if not is_rss_package_name(declared_name):
                     continue
                 canonical = canonical_package_name(declared_name)
@@ -535,6 +554,8 @@ def direct_rss_dependencies(metadata, bundle_names: set[str]):
         for dependency in package.get("dependencies", []):
             name = dependency.get("name")
             if not is_rss_package_name(name):
+                continue
+            if name == DEVICE_SECURITY_CLIENT and dependency.get("source") is None:
                 continue
             canonical = canonical_package_name(name)
             source = dependency.get("source")
