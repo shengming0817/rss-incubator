@@ -47,6 +47,16 @@ pub(crate) fn validate_credential(
         fs::read(files.certificate_chain()).map_err(|_| CredentialError::Unavailable)?;
     let private_key = fs::read(files.private_key()).map_err(|_| CredentialError::Unavailable)?;
 
+    validate_credential_bytes(ca, certificate, private_key, identity, now_epoch_seconds)
+}
+
+pub(crate) fn validate_credential_bytes(
+    ca: Vec<u8>,
+    certificate: Vec<u8>,
+    private_key: Vec<u8>,
+    identity: &DeviceIdentity,
+    now_epoch_seconds: u64,
+) -> Result<ValidatedCredential, CredentialError> {
     let roots = parse_certificates(&ca)?;
     let chain = parse_certificates(&certificate)?;
     let key = parse_private_key(&private_key)?;

@@ -212,8 +212,30 @@ mod tests {
         .expect("canonical command");
 
         assert_eq!(command.command_id().expose(), "command-1");
+        assert_eq!(command.device_id(), identity().device());
+        assert_eq!(
+            command.artifact_id().expose(),
+            "fixture-device-certificate-0001"
+        );
+        assert_eq!(
+            command.artifact_digest().expose(),
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            command.authorization_receipt_id(),
+            Uuid::parse_str("0198d5f2-70de-7a2d-b3f4-0123456789ab").expect("receipt")
+        );
+        assert_eq!(command.deadline_epoch_seconds().get(), 1_900_000_000);
         assert_eq!(command.desired_generation().get(), 8);
         assert_eq!(command.fence_epoch().get(), 3);
+        assert_eq!(
+            command.intent_digest().expose(),
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        assert_eq!(
+            command.policy_hash().expose(),
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        );
     }
 
     #[test]
@@ -253,8 +275,8 @@ mod tests {
     }
 
     #[test]
-    fn acknowledgement_encoding_uses_the_canonical_closed_variant() {
-        let encoded = encode_outbound(
+    fn acknowledgement_encoding_uses_complete_canonical_closed_variants() {
+        let rejected = encode_outbound(
             &identity(),
             OutboundFact::CommandAcknowledged {
                 event_id: "ack-event".to_owned(),
@@ -269,10 +291,52 @@ mod tests {
             },
         )
         .expect("ACK");
-        let value: serde_json::Value = serde_json::from_slice(&encoded.payload).expect("JSON");
-        assert_eq!(value["result"], "rejected");
-        assert_eq!(value["reason"], "FenceEpochStale");
-        assert_eq!(encoded.event_id, "ack-event");
+        let value: serde_json::Value = serde_json::from_slice(&rejected.payload).expect("JSON");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "commandId": "command-1",
+                "desiredGeneration": 8,
+                "deviceId": "00000000-0000-0000-0000-000000000101",
+                "deviceSequence": 4,
+                "fenceEpoch": 3,
+                "observedAt": 1_800_000_000,
+                "reason": "FenceEpochStale",
+                "result": "rejected"
+            })
+        );
+        assert_eq!(rejected.event_id, "ack-event");
+
+        let accepted = encode_outbound(
+            &identity(),
+            OutboundFact::CommandAcknowledged {
+                event_id: "accepted-event".to_owned(),
+                payload: AckFact {
+                    command_id: "command-2".to_owned(),
+                    desired_generation: 9,
+                    fence_epoch: 4,
+                    device_sequence: 5,
+                    observed_at: 1_800_000_001,
+                    rejection: None,
+                },
+            },
+        )
+        .expect("accepted ACK");
+        let value: serde_json::Value = serde_json::from_slice(&accepted.payload).expect("JSON");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "commandId": "command-2",
+                "desiredGeneration": 9,
+                "deviceId": "00000000-0000-0000-0000-000000000101",
+                "deviceSequence": 5,
+                "fenceEpoch": 4,
+                "observedAt": 1_800_000_001,
+                "reason": "None",
+                "result": "received"
+            })
+        );
+        assert_eq!(accepted.event_id, "accepted-event");
     }
 
     #[test]

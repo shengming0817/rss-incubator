@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use rumqttc::v5::mqttbytes::QoS;
 use rumqttc::v5::mqttbytes::v5::{Packet, Publish, PublishProperties};
-use rumqttc::v5::{AsyncClient, Event, EventLoop, MqttOptions};
+use rumqttc::v5::{AsyncClient, ClientError, ConnectionError, Event, EventLoop, MqttOptions};
 use rumqttc::{Outgoing, TlsConfiguration, Transport};
 
 use crate::{CredentialFiles, MqttConnectionConfig, TopicSet};
@@ -13,12 +13,41 @@ use crate::{CredentialFiles, MqttConnectionConfig, TopicSet};
 pub enum MqttError {
     #[error("MQTT credential files are unavailable")]
     CredentialUnavailable,
-    #[error("MQTT transport failed")]
-    Transport,
+    #[error("MQTT request queue failed: {0}")]
+    Request(#[source] Box<ClientError>),
+    #[error("MQTT connection failed: {0}")]
+    Connection(#[source] Box<ConnectionError>),
     #[error("MQTT command frame is invalid")]
     InvalidCommandFrame,
     #[error("MQTT outbound acknowledgement was not correlated")]
     UnknownPubAck,
+}
+
+impl MqttError {
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Request(_))
+            || matches!(
+                self,
+                Self::Connection(error)
+                    if matches!(error.as_ref(), ConnectionError::Timeout(_) | ConnectionError::Io(_))
+            )
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::CredentialUnavailable => "credential_unavailable",
+            Self::Request(_) => "request_queue",
+            Self::Connection(error) => match error.as_ref() {
+                ConnectionError::Timeout(_) => "timeout",
+                ConnectionError::Io(_) => "io",
+                _ => "connection_rejected",
+            },
+            Self::InvalidCommandFrame => "invalid_command_frame",
+            Self::UnknownPubAck => "unknown_puback",
+        }
+    }
 }
 
 /// Peer-authenticated command delivery retaining the one-shot manual PUBACK capability.
@@ -125,7 +154,7 @@ impl MqttSession {
         self.client
             .subscribe(self.topics.command(), QoS::AtLeastOnce)
             .await
-            .map_err(|_| MqttError::Transport)
+            .map_err(|error| MqttError::Request(Box::new(error)))
     }
 
     /// Unsubscribes from the canonical command topic before credential reconnect.
@@ -137,7 +166,7 @@ impl MqttSession {
         self.client
             .unsubscribe(self.topics.command())
             .await
-            .map_err(|_| MqttError::Transport)
+            .map_err(|error| MqttError::Request(Box::new(error)))
     }
 
     /// Publishes one durable fact at `QoS` 1 with its event ID as correlation data.
@@ -160,7 +189,7 @@ impl MqttSession {
         self.client
             .publish_with_properties(topic, QoS::AtLeastOnce, false, payload, properties)
             .await
-            .map_err(|_| MqttError::Transport)?;
+            .map_err(|error| MqttError::Request(Box::new(error)))?;
         self.awaiting_packet_id.push_back(event_id.to_owned());
         Ok(())
     }
@@ -174,7 +203,7 @@ impl MqttSession {
         self.client
             .ack(&delivery.publish)
             .await
-            .map_err(|_| MqttError::Transport)
+            .map_err(|error| MqttError::Request(Box::new(error)))
     }
 
     /// Polls one correlated transport event.
@@ -187,7 +216,7 @@ impl MqttSession {
             .event_loop
             .poll()
             .await
-            .map_err(|_| MqttError::Transport)?;
+            .map_err(|error| MqttError::Connection(Box::new(error)))?;
         match event {
             Event::Incoming(Packet::ConnAck(ack)) => Ok(MqttEvent::Connected {
                 session_present: ack.session_present,

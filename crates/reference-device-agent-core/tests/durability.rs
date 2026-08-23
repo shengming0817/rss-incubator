@@ -34,6 +34,7 @@ fn accepted_command_is_durable_and_report_waits_for_ack_and_new_session() {
             .expect("apply"),
         ApplyOutcome::Accepted
     );
+    assert!(agent.rotation_in_flight());
     let ack = agent.next_outbound().expect("durable ACK");
     assert!(matches!(ack, OutboundFact::CommandAcknowledged { .. }));
     agent.confirm_outbound(ack.event_id()).expect("confirm ACK");
@@ -60,12 +61,14 @@ fn accepted_command_is_durable_and_report_waits_for_ack_and_new_session() {
     reopened
         .mark_current_credential_connected(CredentialRevision::try_from(2).expect("revision"))
         .expect("new credential connected");
+    assert!(reopened.rotation_in_flight());
     let report = reopened.next_outbound().expect("report after reconnect");
     assert!(matches!(report, OutboundFact::CertificateReported { .. }));
     reopened
         .confirm_outbound(report.event_id())
         .expect("confirm report");
     assert!(reopened.next_outbound().is_none());
+    assert!(!reopened.rotation_in_flight());
 
     let current_topic = TopicSet::new(&reopened.current_identity().expect("identity"))
         .command()
@@ -114,6 +117,40 @@ fn semantically_corrupt_known_state_fields_fail_closed() {
         ReferenceDeviceAgent::open(fixture.config(), NOW),
         Err(AgentError::Store(StoreError::InvalidState))
     ));
+}
+
+#[test]
+fn corrupt_event_causality_and_rotation_phase_fail_closed() {
+    for mutation in ["event-id", "ack-outcome", "premature-report"] {
+        let fixture = Fixture::new();
+        let (mut agent, command) = fixture.agent_and_command();
+        agent
+            .apply_command(&fixture.command_topic(), &command, NOW)
+            .expect("accept");
+        drop(agent);
+        let state_path = fixture.root.path().join("state/state.v1.json");
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).expect("state")).expect("JSON");
+        match mutation {
+            "event-id" => {
+                state["outbox"][0]["eventId"] = serde_json::json!(
+                    "reference-ack-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                );
+            }
+            "ack-outcome" => {
+                state["outbox"][0]["payload"]["activatesRevision"] = serde_json::Value::Null;
+            }
+            "premature-report" => {
+                state["outbox"][1]["kind"] = serde_json::json!("reportReady");
+            }
+            _ => unreachable!(),
+        }
+        fs::write(&state_path, serde_json::to_vec(&state).expect("serialize")).expect("corrupt");
+
+        let error = ReferenceDeviceAgent::open(fixture.config(), NOW)
+            .expect_err("corrupt phase must fail closed");
+        assert!(matches!(error, AgentError::Store(StoreError::InvalidState)));
+    }
 }
 
 #[test]

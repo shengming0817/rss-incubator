@@ -1,11 +1,12 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
-use crate::material::{CredentialError, ValidatedCredential, validate_credential};
+use crate::material::{CredentialError, ValidatedCredential, validate_credential_bytes};
 use crate::{CredentialFiles, CredentialGeneration, DeviceCommand, DeviceIdentity, Sha256Digest};
 
 #[derive(Debug, thiserror::Error)]
@@ -66,12 +67,12 @@ impl ArtifactCatalog {
         }
 
         let root = self.path.parent().unwrap_or_else(|| Path::new("."));
-        let files = CredentialFiles::new(
-            safe_catalog_path(root, &entry.ca_path)?,
-            safe_catalog_path(root, &entry.certificate_path)?,
-            safe_catalog_path(root, &entry.private_key_path)?,
-        );
-        let computed = compute_artifact_digest(&files).map_err(|_| CatalogError::Unavailable)?;
+        let ca = read_catalog_file(&safe_catalog_path(root, &entry.ca_path)?, false)?;
+        let certificate =
+            read_catalog_file(&safe_catalog_path(root, &entry.certificate_path)?, false)?;
+        let private_key =
+            read_catalog_file(&safe_catalog_path(root, &entry.private_key_path)?, true)?;
+        let computed = compute_artifact_digest_bytes(&ca, &certificate, &private_key)?;
         let declared =
             Sha256Digest::try_from(entry.artifact_digest).map_err(|_| CatalogError::Malformed)?;
         if &computed != command.artifact_digest() || computed != declared {
@@ -80,7 +81,13 @@ impl ArtifactCatalog {
         let generation = CredentialGeneration::try_from(entry.credential_generation)
             .map_err(|_| CatalogError::Malformed)?;
         let target_identity = DeviceIdentity::new(identity.tenant(), identity.device(), generation);
-        let credential = validate_credential(&files, &target_identity, now_epoch_seconds)?;
+        let credential = validate_credential_bytes(
+            ca,
+            certificate,
+            private_key,
+            &target_identity,
+            now_epoch_seconds,
+        )?;
         Ok(ResolvedArtifact {
             credential_generation: generation,
             credential,
@@ -95,20 +102,56 @@ impl ArtifactCatalog {
 ///
 /// Returns an error when any credential file cannot be read.
 pub fn compute_artifact_digest(files: &CredentialFiles) -> Result<Sha256Digest, std::io::Error> {
+    compute_artifact_digest_bytes(
+        &fs::read(files.ca_certificate())?,
+        &fs::read(files.certificate_chain())?,
+        &fs::read(files.private_key())?,
+    )
+    .map_err(|_| std::io::Error::other("SHA-256 formatting failed"))
+}
+
+fn compute_artifact_digest_bytes(
+    ca: &[u8],
+    certificate: &[u8],
+    private_key: &[u8],
+) -> Result<Sha256Digest, CatalogError> {
     let mut hasher = Sha256::new();
     hasher.update(b"rss.reference-device-agent.artifact.v1\0");
-    for path in [
-        files.ca_certificate(),
-        files.certificate_chain(),
-        files.private_key(),
-    ] {
-        let bytes = fs::read(path)?;
+    for bytes in [ca, certificate, private_key] {
         let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         hasher.update(len.to_be_bytes());
         hasher.update(bytes);
     }
     Sha256Digest::try_from(format!("sha256:{:x}", hasher.finalize()))
-        .map_err(|_| std::io::Error::other("SHA-256 formatting failed"))
+        .map_err(|_| CatalogError::Malformed)
+}
+
+fn read_catalog_file(path: &Path, private_key: bool) -> Result<Vec<u8>, CatalogError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(|_| CatalogError::Unavailable)?;
+    let metadata = file.metadata().map_err(|_| CatalogError::Unavailable)?;
+    if !metadata.is_file() {
+        return Err(CatalogError::Malformed);
+    }
+    #[cfg(unix)]
+    if private_key {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(CatalogError::Credential(
+                CredentialError::InsecurePrivateKey,
+            ));
+        }
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|_| CatalogError::Unavailable)?;
+    Ok(bytes)
 }
 
 fn validate_binding(

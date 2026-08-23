@@ -239,6 +239,12 @@ impl ReferenceDeviceAgent {
             .map_err(|_| AgentError::Store(StoreError::InvalidState))
     }
 
+    /// Reports whether an accepted rotation is waiting for ACK settlement or reconnect.
+    #[must_use]
+    pub fn rotation_in_flight(&self) -> bool {
+        self.state.rotation_in_flight()
+    }
+
     /// Records that the committed credential revision established its MQTT session.
     ///
     /// # Errors
@@ -319,6 +325,7 @@ impl ReferenceDeviceAgent {
     }
 
     fn persist_candidate(&mut self, candidate: StateV1) -> Result<(), AgentError> {
+        candidate.validate()?;
         self.store.persist(&candidate)?;
         self.state = candidate;
         Ok(())

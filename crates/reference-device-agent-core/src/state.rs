@@ -192,6 +192,7 @@ impl StateV1 {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn verify(&self, identity: &DeviceIdentity) -> Result<(), StoreError> {
         let coordinates_valid = self.schema_version == 1
             && self.identity.tenant_id == identity.tenant()
@@ -245,17 +246,62 @@ impl StateV1 {
         {
             return Err(StoreError::InvalidState);
         }
-        if let Some(revision) = self.reconnect_revision {
-            let matching = revision == self.current.credential_revision
-                && self.outbox.iter().any(|entry| {
-                    matches!(entry, StoredOutbound::ReportBlocked { payload, .. }
-                        if payload.credential_revision == revision)
-                });
-            if !matching {
-                return Err(StoreError::InvalidState);
+        let reports = self
+            .outbox
+            .iter()
+            .filter(|entry| entry.report_payload().is_some())
+            .count();
+        if reports > 1 {
+            return Err(StoreError::InvalidState);
+        }
+        for entry in &self.outbox {
+            match entry {
+                StoredOutbound::Ack { payload, .. } if payload.activates_revision.is_some() => {
+                    let revision = payload.activates_revision.unwrap_or_default();
+                    let matching = revision == self.current.credential_revision
+                        && self.outbox.iter().any(|candidate| {
+                            matches!(candidate, StoredOutbound::ReportBlocked { payload: report, .. }
+                                if report.credential_revision == revision
+                                    && report.command_id == payload.command_id)
+                        })
+                        && self.reconnect_revision.is_none();
+                    if !matching {
+                        return Err(StoreError::InvalidState);
+                    }
+                }
+                StoredOutbound::ReportBlocked { payload, .. } => {
+                    let has_activation = self.outbox.iter().any(|candidate| {
+                        matches!(candidate, StoredOutbound::Ack { payload: ack, .. }
+                            if ack.activates_revision == Some(payload.credential_revision)
+                                && ack.command_id == payload.command_id)
+                    });
+                    if has_activation == (self.reconnect_revision.is_some())
+                        || self
+                            .reconnect_revision
+                            .is_some_and(|revision| revision != payload.credential_revision)
+                    {
+                        return Err(StoreError::InvalidState);
+                    }
+                }
+                StoredOutbound::ReportReady { .. } if self.reconnect_revision.is_some() => {
+                    return Err(StoreError::InvalidState);
+                }
+                _ => {}
             }
         }
+        if self.reconnect_revision.is_some() && reports != 1 {
+            return Err(StoreError::InvalidState);
+        }
+        if let Some(revision) = self.reconnect_revision
+            && revision != self.current.credential_revision
+        {
+            return Err(StoreError::InvalidState);
+        }
         Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), StoreError> {
+        self.verify(&self.current_identity()?)
     }
 
     pub fn current_generation(&self) -> u64 {
@@ -284,6 +330,11 @@ impl StateV1 {
     }
     pub fn reconnect_revision(&self) -> Option<u64> {
         self.reconnect_revision
+    }
+    pub fn rotation_in_flight(&self) -> bool {
+        self.outbox
+            .iter()
+            .any(|entry| entry.report_payload().is_some())
     }
     pub fn last_command(&self) -> Option<&StoredCommand> {
         self.last_command.as_ref()
@@ -333,12 +384,14 @@ impl StateV1 {
         };
         let acknowledgement = StoredAck {
             command_id: command_id.to_owned(),
+            event_cause: command_id.to_owned(),
             desired_generation: generation,
             fence_epoch: fence,
             device_sequence: ack_sequence,
             observed_at,
             rejection: None,
             activates_revision: Some(revision),
+            settled_replay: false,
         };
         self.last_command = Some(StoredCommand {
             command_id: command_id.to_owned(),
@@ -352,6 +405,7 @@ impl StateV1 {
         self.outbox.push(StoredOutbound::ReportBlocked {
             event_id: report_event,
             payload: StoredReport {
+                command_id: command_id.to_owned(),
                 observed_generation: generation,
                 fence_epoch: fence,
                 device_sequence: report_sequence,
@@ -377,12 +431,14 @@ impl StateV1 {
         self.device_sequence = self.device_sequence.saturating_add(1);
         let acknowledgement = StoredAck {
             command_id: command_id.to_owned(),
+            event_cause: command_id.to_owned(),
             desired_generation: generation,
             fence_epoch: fence,
             device_sequence: self.device_sequence,
             observed_at,
             rejection: Some(rejection.into()),
             activates_revision: None,
+            settled_replay: false,
         };
         self.last_command = Some(StoredCommand {
             command_id: command_id.to_owned(),
@@ -411,12 +467,14 @@ impl StateV1 {
             event_id: event_id("rejected", &event_source),
             payload: StoredAck {
                 command_id,
+                event_cause: event_source,
                 desired_generation: generation,
                 fence_epoch: fence,
                 device_sequence: self.device_sequence,
                 observed_at,
                 rejection: Some(StoredRejection::MalformedCommand),
                 activates_revision: None,
+                settled_replay: false,
             },
         });
     }
@@ -429,9 +487,14 @@ impl StateV1 {
 
     pub fn replay_last(&mut self) -> Result<(), StoreError> {
         let last = self.last_command.clone().ok_or(StoreError::InvalidState)?;
+        let mut acknowledgement = last.acknowledgement;
+        if acknowledgement.rejection.is_none() {
+            acknowledgement.activates_revision = None;
+            acknowledgement.settled_replay = true;
+        }
         self.outbox.push(StoredOutbound::Ack {
             event_id: event_id("ack", &last.command_id),
-            payload: last.acknowledgement,
+            payload: acknowledgement,
         });
         Ok(())
     }
@@ -574,7 +637,27 @@ impl StoredOutbound {
     }
 
     fn semantic_valid(&self) -> bool {
-        let event_valid = valid_event_id(self.event_id());
+        let event_valid = match self {
+            Self::Ack {
+                event_id: actual,
+                payload,
+            } => {
+                let kind = if payload.event_cause == payload.command_id {
+                    "ack"
+                } else {
+                    "rejected"
+                };
+                *actual == event_id(kind, &payload.event_cause)
+            }
+            Self::ReportBlocked {
+                event_id: actual,
+                payload,
+            }
+            | Self::ReportReady {
+                event_id: actual,
+                payload,
+            } => *actual == event_id("report", &payload.command_id),
+        };
         event_valid
             && match self {
                 Self::Ack { payload, .. } => payload.semantic_valid(),
@@ -598,23 +681,29 @@ impl StoredOutbound {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StoredAck {
     command_id: String,
+    event_cause: String,
     desired_generation: u64,
     fence_epoch: u64,
     device_sequence: u64,
     observed_at: i64,
     rejection: Option<StoredRejection>,
     activates_revision: Option<u64>,
+    settled_replay: bool,
 }
 
 impl StoredAck {
     fn semantic_valid(&self) -> bool {
         !self.command_id.is_empty()
+            && !self.event_cause.is_empty()
             && self.desired_generation > 0
             && self.fence_epoch > 0
             && self.device_sequence > 0
             && self.observed_at >= 0
             && self.activates_revision.is_none_or(|revision| revision > 0)
-            && !(self.rejection.is_some() && self.activates_revision.is_some())
+            && matches!(
+                (self.rejection, self.activates_revision, self.settled_replay),
+                (Some(_), None, false) | (None, Some(_), false) | (None, None, true)
+            )
     }
 }
 
@@ -634,6 +723,7 @@ impl From<StoredAck> for AckFact {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StoredReport {
+    command_id: String,
     observed_generation: u64,
     fence_epoch: u64,
     device_sequence: u64,
@@ -647,7 +737,8 @@ struct StoredReport {
 
 impl StoredReport {
     fn semantic_valid(&self) -> bool {
-        self.observed_generation > 0
+        !self.command_id.is_empty()
+            && self.observed_generation > 0
             && self.fence_epoch > 0
             && self.device_sequence > 0
             && self.observed_at >= 0
@@ -720,19 +811,6 @@ fn event_id(kind: &str, command_id: &str) -> String {
     hasher.update([0]);
     hasher.update(command_id.as_bytes());
     format!("reference-{kind}-{:x}", hasher.finalize())
-}
-
-fn valid_event_id(value: &str) -> bool {
-    let Some((prefix, digest)) = value.rsplit_once('-') else {
-        return false;
-    };
-    matches!(
-        prefix,
-        "reference-ack" | "reference-report" | "reference-rejected"
-    ) && digest.len() == 64
-        && digest
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 #[allow(clippy::too_many_arguments)]
