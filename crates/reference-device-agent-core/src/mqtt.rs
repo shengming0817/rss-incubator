@@ -3,7 +3,7 @@ use std::fs;
 use std::time::Duration;
 
 use rumqttc::v5::mqttbytes::QoS;
-use rumqttc::v5::mqttbytes::v5::{Packet, Publish, PublishProperties};
+use rumqttc::v5::mqttbytes::v5::{ConnectReturnCode, Packet, Publish, PublishProperties};
 use rumqttc::v5::{AsyncClient, ClientError, ConnectionError, Event, EventLoop, MqttOptions};
 use rumqttc::{Outgoing, TlsConfiguration, Transport};
 
@@ -31,6 +31,20 @@ impl MqttError {
                 self,
                 Self::Connection(error)
                     if matches!(error.as_ref(), ConnectionError::Timeout(_) | ConnectionError::Io(_))
+            )
+            || matches!(
+                self,
+                Self::Connection(error)
+                    if matches!(
+                        error.as_ref(),
+                        ConnectionError::ConnectionRefused(
+                            ConnectReturnCode::ServiceUnavailable
+                                | ConnectReturnCode::ServerUnavailable
+                                | ConnectReturnCode::ServerBusy
+                                | ConnectReturnCode::QuotaExceeded
+                                | ConnectReturnCode::ConnectionRateExceeded
+                        )
+                    )
             )
     }
 
@@ -88,6 +102,7 @@ pub enum MqttEvent {
     Unsubscribed,
     Command(Box<CommandDelivery>),
     OutboundAcknowledged { event_id: String },
+    InboundAcknowledged { command_id: String },
     TransportProgress,
 }
 
@@ -98,6 +113,8 @@ pub struct MqttSession {
     topics: TopicSet,
     awaiting_packet_id: VecDeque<String>,
     packet_events: HashMap<u16, String>,
+    inbound_acknowledgements: HashMap<u16, String>,
+    recovery_command_topic: Option<String>,
 }
 
 impl std::fmt::Debug for MqttSession {
@@ -116,6 +133,7 @@ impl MqttSession {
         config: &MqttConnectionConfig,
         credentials: &CredentialFiles,
         topics: TopicSet,
+        recovery_command_topic: Option<String>,
     ) -> Result<Self, MqttError> {
         let ca =
             fs::read(credentials.ca_certificate()).map_err(|_| MqttError::CredentialUnavailable)?;
@@ -142,6 +160,8 @@ impl MqttSession {
             topics,
             awaiting_packet_id: VecDeque::new(),
             packet_events: HashMap::new(),
+            inbound_acknowledgements: HashMap::new(),
+            recovery_command_topic,
         })
     }
 
@@ -163,8 +183,17 @@ impl MqttSession {
     ///
     /// Returns an error when the request cannot be queued to the transport.
     pub async fn unsubscribe_command(&self) -> Result<(), MqttError> {
+        self.unsubscribe_topic(self.topics.command()).await
+    }
+
+    /// Removes one exact durable recovery subscription.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request cannot be queued to the transport.
+    pub async fn unsubscribe_topic(&self, topic: &str) -> Result<(), MqttError> {
         self.client
-            .unsubscribe(self.topics.command())
+            .unsubscribe(topic)
             .await
             .map_err(|error| MqttError::Request(Box::new(error)))
     }
@@ -199,11 +228,17 @@ impl MqttSession {
     /// # Errors
     ///
     /// Returns an error when the acknowledgement cannot be queued to the transport.
-    pub async fn acknowledge_command(&self, delivery: &CommandDelivery) -> Result<(), MqttError> {
+    pub async fn acknowledge_command(
+        &mut self,
+        delivery: &CommandDelivery,
+    ) -> Result<(), MqttError> {
         self.client
             .ack(&delivery.publish)
             .await
-            .map_err(|error| MqttError::Request(Box::new(error)))
+            .map_err(|error| MqttError::Request(Box::new(error)))?;
+        self.inbound_acknowledgements
+            .insert(delivery.publish.pkid, delivery.command_id.clone());
+        Ok(())
     }
 
     /// Polls one correlated transport event.
@@ -241,6 +276,13 @@ impl MqttSession {
                 }
                 Ok(MqttEvent::TransportProgress)
             }
+            Event::Outgoing(Outgoing::PubAck(packet_id)) => {
+                let command_id = self
+                    .inbound_acknowledgements
+                    .remove(&packet_id)
+                    .ok_or(MqttError::UnknownPubAck)?;
+                Ok(MqttEvent::InboundAcknowledged { command_id })
+            }
             _ => Ok(MqttEvent::TransportProgress),
         }
     }
@@ -249,7 +291,9 @@ impl MqttSession {
         let topic = std::str::from_utf8(&publish.topic)
             .map_err(|_| MqttError::InvalidCommandFrame)?
             .to_owned();
-        if publish.qos != QoS::AtLeastOnce || !self.topics.accepts_command(&topic) {
+        let accepted_topic = self.topics.accepts_command(&topic)
+            || self.recovery_command_topic.as_deref() == Some(&topic);
+        if publish.qos != QoS::AtLeastOnce || !accepted_topic {
             return Err(MqttError::InvalidCommandFrame);
         }
         let correlation = publish
@@ -268,5 +312,35 @@ impl MqttSession {
             topic,
             command_id,
         })))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broker_refusal_retry_policy_separates_capacity_from_authentication() {
+        for code in [
+            ConnectReturnCode::ServiceUnavailable,
+            ConnectReturnCode::ServerUnavailable,
+            ConnectReturnCode::ServerBusy,
+            ConnectReturnCode::QuotaExceeded,
+            ConnectReturnCode::ConnectionRateExceeded,
+        ] {
+            let error = MqttError::Connection(Box::new(ConnectionError::ConnectionRefused(code)));
+            assert!(error.is_retryable(), "{code:?} must retry");
+        }
+        for code in [
+            ConnectReturnCode::BadClientId,
+            ConnectReturnCode::BadUserNamePassword,
+            ConnectReturnCode::NotAuthorized,
+            ConnectReturnCode::Banned,
+            ConnectReturnCode::BadAuthenticationMethod,
+            ConnectReturnCode::TopicNameInvalid,
+        ] {
+            let error = MqttError::Connection(Box::new(ConnectionError::ConnectionRefused(code)));
+            assert!(!error.is_retryable(), "{code:?} must fail closed");
+        }
     }
 }

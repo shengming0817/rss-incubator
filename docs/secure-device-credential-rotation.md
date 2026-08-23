@@ -77,7 +77,10 @@ The sequence below is the single implementation path. Implemented items remain s
    authentication or authorization decisions.
 4. **Azure PBI #2122** implements `apps/reference-device-agent` with mandatory mTLS MQTT v5,
    persistent/manual-QoS-1 settlement, a strict local artifact catalog, immutable credential
-   revisions, and atomic device-local state. It consumes the canonical DTOs through one thin wire
+   revisions, and atomic device-local state. The private state retains the single old-topic delivery
+   awaiting broker settlement so a crash can acknowledge only that exact redelivery with the new
+   committed credential; it never restores the old revision or reopens the old subscription. It
+   consumes the canonical DTOs through one thin wire
    adapter and does not become an MDM/fleet agent.
 5. **Azure PBI #2123** implements the canonical external T2 journey and focused failures. It does
    not register a T3 selector or production acceptance carrier.
@@ -105,7 +108,7 @@ It may consume only stable RSS Release Surface artifacts.
 | A second wire model, alternate topic, or generic protocol provider appears | Candidate app imports the exact canonical contracts and the core exposes one concrete MQTT runner | Cargo/private API Hard plus wire golden tests |
 | Plaintext, clean session, automatic ACK, or QoS downgrade appears | `MqttConnectionConfig` has no mode switches; the concrete session hard-codes mTLS, persistent session, manual ACK, and QoS 1 | Construction/API Hard |
 | Corrupt/legacy state is migrated or reset, or an orphan revision becomes current | Strict private `StateV1`, synced immutable revisions, atomic manifest rename, and fail-closed restart tests | Persistence/test Hard |
-| ACK, broker PUBACK, reconnect, report, and application receipt collapse into readiness | Durable blocked/ready outbox states and explicit broker-confirm/reconnect transitions; no receipt or `Ready` API | State-machine Hard |
+| ACK, broker PUBACK, reconnect, report, and application receipt collapse into readiness | Durable blocked/ready outbox states, exact old-delivery settlement recovery, and explicit broker-confirm/reconnect transitions; no receipt or `Ready` API | State-machine Hard |
 | Outbox pressure drops or overwrites protocol facts | Fixed 128-entry durable outbox with reservation before state mutation | State-machine Hard |
 | Source coupling enters candidate consumption | Independent repository, committed root lock, existing candidate proof | Physical/Cargo Hard plus proof Medium |
 | Product scope, owner, public-waist choice, and T3 prohibition drift | Accepted upstream ADR plus review of this scope document | Policy/review fact; not represented as machine enforcement |

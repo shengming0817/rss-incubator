@@ -67,11 +67,9 @@ impl ArtifactCatalog {
         }
 
         let root = self.path.parent().unwrap_or_else(|| Path::new("."));
-        let ca = read_catalog_file(&safe_catalog_path(root, &entry.ca_path)?, false)?;
-        let certificate =
-            read_catalog_file(&safe_catalog_path(root, &entry.certificate_path)?, false)?;
-        let private_key =
-            read_catalog_file(&safe_catalog_path(root, &entry.private_key_path)?, true)?;
+        let ca = read_catalog_file(root, &entry.ca_path, false)?;
+        let certificate = read_catalog_file(root, &entry.certificate_path, false)?;
+        let private_key = read_catalog_file(root, &entry.private_key_path, true)?;
         let computed = compute_artifact_digest_bytes(&ca, &certificate, &private_key)?;
         let declared =
             Sha256Digest::try_from(entry.artifact_digest).map_err(|_| CatalogError::Malformed)?;
@@ -126,15 +124,49 @@ fn compute_artifact_digest_bytes(
         .map_err(|_| CatalogError::Malformed)
 }
 
-fn read_catalog_file(path: &Path, private_key: bool) -> Result<Vec<u8>, CatalogError> {
+#[cfg(unix)]
+fn read_catalog_file(root: &Path, raw: &str, private_key: bool) -> Result<Vec<u8>, CatalogError> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    let relative = validated_relative_path(raw)?;
+    let canonical_root = root.canonicalize().map_err(|_| CatalogError::Unavailable)?;
+    let mut current = OpenOptions::new()
+        .read(true)
+        .open(canonical_root)
+        .map_err(|_| CatalogError::Unavailable)?;
+    let components = relative.components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(component) = component else {
+            return Err(CatalogError::Malformed);
+        };
+        let final_component = index + 1 == components.len();
+        let flags = if final_component {
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW
+        } else {
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY
+        };
+        let descriptor = openat(&current, *component, flags, Mode::empty()).map_err(|error| {
+            if matches!(error, rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) {
+                CatalogError::Malformed
+            } else {
+                CatalogError::Unavailable
+            }
+        })?;
+        current = fs::File::from(descriptor);
+    }
+    read_open_catalog_file(current, private_key)
+}
+
+#[cfg(not(unix))]
+fn read_catalog_file(root: &Path, raw: &str, private_key: bool) -> Result<Vec<u8>, CatalogError> {
+    let path = safe_catalog_path(root, raw)?;
     let mut options = OpenOptions::new();
     options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut file = options.open(path).map_err(|_| CatalogError::Unavailable)?;
+    let file = options.open(path).map_err(|_| CatalogError::Unavailable)?;
+    read_open_catalog_file(file, private_key)
+}
+
+fn read_open_catalog_file(mut file: fs::File, private_key: bool) -> Result<Vec<u8>, CatalogError> {
     let metadata = file.metadata().map_err(|_| CatalogError::Unavailable)?;
     if !metadata.is_file() {
         return Err(CatalogError::Malformed);
@@ -154,6 +186,22 @@ fn read_catalog_file(path: &Path, private_key: bool) -> Result<Vec<u8>, CatalogE
     Ok(bytes)
 }
 
+fn validated_relative_path(raw: &str) -> Result<&Path, CatalogError> {
+    let path = Path::new(raw);
+    if raw.is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(CatalogError::Malformed);
+    }
+    Ok(path)
+}
+
 fn validate_binding(
     identity: &DeviceIdentity,
     command: &DeviceCommand,
@@ -168,18 +216,9 @@ fn validate_binding(
     matches.then_some(()).ok_or(CatalogError::BindingMismatch)
 }
 
+#[cfg(not(unix))]
 fn safe_catalog_path(root: &Path, raw: &str) -> Result<PathBuf, CatalogError> {
-    let path = Path::new(raw);
-    if path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
-        return Err(CatalogError::Malformed);
-    }
+    let path = validated_relative_path(raw)?;
     let canonical_root = root.canonicalize().map_err(|_| CatalogError::Unavailable)?;
     let mut candidate = canonical_root.clone();
     for component in path.components() {

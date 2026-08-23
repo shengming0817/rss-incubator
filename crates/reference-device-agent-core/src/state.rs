@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::material::ValidatedCredential;
 use crate::{
     AckFact, CommandRejection, CredentialFiles, CredentialGeneration, DeviceIdentity, OutboundFact,
-    ReportFact, Sha256Digest,
+    ReportFact, Sha256Digest, TopicSet,
 };
 
 pub(crate) const OUTBOX_LIMIT: usize = 128;
@@ -166,6 +166,7 @@ pub(crate) struct StateV1 {
     last_command: Option<StoredCommand>,
     outbox: Vec<StoredOutbound>,
     reconnect_revision: Option<u64>,
+    pending_inbound: Option<StoredInboundSettlement>,
 }
 
 impl StateV1 {
@@ -189,6 +190,7 @@ impl StateV1 {
             last_command: None,
             outbox: Vec::new(),
             reconnect_revision: None,
+            pending_inbound: None,
         }
     }
 
@@ -246,12 +248,30 @@ impl StateV1 {
         {
             return Err(StoreError::InvalidState);
         }
+        if let Some(pending) = &self.pending_inbound {
+            let generation = CredentialGeneration::try_from(pending.credential_generation)
+                .map_err(|_| StoreError::InvalidState)?;
+            let identity =
+                DeviceIdentity::new(self.identity.tenant_id, self.identity.device_id, generation);
+            let valid = !pending.command_id.is_empty()
+                && Sha256Digest::try_from(pending.fingerprint.clone()).is_ok()
+                && pending.topic == TopicSet::new(&identity).command()
+                && self.last_command.as_ref().is_some_and(|last| {
+                    last.command_id == pending.command_id && last.fingerprint == pending.fingerprint
+                });
+            if !valid {
+                return Err(StoreError::InvalidState);
+            }
+        }
         let reports = self
             .outbox
             .iter()
             .filter(|entry| entry.report_payload().is_some())
             .count();
         if reports > 1 {
+            return Err(StoreError::InvalidState);
+        }
+        if self.pending_inbound.is_some() != (reports == 1) {
             return Err(StoreError::InvalidState);
         }
         for entry in &self.outbox {
@@ -336,6 +356,15 @@ impl StateV1 {
             .iter()
             .any(|entry| entry.report_payload().is_some())
     }
+    pub fn pending_inbound(&self) -> Option<(&str, &str, u64)> {
+        self.pending_inbound.as_ref().map(|pending| {
+            (
+                pending.topic.as_str(),
+                pending.command_id.as_str(),
+                pending.credential_generation,
+            )
+        })
+    }
     pub fn last_command(&self) -> Option<&StoredCommand> {
         self.last_command.as_ref()
     }
@@ -359,6 +388,7 @@ impl StateV1 {
         expires_at: i64,
         observed_at: i64,
     ) {
+        let previous_identity = self.current_identity().expect("validated state identity");
         self.device_sequence = self.device_sequence.saturating_add(1);
         let ack_sequence = self.device_sequence;
         self.device_sequence = self.device_sequence.saturating_add(1);
@@ -397,6 +427,17 @@ impl StateV1 {
             command_id: command_id.to_owned(),
             fingerprint,
             acknowledgement: acknowledgement.clone(),
+        });
+        self.pending_inbound = Some(StoredInboundSettlement {
+            topic: TopicSet::new(&previous_identity).command().to_owned(),
+            command_id: command_id.to_owned(),
+            fingerprint: self
+                .last_command
+                .as_ref()
+                .expect("stored command")
+                .fingerprint
+                .clone(),
+            credential_generation: previous_identity.credential_generation().get(),
         });
         self.outbox.push(StoredOutbound::Ack {
             event_id: ack_event,
@@ -479,6 +520,14 @@ impl StateV1 {
         });
     }
 
+    pub fn has_conflicting_replay(&self, command_id: &str, fingerprint: &str) -> bool {
+        let mut event_source = command_id.to_owned();
+        event_source.push('\0');
+        event_source.push_str(fingerprint);
+        let expected = event_id("rejected", &event_source);
+        self.outbox.iter().any(|entry| entry.event_id() == expected)
+    }
+
     pub fn has_command_ack(&self, command_id: &str) -> bool {
         self.outbox.iter().any(|entry| {
             matches!(entry, StoredOutbound::Ack { payload, .. } if payload.command_id == command_id)
@@ -512,7 +561,7 @@ impl StateV1 {
             return false;
         };
         let confirmed = self.outbox.remove(index);
-        if let StoredOutbound::Ack { payload, .. } = confirmed
+        if let StoredOutbound::Ack { payload, .. } = &confirmed
             && let Some(revision) = payload.activates_revision
             && self.outbox.iter().any(|item| {
                 matches!(item, StoredOutbound::ReportBlocked { payload, .. }
@@ -520,6 +569,9 @@ impl StateV1 {
             })
         {
             self.reconnect_revision = Some(revision);
+        }
+        if matches!(confirmed, StoredOutbound::ReportReady { .. }) {
+            self.pending_inbound = None;
         }
         true
     }
@@ -536,6 +588,15 @@ impl StateV1 {
         self.reconnect_revision = None;
         true
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredInboundSettlement {
+    topic: String,
+    command_id: String,
+    fingerprint: String,
+    credential_generation: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

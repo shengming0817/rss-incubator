@@ -4,7 +4,7 @@ use std::path::Path;
 
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-    SanType,
+    SanType, date_time_ymd,
 };
 use reference_device_agent_core::{
     AgentConfig, AgentError, ApplyOutcome, ArtifactCatalog, ArtifactId, CommandId,
@@ -80,6 +80,103 @@ fn accepted_command_is_durable_and_report_waits_for_ack_and_new_session() {
         ApplyOutcome::Duplicate
     );
     assert_eq!(reopened.next_outbound().expect("replayed ACK"), ack);
+}
+
+#[test]
+fn committed_rotation_recognizes_only_its_old_delivery_after_restart() {
+    let fixture = Fixture::new();
+    let (mut agent, command) = fixture.agent_and_command();
+    let old_topic = fixture.command_topic();
+    agent
+        .apply_command(&old_topic, &command, NOW)
+        .expect("accept rotation");
+    drop(agent);
+
+    let mut reopened = fixture.open_agent();
+    assert_eq!(reopened.pending_command_topic(), Some(old_topic.as_str()));
+    assert_eq!(reopened.pending_command_id(), Some("command-0001"));
+    assert_eq!(
+        reopened
+            .delivery_identity(&old_topic, "command-0001")
+            .expect("durable recovery identity")
+            .credential_generation()
+            .get(),
+        1
+    );
+    assert!(matches!(
+        reopened.delivery_identity(&old_topic, "another-command"),
+        Err(AgentError::UnexpectedDelivery)
+    ));
+    assert_eq!(
+        reopened
+            .apply_command(&old_topic, &command, NOW)
+            .expect("redelivery replay"),
+        ApplyOutcome::Duplicate
+    );
+    let unrelated = fixture.command(
+        "another-command",
+        &fixture.artifact_id,
+        &fixture.artifact_digest,
+        NOW + 600,
+        3,
+        3,
+    );
+    assert!(matches!(
+        reopened.apply_command(&old_topic, &unrelated, NOW),
+        Err(AgentError::RotationInFlight)
+    ));
+
+    let ack = reopened.next_outbound().expect("ACK");
+    reopened
+        .confirm_outbound(ack.event_id())
+        .expect("ACK PUBACK");
+    reopened
+        .mark_current_credential_connected(CredentialRevision::try_from(2).expect("revision"))
+        .expect("reconnect");
+    let report = reopened.next_outbound().expect("report");
+    reopened
+        .confirm_outbound(report.event_id())
+        .expect("report PUBACK");
+    assert!(reopened.pending_command_topic().is_none());
+    assert!(matches!(
+        reopened.delivery_identity(&old_topic, "command-0001"),
+        Err(AgentError::UnexpectedDelivery)
+    ));
+}
+
+#[test]
+fn conflicting_replay_redelivery_reuses_one_durable_rejection() {
+    let fixture = Fixture::new();
+    let (mut agent, accepted) = fixture.agent_and_command();
+    let topic = fixture.command_topic();
+    agent
+        .apply_command(&topic, &accepted, NOW)
+        .expect("accept rotation");
+    let conflicting = fixture.command(
+        "command-0001",
+        "different-artifact",
+        &fixture.artifact_digest,
+        NOW + 600,
+        2,
+        2,
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            agent
+                .apply_command(&topic, &conflicting, NOW)
+                .expect("stable rejection"),
+            ApplyOutcome::Rejected(CommandRejection::MalformedCommand)
+        );
+    }
+    let accepted_ack = agent.next_outbound().expect("accepted ACK");
+    agent
+        .confirm_outbound(accepted_ack.event_id())
+        .expect("accepted ACK PUBACK");
+    let rejection = agent.next_outbound().expect("one rejection");
+    agent
+        .confirm_outbound(rejection.event_id())
+        .expect("rejection PUBACK");
+    assert!(agent.next_outbound().is_none());
 }
 
 #[test]
@@ -312,6 +409,15 @@ fn stale_fence_is_checked_before_stale_generation() {
             .expect("accept"),
         ApplyOutcome::Accepted
     );
+    let ack = agent.next_outbound().expect("ACK");
+    agent.confirm_outbound(ack.event_id()).expect("ACK PUBACK");
+    agent
+        .mark_current_credential_connected(CredentialRevision::try_from(2).expect("revision"))
+        .expect("reconnect");
+    let report = agent.next_outbound().expect("report");
+    agent
+        .confirm_outbound(report.event_id())
+        .expect("report PUBACK");
     let current_topic = TopicSet::new(&agent.current_identity().expect("identity"))
         .command()
         .to_owned();
@@ -479,6 +585,34 @@ fn catalog_symlink_escape_is_rejected() {
 
 #[cfg(unix)]
 #[test]
+fn catalog_ancestor_symlink_swap_is_rejected() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new();
+    let catalog = fixture.root.path().join("catalog");
+    let material = catalog.join("material");
+    let outside = fixture.root.path().join("outside-material");
+    fs::rename(&material, &outside).expect("move material outside catalog");
+    symlink(&outside, &material).expect("ancestor symlink");
+    let (mut agent, command) = fixture.agent_and_command();
+
+    assert_eq!(
+        agent
+            .apply_command(&fixture.command_topic(), &command, NOW)
+            .expect("ancestor symlink rejection"),
+        ApplyOutcome::Rejected(CommandRejection::MalformedCommand)
+    );
+    assert!(
+        !fixture
+            .root
+            .path()
+            .join("state/credentials/revision-2")
+            .exists()
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn insecure_catalog_private_key_permissions_are_rejected() {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -501,6 +635,93 @@ fn insecure_catalog_private_key_permissions_are_rejected() {
             .join("state/credentials/revision-2")
             .exists()
     );
+}
+
+#[test]
+fn catalog_rejects_wrong_identity_expired_untrusted_and_mismatched_key_material() {
+    for case in ["identity", "expired", "untrusted", "key-mismatch"] {
+        let fixture = Fixture::new();
+        let material = fixture.root.path().join("catalog/material");
+        match case {
+            "identity" => {
+                let wrong = DeviceIdentity::new(
+                    fixture.initial_identity.tenant(),
+                    Uuid::parse_str("00000000-0000-0000-0000-000000000999").expect("wrong device"),
+                    CredentialGeneration::try_from(2).expect("generation"),
+                );
+                issue_credentials(&material, &wrong);
+            }
+            "expired" => {
+                let next = DeviceIdentity::new(
+                    fixture.initial_identity.tenant(),
+                    fixture.device,
+                    CredentialGeneration::try_from(2).expect("generation"),
+                );
+                issue_expired_credentials(&material, &next);
+            }
+            "untrusted" => {
+                let next = DeviceIdentity::new(
+                    fixture.initial_identity.tenant(),
+                    fixture.device,
+                    CredentialGeneration::try_from(2).expect("generation"),
+                );
+                let replacement =
+                    issue_credentials(&fixture.root.path().join("untrusted-material"), &next);
+                fs::copy(
+                    replacement.certificate_chain(),
+                    material.join("certificate.pem"),
+                )
+                .expect("certificate");
+                fs::copy(replacement.private_key(), material.join("private-key.pem")).expect("key");
+                owner_only(&material.join("private-key.pem"));
+            }
+            "key-mismatch" => {
+                let replacement = KeyPair::generate().expect("replacement key");
+                fs::write(
+                    material.join("private-key.pem"),
+                    replacement.serialize_pem(),
+                )
+                .expect("key");
+                owner_only(&material.join("private-key.pem"));
+            }
+            _ => unreachable!(),
+        }
+        let files = CredentialFiles::new(
+            material.join("ca.pem"),
+            material.join("certificate.pem"),
+            material.join("private-key.pem"),
+        );
+        let digest = compute_artifact_digest(&files)
+            .expect("digest")
+            .expose()
+            .to_owned();
+        fixture.set_catalog_digest(&digest);
+        let command = fixture.command(
+            "invalid-credential-command",
+            &fixture.artifact_id,
+            &digest,
+            NOW + 600,
+            2,
+            2,
+        );
+        let mut agent = fixture.open_agent();
+        let outcome = agent
+            .apply_command(&fixture.command_topic(), &command, NOW)
+            .expect("credential rejection");
+        assert!(matches!(
+            outcome,
+            ApplyOutcome::Rejected(
+                CommandRejection::PolicyRejected | CommandRejection::DeviceFailure
+            )
+        ));
+        assert!(
+            !fixture
+                .root
+                .path()
+                .join("state/credentials/revision-2")
+                .exists()
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -528,6 +749,53 @@ fn failed_persistence_does_not_advance_in_memory_protocol_state() {
     ));
     assert_eq!(agent.next_outbound(), Some(acknowledgement));
     assert_eq!(agent.reconnect_revision().expect("revision"), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn installed_orphan_revision_never_becomes_current_after_state_commit_failure() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = Fixture::new();
+    let (mut agent, command) = fixture.agent_and_command();
+    let state_root = fixture.root.path().join("state");
+    fs::set_permissions(&state_root, fs::Permissions::from_mode(0o500))
+        .expect("make manifest directory read-only");
+
+    let result = agent.apply_command(&fixture.command_topic(), &command, NOW);
+
+    fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700))
+        .expect("restore state permissions");
+    assert!(matches!(
+        result,
+        Err(AgentError::Store(StoreError::Unavailable))
+    ));
+    assert!(state_root.join("credentials/revision-2").is_dir());
+    assert_eq!(
+        agent
+            .current_identity()
+            .expect("in-memory identity")
+            .credential_generation()
+            .get(),
+        1
+    );
+
+    drop(agent);
+    let mut reopened = fixture.open_agent();
+    assert_eq!(
+        reopened
+            .current_identity()
+            .expect("durable identity")
+            .credential_generation()
+            .get(),
+        1
+    );
+    assert_eq!(
+        reopened
+            .apply_command(&fixture.command_topic(), &command, NOW)
+            .expect("reuse matching orphan"),
+        ApplyOutcome::Accepted
+    );
 }
 
 struct Fixture {
@@ -654,6 +922,15 @@ impl Fixture {
             .expect("rewrite catalog");
     }
 
+    fn set_catalog_digest(&self, digest: &str) {
+        let path = self.root.path().join("catalog/catalog.json");
+        let mut catalog: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("catalog")).expect("catalog JSON");
+        catalog["artifacts"][0]["artifactDigest"] = serde_json::json!(digest);
+        fs::write(path, serde_json::to_vec(&catalog).expect("catalog JSON"))
+            .expect("rewrite catalog");
+    }
+
     fn command(
         &self,
         command_id: &str,
@@ -679,6 +956,18 @@ impl Fixture {
 }
 
 fn issue_credentials(directory: &Path, identity: &DeviceIdentity) -> CredentialFiles {
+    issue_credentials_with_dates(directory, identity, false)
+}
+
+fn issue_expired_credentials(directory: &Path, identity: &DeviceIdentity) -> CredentialFiles {
+    issue_credentials_with_dates(directory, identity, true)
+}
+
+fn issue_credentials_with_dates(
+    directory: &Path,
+    identity: &DeviceIdentity,
+    expired: bool,
+) -> CredentialFiles {
     fs::create_dir_all(directory).expect("credential directory");
     let ca_key = KeyPair::generate().expect("CA key");
     let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("CA params");
@@ -687,6 +976,10 @@ fn issue_credentials(directory: &Path, identity: &DeviceIdentity) -> CredentialF
 
     let key = KeyPair::generate().expect("device key");
     let mut params = CertificateParams::new(Vec::<String>::new()).expect("device params");
+    if expired {
+        params.not_before = date_time_ymd(2020, 1, 1);
+        params.not_after = date_time_ymd(2021, 1, 1);
+    }
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
     params.subject_alt_names = vec![SanType::URI(
         identity.principal_urn().try_into().expect("URI SAN"),

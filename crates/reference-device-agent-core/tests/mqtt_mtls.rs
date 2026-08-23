@@ -36,7 +36,7 @@ async fn persistent_session_queues_offline_command_and_manual_ack_is_explicit() 
     let device_config = connection(&host, port, &format!("reference-agent-t2-device-{run_id}"));
     let service_config = connection(&host, port, &format!("reference-agent-t2-service-{run_id}"));
 
-    let mut online = MqttSession::new(&device_config, &device_credentials, topics.clone())
+    let mut online = MqttSession::new(&device_config, &device_credentials, topics.clone(), None)
         .expect("device session");
     wait_connected(&mut online, false).await;
     online.subscribe().await.expect("subscribe");
@@ -44,7 +44,7 @@ async fn persistent_session_queues_offline_command_and_manual_ack_is_explicit() 
     drop(online);
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let mut service = MqttSession::new(&service_config, &service_credentials, topics.clone())
+    let mut service = MqttSession::new(&service_config, &service_credentials, topics.clone(), None)
         .expect("service session");
     wait_connected(&mut service, false).await;
     service
@@ -58,7 +58,7 @@ async fn persistent_session_queues_offline_command_and_manual_ack_is_explicit() 
     wait_outbound_ack(&mut service, "offline-command-1").await;
     drop(service);
 
-    let mut reconnected = MqttSession::new(&device_config, &device_credentials, topics)
+    let mut reconnected = MqttSession::new(&device_config, &device_credentials, topics, None)
         .expect("reconnected device session");
     wait_connected(&mut reconnected, true).await;
     let delivery = wait_command(&mut reconnected).await;

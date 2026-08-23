@@ -52,6 +52,10 @@ pub enum AgentError {
     UnknownOutbound,
     #[error("reconnect does not match the committed credential revision")]
     UnexpectedReconnect,
+    #[error("MQTT delivery is outside the current or pending settlement scope")]
+    UnexpectedDelivery,
+    #[error("credential rotation is in flight; command intake is backpressured")]
+    RotationInFlight,
 }
 
 /// Product-specific device state machine and durable credential store.
@@ -122,16 +126,6 @@ impl ReferenceDeviceAgent {
     ) -> Result<ApplyOutcome, AgentError> {
         let observed_at = i64::try_from(now_epoch_seconds).unwrap_or(i64::MAX);
         let fingerprint = command_fingerprint(command);
-        if !TopicSet::new(&self.current_identity()?).accepts_command(topic)
-            || command.device_id() != self.current_identity()?.device()
-        {
-            return self.persist_rejection(
-                command,
-                fingerprint,
-                CommandRejection::MalformedCommand,
-                observed_at,
-            );
-        }
         if let Some(same_payload) = self
             .state
             .last_command()
@@ -146,6 +140,12 @@ impl ReferenceDeviceAgent {
                 }
                 return Ok(ApplyOutcome::Duplicate);
             }
+            if self
+                .state
+                .has_conflicting_replay(command.command_id().expose(), &fingerprint)
+            {
+                return Ok(ApplyOutcome::Rejected(CommandRejection::MalformedCommand));
+            }
             let mut candidate = self.state.clone();
             candidate.reserve_outbox(1)?;
             candidate.reject_conflicting_replay(
@@ -157,6 +157,19 @@ impl ReferenceDeviceAgent {
             );
             self.persist_candidate(candidate)?;
             return Ok(ApplyOutcome::Rejected(CommandRejection::MalformedCommand));
+        }
+        if self.rotation_in_flight() {
+            return Err(AgentError::RotationInFlight);
+        }
+        if !TopicSet::new(&self.current_identity()?).accepts_command(topic)
+            || command.device_id() != self.current_identity()?.device()
+        {
+            return self.persist_rejection(
+                command,
+                fingerprint,
+                CommandRejection::MalformedCommand,
+                observed_at,
+            );
         }
         if command.deadline_epoch_seconds().get() <= now_epoch_seconds {
             return self.persist_rejection(
@@ -243,6 +256,49 @@ impl ReferenceDeviceAgent {
     #[must_use]
     pub fn rotation_in_flight(&self) -> bool {
         self.state.rotation_in_flight()
+    }
+
+    #[must_use]
+    pub fn pending_command_topic(&self) -> Option<&str> {
+        self.state.pending_inbound().map(|(topic, _, _)| topic)
+    }
+
+    #[must_use]
+    pub fn pending_command_id(&self) -> Option<&str> {
+        self.state
+            .pending_inbound()
+            .map(|(_, command_id, _)| command_id)
+    }
+
+    /// Selects the exact identity permitted to decode a current or recovery delivery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the topic and command identify the current scope or the single
+    /// durable delivery awaiting broker settlement.
+    pub fn delivery_identity(
+        &self,
+        topic: &str,
+        command_id: &str,
+    ) -> Result<DeviceIdentity, AgentError> {
+        let current = self.current_identity()?;
+        if TopicSet::new(&current).accepts_command(topic) {
+            return Ok(current);
+        }
+        let Some((pending_topic, pending_command, generation)) = self.state.pending_inbound()
+        else {
+            return Err(AgentError::UnexpectedDelivery);
+        };
+        if pending_topic != topic || pending_command != command_id {
+            return Err(AgentError::UnexpectedDelivery);
+        }
+        let generation = crate::CredentialGeneration::try_from(generation)
+            .map_err(|_| AgentError::Store(StoreError::InvalidState))?;
+        Ok(DeviceIdentity::new(
+            current.tenant(),
+            current.device(),
+            generation,
+        ))
     }
 
     /// Records that the committed credential revision established its MQTT session.
