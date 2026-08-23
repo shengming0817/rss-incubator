@@ -57,14 +57,15 @@ use rss_device_security_contracts::{
     policy_put::{
         IdentityDeviceCertificatePolicyPutConflictError as ConflictError,
         IdentityDeviceCertificatePolicyPutConflictResponse as ConflictResponse,
-        IdentityDeviceCertificatePolicyPutConflictResponseErrorMessage as ConflictMessage,
         IdentityDeviceCertificatePolicyPutData as PolicyData,
         IdentityDeviceCertificatePolicyPutDataCondition as PolicyCondition,
+        IdentityDeviceCertificatePolicyPutGeneralConflictMessage as GeneralConflictMessage,
         IdentityDeviceCertificatePolicyPutNotFoundError as NotFoundError,
         IdentityDeviceCertificatePolicyPutNotFoundErrorCode as NotFoundCode,
         IdentityDeviceCertificatePolicyPutNotFoundErrorMessage as NotFoundMessage,
         IdentityDeviceCertificatePolicyPutNotFoundResponse as NotFoundResponse,
         IdentityDeviceCertificatePolicyPutResponse as PolicyResponse,
+        IdentityDeviceCertificatePolicyPutVersionConflictMessage as VersionConflictMessage,
     },
     status_get::{
         IdentityDeviceCertificateStatusGetData as StatusData,
@@ -127,13 +128,13 @@ fn policy_failures_preserve_canonical_404_and_both_409_variants() {
     for error in [
         ConflictError::ErrCoreVersionConflict {
             details: Vec::<HashMap<String, String>>::new(),
-            message: ConflictMessage::VersionConflict,
+            message: VersionConflictMessage::VersionConflict,
             request_id: "request-409-version".to_owned(),
             retryable: false,
         },
         ConflictError::ErrCoreConflict {
             details: Vec::<HashMap<String, String>>::new(),
-            message: ConflictMessage::VersionConflict,
+            message: GeneralConflictMessage::Conflict,
             request_id: "request-409-conflict".to_owned(),
             retryable: false,
         },

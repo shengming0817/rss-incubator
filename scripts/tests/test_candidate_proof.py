@@ -173,11 +173,12 @@ class CandidateBundleTests(unittest.TestCase):
         self.assertEqual(
             excluded_members,
             {
+                "apps/rotation-control",
                 "crates/platform-authoring-smoke",
                 "crates/rss-device-security-client",
             },
         )
-        self.assertTrue(excluded_members < repository_members)
+        self.assertTrue(excluded_members - {"apps/rotation-control"} < repository_members)
         for command in (
             "cargo check --workspace --all-targets --locked",
             "cargo test --workspace --all-targets --locked",
@@ -186,7 +187,7 @@ class CandidateBundleTests(unittest.TestCase):
         ):
             self.assertIn(command, ci_job)
         self.assertIn(
-            "find crates -type f -name '*.rs' "
+            "find apps crates -type f -name '*.rs' "
             "-exec rustfmt --edition 2024 --check {} +",
             ci_job,
         )
@@ -743,9 +744,13 @@ class CandidateBundleTests(unittest.TestCase):
         crates_io = "registry+https://github.com/rust-lang/crates.io-index"
         baseline_identity = ("baseline", "1.0.0", crates_io, "a" * 64)
         required_identity = ("required", "2.0.0", crates_io, "b" * 64)
+        app_identity = ("app-only", "2.1.0", crates_io, "e" * 64)
         unrelated_identity = ("unrelated", "3.0.0", crates_io, "c" * 64)
         rss_id = "registry+https://rss-candidate.invalid/index#rss-platform@0.3.0"
+        app_id = "path+file:///snapshot/apps/rotation-control#0.0.0"
+        app_manifest = "/snapshot/apps/rotation-control/Cargo.toml"
         required_id = "registry+https://github.com/rust-lang/crates.io-index#required@2.0.0"
+        app_dependency_id = "registry+https://github.com/rust-lang/crates.io-index#app-only@2.1.0"
         unrelated_id = "registry+https://github.com/rust-lang/crates.io-index#unrelated@3.0.0"
         metadata = {
             "packages": [
@@ -757,10 +762,24 @@ class CandidateBundleTests(unittest.TestCase):
                     "checksum": "d" * 64,
                 },
                 {
+                    "id": app_id,
+                    "name": "rotation-control",
+                    "version": "0.0.0",
+                    "source": None,
+                    "manifest_path": app_manifest,
+                },
+                {
                     "id": required_id,
                     "name": required_identity[0],
                     "version": required_identity[1],
                     "source": required_identity[2],
+                    "checksum": None,
+                },
+                {
+                    "id": app_dependency_id,
+                    "name": app_identity[0],
+                    "version": app_identity[1],
+                    "source": app_identity[2],
                     "checksum": None,
                 },
                 {
@@ -774,7 +793,9 @@ class CandidateBundleTests(unittest.TestCase):
             "resolve": {
                 "nodes": [
                     {"id": rss_id, "dependencies": [required_id]},
+                    {"id": app_id, "dependencies": [app_dependency_id]},
                     {"id": required_id, "dependencies": []},
+                    {"id": app_dependency_id, "dependencies": []},
                     {"id": unrelated_id, "dependencies": []},
                 ]
             },
@@ -782,7 +803,10 @@ class CandidateBundleTests(unittest.TestCase):
         baseline = {baseline_identity}
 
         candidate_proof.validate_non_rss_lock_delta(
-            metadata, baseline, baseline | {required_identity}
+            metadata,
+            baseline,
+            baseline | {required_identity, app_identity},
+            [Path(app_manifest)],
         )
         with self.assertRaisesRegex(
             candidate_proof.ProofError, "outside the candidate dependency graph"
@@ -790,7 +814,8 @@ class CandidateBundleTests(unittest.TestCase):
             candidate_proof.validate_non_rss_lock_delta(
                 metadata,
                 baseline,
-                baseline | {required_identity, unrelated_identity},
+                baseline | {required_identity, app_identity, unrelated_identity},
+                [Path(app_manifest)],
             )
 
     def test_non_rss_lock_delta_requires_a_well_formed_resolve_graph(self):

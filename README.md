@@ -17,10 +17,11 @@ authorization, retry, readiness, or device-state behavior.
 
 ## Incubating products
 
-The [Secure Device Credential Rotation](docs/secure-device-credential-rotation.md) skeleton is an
+The [Secure Device Credential Rotation](docs/secure-device-credential-rotation.md) product is an
 accepted incubation scope. Its `rotation-model` package contains only transport-neutral product
-correlation and observation facts. The public mapping client, future control CLI, reference device agent,
-reference deployment, and external T2 journey retain separate implementation owners.
+facts, and its non-publishable [`rotation-control`](apps/rotation-control/README.md) binary provides
+the PKCE/HTTP policy and status control surface. The reference device agent, service image, fixture
+seeding, and external T2 journey retain separate implementation owners.
 
 The rotation product does not absorb `rss-consumer-smoke`. The observability smoke remains an
 independent compatibility proof and supplies no identity, authorization, or device-state authority.
@@ -69,7 +70,7 @@ the environment's External/T2-only acceptance boundary.
 ```sh
 python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 cargo fmt --all -- --check
-find crates -type f -name '*.rs' -exec rustfmt --edition 2024 --check {} +
+find apps crates -type f -name '*.rs' -exec rustfmt --edition 2024 --check {} +
 cargo check --workspace --all-targets --locked
 cargo test --workspace --all-targets --locked
 cargo test --workspace --doc --locked

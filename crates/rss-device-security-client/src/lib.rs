@@ -7,8 +7,8 @@ use rotation_model::{
     ApplicationRejectionReason, ApplicationStaleReason, ArtifactDigest, AuthorizationReceiptRef,
     CommandAckPosition, CommandAcknowledgement, CommandAcknowledgementOutcome, CommandRef,
     CommandRejectionReason, CredentialReport, DeviceSequence, EventRef, FenceEpoch, Generation,
-    IngressEnvelopeRef, ReceiptLineage, ReportPosition, RotationAccepted, RotationCoordinates,
-    RotationModelError, StateHash, UnixTimestamp,
+    IngressEnvelopeRef, KeyUsage, ReceiptLineage, ReportPosition, RotationAccepted,
+    RotationCoordinates, RotationModelError, RotationPolicy, StateHash, UnixTimestamp,
 };
 use rss_device_security_contracts::{
     AuthorizationReceiptId,
@@ -31,11 +31,381 @@ use rss_device_security_contracts::{
         IdentityDeviceCertificatePolicyPutConflictResponse,
         IdentityDeviceCertificatePolicyPutDataCondition,
         IdentityDeviceCertificatePolicyPutNotFoundResponse,
-        IdentityDeviceCertificatePolicyPutResponse,
+        IdentityDeviceCertificatePolicyPutPolicy,
+        IdentityDeviceCertificatePolicyPutPolicyKeyUsagesItem,
+        IdentityDeviceCertificatePolicyPutPolicySansItem,
+        IdentityDeviceCertificatePolicyPutRequest, IdentityDeviceCertificatePolicyPutResponse,
+        IdentityDeviceCertificatePolicyPutValidationResponse,
     },
     status_get::IdentityDeviceCertificateStatusGetResponse,
 };
 use uuid::Uuid;
+
+/// Canonical operation descriptor independent of any HTTP implementation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OperationDescriptor {
+    pub method: &'static str,
+    pub path_template: &'static str,
+}
+
+pub const POLICY_PUT_OPERATION: OperationDescriptor = OperationDescriptor {
+    method: "PUT",
+    path_template: "/api/v2/identity/devices/{deviceId}/certificate-policy",
+};
+
+pub const STATUS_GET_OPERATION: OperationDescriptor = OperationDescriptor {
+    method: "GET",
+    path_template: "/api/v2/identity/devices/{deviceId}/certificate-status",
+};
+
+/// A fully prepared canonical request. Its body is intentionally redacted from `Debug`.
+#[derive(Clone, Eq, PartialEq)]
+pub struct PreparedRequest {
+    method: &'static str,
+    path: String,
+    body: Option<Vec<u8>>,
+}
+
+impl fmt::Debug for PreparedRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedRequest")
+            .field("method", &self.method)
+            .field("path", &"[REDACTED]")
+            .field("body", &self.body.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
+}
+
+impl PreparedRequest {
+    #[must_use]
+    pub const fn method(&self) -> &'static str {
+        self.method
+    }
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+    #[must_use]
+    pub fn body(&self) -> Option<&[u8]> {
+        self.body.as_deref()
+    }
+}
+
+/// Payload-free construction or decoding failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FacadeError {
+    InvalidInput,
+    Serialization,
+}
+
+impl fmt::Display for FacadeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidInput => "invalid canonical request input",
+            Self::Serialization => "canonical request serialization failed",
+        })
+    }
+}
+
+impl std::error::Error for FacadeError {}
+
+/// Builds the exact canonical policy PUT DTO and serializes it at the sole RSS edge.
+///
+/// # Errors
+///
+/// Returns [`FacadeError`] when product values cannot be represented by the canonical DTO or its
+/// serialization fails.
+pub fn prepare_policy_put(
+    device_id: Uuid,
+    expected_generation: u64,
+    idempotency_key: Uuid,
+    policy: &RotationPolicy,
+) -> Result<PreparedRequest, FacadeError> {
+    let key_usages = policy
+        .key_usages()
+        .iter()
+        .map(|usage| match usage {
+            KeyUsage::ClientAuth => {
+                IdentityDeviceCertificatePolicyPutPolicyKeyUsagesItem::ClientAuth
+            }
+            KeyUsage::ServerAuth => {
+                IdentityDeviceCertificatePolicyPutPolicyKeyUsagesItem::ServerAuth
+            }
+        })
+        .collect();
+    let sans = policy
+        .sans()
+        .iter()
+        .map(|san| IdentityDeviceCertificatePolicyPutPolicySansItem::try_from(san.as_str()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| FacadeError::InvalidInput)?;
+    let renew =
+        i64::try_from(policy.renew_before_seconds()).map_err(|_| FacadeError::InvalidInput)?;
+    let validity =
+        i64::try_from(policy.validity_seconds()).map_err(|_| FacadeError::InvalidInput)?;
+    let expected = i64::try_from(expected_generation).map_err(|_| FacadeError::InvalidInput)?;
+    let canonical_policy = IdentityDeviceCertificatePolicyPutPolicy::try_new(
+        key_usages,
+        renew,
+        (!sans.is_empty()).then_some(sans),
+        validity,
+    )
+    .map_err(|_| FacadeError::InvalidInput)?;
+    let request = IdentityDeviceCertificatePolicyPutRequest::try_new(
+        expected,
+        idempotency_key,
+        canonical_policy,
+    )
+    .map_err(|_| FacadeError::InvalidInput)?;
+    let body = serde_json::to_vec(&request).map_err(|_| FacadeError::Serialization)?;
+    Ok(PreparedRequest {
+        method: POLICY_PUT_OPERATION.method,
+        path: format!("/api/v2/identity/devices/{device_id}/certificate-policy"),
+        body: Some(body),
+    })
+}
+
+#[must_use]
+pub fn prepare_status_get(device_id: Uuid) -> PreparedRequest {
+    PreparedRequest {
+        method: STATUS_GET_OPERATION.method,
+        path: format!("/api/v2/identity/devices/{device_id}/certificate-status"),
+        body: None,
+    }
+}
+
+/// Closed diagnostic categories exposed to applications.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiagnosticKind {
+    Validation,
+    NotFound,
+    Conflict,
+    Unauthorized,
+    Forbidden,
+    RateLimited,
+    Upstream,
+    Malformed,
+    UnknownStatus,
+}
+
+impl DiagnosticKind {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Validation => "validation_failed",
+            Self::NotFound => "not_found",
+            Self::Conflict => "conflict",
+            Self::Unauthorized => "unauthorized",
+            Self::Forbidden => "forbidden",
+            Self::RateLimited => "rate_limited",
+            Self::Upstream => "upstream_failure",
+            Self::Malformed => "malformed_response",
+            Self::UnknownStatus => "unknown_status",
+        }
+    }
+}
+
+/// Sanitized diagnostic; upstream payloads and provider messages are never retained.
+#[derive(Clone, Eq, PartialEq)]
+pub struct Diagnostic {
+    kind: DiagnosticKind,
+    request_id: Option<String>,
+    retryable: bool,
+}
+
+impl fmt::Debug for Diagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Diagnostic")
+            .field("kind", &self.kind)
+            .field(
+                "request_id",
+                &self.request_id.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("retryable", &self.retryable)
+            .finish()
+    }
+}
+
+impl Diagnostic {
+    #[must_use]
+    pub const fn kind(&self) -> DiagnosticKind {
+        self.kind
+    }
+    #[must_use]
+    pub fn request_id(&self) -> Option<&str> {
+        self.request_id.as_deref()
+    }
+    #[must_use]
+    pub const fn retryable(&self) -> bool {
+        self.retryable
+    }
+    fn new(kind: DiagnosticKind, request_id: Option<String>, retryable: bool) -> Self {
+        Self {
+            kind,
+            request_id,
+            retryable,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyAcceptedProjection {
+    receipt_id: Uuid,
+    generation: u64,
+    condition: &'static str,
+}
+impl PolicyAcceptedProjection {
+    #[must_use]
+    pub const fn receipt_id(&self) -> Uuid {
+        self.receipt_id
+    }
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+    #[must_use]
+    pub const fn condition(&self) -> &'static str {
+        self.condition
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PolicyResponse {
+    Accepted(PolicyAcceptedProjection),
+    Rejected(Diagnostic),
+}
+
+/// Decodes only documented policy status/body pairs into a closed projection.
+#[must_use]
+pub fn decode_policy_response(status: u16, body: &[u8]) -> PolicyResponse {
+    let malformed =
+        || PolicyResponse::Rejected(Diagnostic::new(DiagnosticKind::Malformed, None, false));
+    match status {
+        200 => serde_json::from_slice::<IdentityDeviceCertificatePolicyPutResponse>(body).map_or_else(
+            |_| malformed(),
+            |value| PolicyResponse::Accepted(PolicyAcceptedProjection {
+                receipt_id: value.data.authorization_receipt_id.as_uuid(),
+                generation: value.data.accepted_generation.get(),
+                condition: match value.data.condition {
+                    IdentityDeviceCertificatePolicyPutDataCondition::Reconciling => "Reconciling",
+                    IdentityDeviceCertificatePolicyPutDataCondition::PendingDevice => "PendingDevice",
+                },
+            }),
+        ),
+        400 => serde_json::from_slice::<IdentityDeviceCertificatePolicyPutValidationResponse>(body)
+            .map_or_else(|_| malformed(), |value| PolicyResponse::Rejected(Diagnostic::new(DiagnosticKind::Validation, Some(value.error.request_id), false))),
+        404 => serde_json::from_slice::<IdentityDeviceCertificatePolicyPutNotFoundResponse>(body)
+            .map_or_else(|_| malformed(), |value| PolicyResponse::Rejected(Diagnostic::new(DiagnosticKind::NotFound, Some(value.error.request_id), false))),
+        409 => serde_json::from_slice::<IdentityDeviceCertificatePolicyPutConflictResponse>(body)
+            .map_or_else(|_| malformed(), |value| {
+                use rss_device_security_contracts::policy_put::IdentityDeviceCertificatePolicyPutConflictError;
+                let (request_id, retryable) = match value.error {
+                    IdentityDeviceCertificatePolicyPutConflictError::ErrCoreVersionConflict { request_id, retryable, .. }
+                    | IdentityDeviceCertificatePolicyPutConflictError::ErrCoreConflict { request_id, retryable, .. } => (request_id, retryable),
+                };
+                PolicyResponse::Rejected(Diagnostic::new(DiagnosticKind::Conflict, Some(request_id), retryable))
+            }),
+        401 => PolicyResponse::Rejected(Diagnostic::new(DiagnosticKind::Unauthorized, None, false)),
+        403 => PolicyResponse::Rejected(Diagnostic::new(DiagnosticKind::Forbidden, None, false)),
+        429 => PolicyResponse::Rejected(Diagnostic::new(DiagnosticKind::RateLimited, None, false)),
+        500..=599 => PolicyResponse::Rejected(Diagnostic::new(DiagnosticKind::Upstream, None, false)),
+        _ => PolicyResponse::Rejected(Diagnostic::new(DiagnosticKind::UnknownStatus, None, false)),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveCommandProjection {
+    pub fence_epoch: u64,
+    pub state: String,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConditionProjection {
+    pub observed_generation: u64,
+    pub reason: String,
+    pub status: String,
+    pub type_: String,
+    pub last_transition_at: i64,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatusProjection {
+    pub desired_generation: Option<u64>,
+    pub authorization_receipt_id: Option<Uuid>,
+    pub observed_generation: u64,
+    pub active_command: Option<ActiveCommandProjection>,
+    pub conditions: Vec<ConditionProjection>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StatusResponse {
+    Observed(StatusProjection),
+    Rejected(Diagnostic),
+}
+
+#[must_use]
+pub fn decode_status_response(status: u16, body: &[u8]) -> StatusResponse {
+    if status != 200 {
+        let kind = match status {
+            401 => DiagnosticKind::Unauthorized,
+            403 => DiagnosticKind::Forbidden,
+            404 => DiagnosticKind::NotFound,
+            429 => DiagnosticKind::RateLimited,
+            500..=599 => DiagnosticKind::Upstream,
+            _ => DiagnosticKind::UnknownStatus,
+        };
+        return StatusResponse::Rejected(Diagnostic::new(kind, None, false));
+    }
+    let Ok(value) = serde_json::from_slice::<IdentityDeviceCertificateStatusGetResponse>(body)
+    else {
+        return StatusResponse::Rejected(Diagnostic::new(DiagnosticKind::Malformed, None, false));
+    };
+    let desired_generation = value
+        .data
+        .desired
+        .as_ref()
+        .map(|desired| desired.generation.get());
+    let authorization_receipt_id = value
+        .data
+        .desired
+        .as_ref()
+        .map(|desired| desired.authorization_receipt_id.as_uuid());
+    let active_command = value
+        .data
+        .desired
+        .as_ref()
+        .and_then(|desired| desired.active_command.as_ref())
+        .map(|command| ActiveCommandProjection {
+            fence_epoch: command.fence_epoch.get(),
+            state: command.state.to_string(),
+        });
+    let Ok(observed_generation) = u64::try_from(value.data.observed_generation) else {
+        return StatusResponse::Rejected(Diagnostic::new(DiagnosticKind::Malformed, None, false));
+    };
+    let mut conditions = Vec::with_capacity(value.data.conditions.len());
+    for condition in value.data.conditions {
+        let Ok(generation) = u64::try_from(condition.observed_generation) else {
+            return StatusResponse::Rejected(Diagnostic::new(
+                DiagnosticKind::Malformed,
+                None,
+                false,
+            ));
+        };
+        conditions.push(ConditionProjection {
+            observed_generation: generation,
+            reason: condition.reason.to_string(),
+            status: condition.status.to_string(),
+            type_: condition.type_.to_string(),
+            last_transition_at: condition.last_transition_at,
+        });
+    }
+    StatusResponse::Observed(StatusProjection {
+        desired_generation,
+        authorization_receipt_id,
+        observed_generation,
+        active_command,
+        conditions,
+    })
+}
 
 /// Product correlation plus the public device UUID expected at this mapping boundary.
 ///
