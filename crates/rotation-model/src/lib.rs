@@ -92,6 +92,11 @@ opaque_reference!(
     "Opaque requester reference that does not establish authentication."
 );
 opaque_reference!(
+    AuthorizationReceiptRef,
+    "authorization_receipt_ref",
+    "Authority-free correlation reference for one durable authorization decision."
+);
+opaque_reference!(
     CommandRef,
     "command_ref",
     "Opaque reference to a device command issued outside this model."
@@ -283,6 +288,7 @@ pub enum AcceptanceCondition {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RotationAccepted {
     coordinates: RotationCoordinates,
+    authorization_receipt: AuthorizationReceiptRef,
     accepted_generation: Generation,
     condition: AcceptanceCondition,
 }
@@ -292,11 +298,13 @@ impl RotationAccepted {
     #[must_use]
     pub const fn new(
         coordinates: RotationCoordinates,
+        authorization_receipt: AuthorizationReceiptRef,
         accepted_generation: Generation,
         condition: AcceptanceCondition,
     ) -> Self {
         Self {
             coordinates,
+            authorization_receipt,
             accepted_generation,
             condition,
         }
@@ -306,6 +314,12 @@ impl RotationAccepted {
     #[must_use]
     pub const fn coordinates(&self) -> &RotationCoordinates {
         &self.coordinates
+    }
+
+    /// Returns correlation to the durable authorization decision.
+    #[must_use]
+    pub const fn authorization_receipt(&self) -> &AuthorizationReceiptRef {
+        &self.authorization_receipt
     }
 
     /// Returns the accepted desired generation.
@@ -581,16 +595,67 @@ pub enum ApplicationRejectionReason {
     ProtocolViolation,
 }
 
+/// Authorization lineage required for an accepted application outcome.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApplicationReceiptLineage {
+    authorization_receipt: AuthorizationReceiptRef,
+    desired_generation: Generation,
+}
+
+impl ApplicationReceiptLineage {
+    /// Creates lineage without treating the correlation reference as an authorization capability.
+    #[must_use]
+    pub const fn new(
+        authorization_receipt: AuthorizationReceiptRef,
+        desired_generation: Generation,
+    ) -> Self {
+        Self {
+            authorization_receipt,
+            desired_generation,
+        }
+    }
+
+    /// Returns correlation to the durable authorization decision.
+    #[must_use]
+    pub const fn authorization_receipt(&self) -> &AuthorizationReceiptRef {
+        &self.authorization_receipt
+    }
+
+    /// Returns the desired generation bound to the decision.
+    #[must_use]
+    pub const fn desired_generation(&self) -> Generation {
+        self.desired_generation
+    }
+}
+
 /// Closed application ingress outcome with only valid reason pairings.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// A rejected outcome cannot carry accepted authorization lineage.
+///
+/// ```compile_fail
+/// use rotation_model::{
+///     ApplicationReceiptLineage, ApplicationReceiptOutcome, ApplicationRejectionReason,
+/// };
+///
+/// fn rejected_cannot_carry_lineage(lineage: ApplicationReceiptLineage) {
+///     let _ = ApplicationReceiptOutcome::Rejected(
+///         lineage,
+///         ApplicationRejectionReason::NotAccepted,
+///     );
+/// }
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApplicationReceiptOutcome {
-    /// The inbound observation was committed.
-    Committed,
-    /// The inbound observation was already committed.
-    Duplicate,
-    /// The inbound observation was stale for the attached reason.
-    Stale(ApplicationStaleReason),
-    /// The inbound observation was rejected for the attached reason.
+    /// The inbound observation was committed with accepted lineage.
+    Committed(ApplicationReceiptLineage),
+    /// The inbound observation was already committed with the same accepted lineage.
+    Duplicate(ApplicationReceiptLineage),
+    /// The inbound observation was stale for the attached reason and accepted lineage.
+    Stale {
+        lineage: ApplicationReceiptLineage,
+        reason: ApplicationStaleReason,
+    },
+    /// The inbound observation was rejected before accepted lineage was available.
     Rejected(ApplicationRejectionReason),
 }
 
@@ -634,8 +699,8 @@ impl ApplicationReceiptObservation {
 
     /// Returns the closed application outcome.
     #[must_use]
-    pub const fn outcome(&self) -> ApplicationReceiptOutcome {
-        self.outcome
+    pub const fn outcome(&self) -> &ApplicationReceiptOutcome {
+        &self.outcome
     }
 
     /// Returns the durable ingress commit time.

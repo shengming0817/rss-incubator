@@ -1,8 +1,9 @@
 use std::any::TypeId;
 
 use rotation_model::{
-    AcceptanceCondition, ApplicationReceiptObservation, ApplicationReceiptOutcome,
-    ApplicationStaleReason, ArtifactDigest, CommandAckPosition, CommandAcknowledgement,
+    AcceptanceCondition, ApplicationReceiptLineage, ApplicationReceiptObservation,
+    ApplicationReceiptOutcome, ApplicationRejectionReason, ApplicationStaleReason, ArtifactDigest,
+    AuthorizationReceiptRef, CommandAckPosition, CommandAcknowledgement,
     CommandAcknowledgementOutcome, CommandRef, CommandRejectionReason, CredentialReport, DeviceRef,
     DeviceSequence, FenceEpoch, Generation, IngressEnvelopeRef, PrincipalRef, ReportPosition,
     RotationAccepted, RotationCoordinates, RotationId, RotationIntent, RotationModelError,
@@ -64,13 +65,22 @@ fn generation_and_fence_epoch_are_positive() {
 fn accepted_rotation_matches_the_public_acceptance_shape() {
     let accepted = RotationAccepted::new(
         coordinates(),
+        authorization_receipt(),
         Generation::try_from(8).expect("positive generation"),
         AcceptanceCondition::PendingDevice,
     );
 
     assert_eq!(accepted.coordinates(), &coordinates());
+    assert_eq!(
+        accepted.authorization_receipt().expose(),
+        "0198d5f2-70de-7a2d-b3f4-0123456789ab"
+    );
     assert_eq!(accepted.accepted_generation().get(), 8);
     assert_eq!(accepted.condition(), AcceptanceCondition::PendingDevice);
+
+    let formatted = format!("{accepted:?}");
+    assert!(!formatted.contains("0198d5f2-70de-7a2d-b3f4-0123456789ab"));
+    assert!(formatted.contains("[REDACTED]"));
 }
 
 #[test]
@@ -126,20 +136,64 @@ fn credential_report_preserves_observed_state_discriminants() {
 }
 
 #[test]
-fn application_receipt_has_no_generation_and_preserves_its_outcome() {
+fn lineaged_application_receipts_preserve_receipt_generation_and_reason() {
+    let outcomes = [
+        ApplicationReceiptOutcome::Committed(application_lineage()),
+        ApplicationReceiptOutcome::Duplicate(application_lineage()),
+        ApplicationReceiptOutcome::Stale {
+            lineage: application_lineage(),
+            reason: ApplicationStaleReason::DeviceSequenceStale,
+        },
+    ];
+
+    for outcome in outcomes {
+        let receipt = ApplicationReceiptObservation::new(
+            coordinates(),
+            IngressEnvelopeRef::try_from("envelope-5").expect("fixed ingress envelope"),
+            outcome,
+            UnixTimestamp::new(1_725_000_020),
+        );
+
+        let lineage = match receipt.outcome() {
+            ApplicationReceiptOutcome::Committed(lineage)
+            | ApplicationReceiptOutcome::Duplicate(lineage) => lineage,
+            ApplicationReceiptOutcome::Stale { lineage, reason } => {
+                assert_eq!(*reason, ApplicationStaleReason::DeviceSequenceStale);
+                lineage
+            }
+            ApplicationReceiptOutcome::Rejected(_) => panic!("expected lineaged outcome"),
+        };
+        assert_eq!(
+            lineage.authorization_receipt().expose(),
+            "0198d5f2-70de-7a2d-b3f4-0123456789ab"
+        );
+        assert_eq!(lineage.desired_generation().get(), 8);
+        assert_eq!(receipt.ingress_envelope().expose(), "envelope-5");
+        assert_eq!(receipt.committed_at().get(), 1_725_000_020);
+
+        let formatted = format!("{receipt:?}");
+        assert!(!formatted.contains("0198d5f2-70de-7a2d-b3f4-0123456789ab"));
+        assert!(formatted.contains("[REDACTED]"));
+    }
+}
+
+#[test]
+fn rejected_application_receipt_carries_only_its_rejection_reason() {
     let receipt = ApplicationReceiptObservation::new(
         coordinates(),
-        IngressEnvelopeRef::try_from("envelope-5").expect("fixed ingress envelope"),
-        ApplicationReceiptOutcome::Stale(ApplicationStaleReason::DeviceSequenceStale),
-        UnixTimestamp::new(1_725_000_020),
+        IngressEnvelopeRef::try_from("envelope-6").expect("fixed ingress envelope"),
+        ApplicationReceiptOutcome::Rejected(ApplicationRejectionReason::NotAccepted),
+        UnixTimestamp::new(1_725_000_030),
     );
 
-    assert_eq!(receipt.ingress_envelope().expose(), "envelope-5");
-    assert_eq!(
-        receipt.outcome(),
-        ApplicationReceiptOutcome::Stale(ApplicationStaleReason::DeviceSequenceStale)
-    );
-    assert_eq!(receipt.committed_at().get(), 1_725_000_020);
+    match receipt.outcome() {
+        ApplicationReceiptOutcome::Rejected(reason) => {
+            assert_eq!(*reason, ApplicationRejectionReason::NotAccepted);
+        }
+        ApplicationReceiptOutcome::Committed(_)
+        | ApplicationReceiptOutcome::Duplicate(_)
+        | ApplicationReceiptOutcome::Stale { .. } => panic!("expected rejected outcome"),
+    }
 }
 
 #[test]
@@ -163,5 +217,17 @@ fn coordinates() -> RotationCoordinates {
         RotationId::try_from("rotation-17").expect("fixed rotation ID"),
         TenantRef::try_from("tenant-a").expect("fixed tenant reference"),
         DeviceRef::try_from("device-42").expect("fixed device reference"),
+    )
+}
+
+fn authorization_receipt() -> AuthorizationReceiptRef {
+    AuthorizationReceiptRef::try_from("0198d5f2-70de-7a2d-b3f4-0123456789ab")
+        .expect("fixed authorization receipt reference")
+}
+
+fn application_lineage() -> ApplicationReceiptLineage {
+    ApplicationReceiptLineage::new(
+        authorization_receipt(),
+        Generation::try_from(8).expect("positive generation"),
     )
 }
