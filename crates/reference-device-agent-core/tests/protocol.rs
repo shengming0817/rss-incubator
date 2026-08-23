@@ -1,6 +1,8 @@
-use std::path::PathBuf;
+use std::num::{NonZeroU32, NonZeroUsize};
 
-use reference_device_agent_core::{CredentialGeneration, DeviceIdentity, TopicSet};
+use reference_device_agent_core::{
+    CredentialGeneration, DeviceIdentity, MqttConnectionConfig, TopicSet, ValueError,
+};
 use uuid::Uuid;
 
 #[test]
@@ -39,5 +41,22 @@ fn credential_paths_are_not_accepted_as_artifact_ids() {
         reference_device_agent_core::ArtifactId::try_from("fixture-device-certificate-0001")
             .is_ok()
     );
-    let _ = PathBuf::from("unused");
+}
+
+#[test]
+fn mqtt_coordinates_reject_invalid_host_port_and_client_id() {
+    let expiry = NonZeroU32::new(60).expect("expiry");
+    let capacity = NonZeroUsize::new(1).expect("capacity");
+    assert_eq!(
+        MqttConnectionConfig::new("", 8883, "client", expiry, capacity),
+        Err(ValueError::InvalidHost)
+    );
+    assert_eq!(
+        MqttConnectionConfig::new("localhost", 0, "client", expiry, capacity),
+        Err(ValueError::InvalidPort)
+    );
+    assert_eq!(
+        MqttConnectionConfig::new("localhost", 8883, "", expiry, capacity),
+        Err(ValueError::InvalidClientId)
+    );
 }

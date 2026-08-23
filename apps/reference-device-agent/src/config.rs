@@ -32,6 +32,9 @@ impl RuntimeConfig {
             raw.device_id,
             CredentialGeneration::try_from(raw.credential_generation).map_err(|_| ConfigError)?,
         );
+        if raw.mqtt.client_id != identity.mqtt_client_id() {
+            return Err(ConfigError);
+        }
         let initial_position = InstalledCredentialPosition::new(
             Generation::try_from(raw.initial.desired_generation).map_err(|_| ConfigError)?,
             FenceEpoch::try_from(raw.initial.fence_epoch).map_err(|_| ConfigError)?,

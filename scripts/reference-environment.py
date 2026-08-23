@@ -2480,6 +2480,7 @@ SELECT json_build_object(
                 "reference-device-agent-core",
                 "--test",
                 "mqtt_mtls",
+                "--locked",
                 "--",
                 "--ignored",
                 "--test-threads=1",

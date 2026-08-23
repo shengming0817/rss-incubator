@@ -20,6 +20,8 @@ pub enum CatalogError {
     BindingMismatch,
     #[error("artifact digest does not match its files")]
     DigestMismatch,
+    #[error("artifact credential is revoked")]
+    Revoked,
     #[error(transparent)]
     Credential(#[from] CredentialError),
 }
@@ -59,6 +61,9 @@ impl ArtifactCatalog {
             .find(|entry| entry.artifact_id == command.artifact_id().expose())
             .ok_or(CatalogError::NotFound)?;
         validate_binding(identity, command, &entry)?;
+        if entry.revoked {
+            return Err(CatalogError::Revoked);
+        }
 
         let root = self.path.parent().unwrap_or_else(|| Path::new("."));
         let files = CredentialFiles::new(
@@ -132,7 +137,29 @@ fn safe_catalog_path(root: &Path, raw: &str) -> Result<PathBuf, CatalogError> {
     {
         return Err(CatalogError::Malformed);
     }
-    Ok(root.join(path))
+    let canonical_root = root.canonicalize().map_err(|_| CatalogError::Unavailable)?;
+    let mut candidate = canonical_root.clone();
+    for component in path.components() {
+        let Component::Normal(component) = component else {
+            return Err(CatalogError::Malformed);
+        };
+        candidate.push(component);
+        let metadata = fs::symlink_metadata(&candidate).map_err(|_| CatalogError::Unavailable)?;
+        if metadata.file_type().is_symlink() {
+            return Err(CatalogError::Malformed);
+        }
+    }
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|_| CatalogError::Unavailable)?;
+    if !canonical.starts_with(&canonical_root)
+        || !fs::metadata(&canonical)
+            .map_err(|_| CatalogError::Unavailable)?
+            .is_file()
+    {
+        return Err(CatalogError::Malformed);
+    }
+    Ok(canonical)
 }
 
 #[derive(Deserialize)]
@@ -157,4 +184,5 @@ struct CatalogEntryV1 {
     ca_path: String,
     certificate_path: String,
     private_key_path: String,
+    revoked: bool,
 }

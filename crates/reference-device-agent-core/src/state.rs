@@ -61,6 +61,9 @@ impl StateStore {
             state.verify(identity)?;
             state
         } else {
+            if store.has_committed_revision()? {
+                return Err(StoreError::InvalidState);
+            }
             store.install_revision(position.credential_revision(), initial)?;
             let state = StateV1::initial(identity, position, initial_digest, initial.expires_at);
             store.persist(&state)?;
@@ -135,6 +138,22 @@ impl StateStore {
     fn revision_root(&self, revision: u64) -> PathBuf {
         self.credentials_root().join(format!("revision-{revision}"))
     }
+
+    fn has_committed_revision(&self) -> Result<bool, StoreError> {
+        let entries = match fs::read_dir(self.credentials_root()) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(_) => return Err(StoreError::Unavailable),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|_| StoreError::Unavailable)?;
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("revision-") {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -174,14 +193,69 @@ impl StateV1 {
     }
 
     fn verify(&self, identity: &DeviceIdentity) -> Result<(), StoreError> {
-        let valid = self.schema_version == 1
+        let coordinates_valid = self.schema_version == 1
             && self.identity.tenant_id == identity.tenant()
             && self.identity.device_id == identity.device()
+            && self.identity.credential_generation > 0
             && self.current.desired_generation > 0
             && self.current.fence_epoch > 0
             && self.current.credential_revision > 0
+            && self.current.expires_at > 0
+            && Sha256Digest::try_from(self.current.artifact_digest.clone()).is_ok()
             && self.outbox.len() <= OUTBOX_LIMIT;
-        valid.then_some(()).ok_or(StoreError::InvalidState)
+        if !coordinates_valid {
+            return Err(StoreError::InvalidState);
+        }
+        let mut event_ids = std::collections::HashSet::new();
+        let mut sequences = std::collections::HashSet::new();
+        for entry in &self.outbox {
+            if !event_ids.insert(entry.event_id()) {
+                return Err(StoreError::InvalidState);
+            }
+            let sequence = entry.sequence();
+            if sequence == 0
+                || sequence > self.device_sequence
+                || !sequences.insert(sequence)
+                || !entry.semantic_valid()
+            {
+                return Err(StoreError::InvalidState);
+            }
+            if let Some(report) = entry.report_payload() {
+                let expected_hash = state_hash(
+                    self.identity.tenant_id,
+                    self.identity.device_id,
+                    report.credential_generation,
+                    report.observed_generation,
+                    report.fence_epoch,
+                    report.credential_revision,
+                    &report.artifact_digest,
+                );
+                if report.state_hash != expected_hash
+                    || report.credential_revision != self.current.credential_revision
+                    || report.observed_generation != self.current.desired_generation
+                    || report.fence_epoch != self.current.fence_epoch
+                    || report.artifact_digest != self.current.artifact_digest
+                {
+                    return Err(StoreError::InvalidState);
+                }
+            }
+        }
+        if let Some(last) = &self.last_command
+            && !last.semantic_valid()
+        {
+            return Err(StoreError::InvalidState);
+        }
+        if let Some(revision) = self.reconnect_revision {
+            let matching = revision == self.current.credential_revision
+                && self.outbox.iter().any(|entry| {
+                    matches!(entry, StoredOutbound::ReportBlocked { payload, .. }
+                        if payload.credential_revision == revision)
+                });
+            if !matching {
+                return Err(StoreError::InvalidState);
+            }
+        }
+        Ok(())
     }
 
     pub fn current_generation(&self) -> u64 {
@@ -192,6 +266,9 @@ impl StateV1 {
     }
     pub fn current_revision(&self) -> u64 {
         self.current.credential_revision
+    }
+    pub fn current_artifact_digest(&self) -> &str {
+        &self.current.artifact_digest
     }
     pub fn current_credential_generation(&self) -> u64 {
         self.identity.credential_generation
@@ -221,7 +298,7 @@ impl StateV1 {
     #[allow(clippy::too_many_arguments)]
     pub fn accept(
         &mut self,
-        command_id: String,
+        command_id: &str,
         fingerprint: String,
         generation: u64,
         fence: u64,
@@ -235,8 +312,8 @@ impl StateV1 {
         let ack_sequence = self.device_sequence;
         self.device_sequence = self.device_sequence.saturating_add(1);
         let report_sequence = self.device_sequence;
-        let ack_event = event_id("ack", &command_id);
-        let report_event = event_id("report", &command_id);
+        let ack_event = event_id("ack", command_id);
+        let report_event = event_id("report", command_id);
         let state_hash = state_hash(
             self.identity.tenant_id,
             self.identity.device_id,
@@ -254,23 +331,23 @@ impl StateV1 {
             artifact_digest: artifact_digest.clone(),
             expires_at,
         };
-        self.last_command = Some(StoredCommand {
-            command_id: command_id.clone(),
-            fingerprint,
+        let acknowledgement = StoredAck {
+            command_id: command_id.to_owned(),
             desired_generation: generation,
             fence_epoch: fence,
-            outcome: StoredCommandOutcome::Accepted,
+            device_sequence: ack_sequence,
+            observed_at,
+            rejection: None,
+            activates_revision: Some(revision),
+        };
+        self.last_command = Some(StoredCommand {
+            command_id: command_id.to_owned(),
+            fingerprint,
+            acknowledgement: acknowledgement.clone(),
         });
         self.outbox.push(StoredOutbound::Ack {
             event_id: ack_event,
-            payload: StoredAck {
-                command_id,
-                desired_generation: generation,
-                fence_epoch: fence,
-                device_sequence: ack_sequence,
-                observed_at,
-                rejection: None,
-            },
+            payload: acknowledgement,
         });
         self.outbox.push(StoredOutbound::ReportBlocked {
             event_id: report_event,
@@ -282,13 +359,15 @@ impl StateV1 {
                 state_hash,
                 artifact_digest,
                 expires_at: Some(expires_at),
+                credential_generation,
+                credential_revision: revision,
             },
         });
     }
 
     pub fn reject(
         &mut self,
-        command_id: String,
+        command_id: &str,
         fingerprint: String,
         generation: u64,
         fence: u64,
@@ -296,23 +375,23 @@ impl StateV1 {
         observed_at: i64,
     ) {
         self.device_sequence = self.device_sequence.saturating_add(1);
-        self.last_command = Some(StoredCommand {
-            command_id: command_id.clone(),
-            fingerprint,
+        let acknowledgement = StoredAck {
+            command_id: command_id.to_owned(),
             desired_generation: generation,
             fence_epoch: fence,
-            outcome: StoredCommandOutcome::Rejected(rejection.into()),
+            device_sequence: self.device_sequence,
+            observed_at,
+            rejection: Some(rejection.into()),
+            activates_revision: None,
+        };
+        self.last_command = Some(StoredCommand {
+            command_id: command_id.to_owned(),
+            fingerprint,
+            acknowledgement: acknowledgement.clone(),
         });
         self.outbox.push(StoredOutbound::Ack {
-            event_id: event_id("ack", &command_id),
-            payload: StoredAck {
-                command_id,
-                desired_generation: generation,
-                fence_epoch: fence,
-                device_sequence: self.device_sequence,
-                observed_at,
-                rejection: Some(rejection.into()),
-            },
+            event_id: event_id("ack", command_id),
+            payload: acknowledgement,
         });
     }
 
@@ -337,6 +416,7 @@ impl StateV1 {
                 device_sequence: self.device_sequence,
                 observed_at,
                 rejection: Some(StoredRejection::MalformedCommand),
+                activates_revision: None,
             },
         });
     }
@@ -347,23 +427,11 @@ impl StateV1 {
         })
     }
 
-    pub fn replay_last(&mut self, observed_at: i64) -> Result<(), StoreError> {
+    pub fn replay_last(&mut self) -> Result<(), StoreError> {
         let last = self.last_command.clone().ok_or(StoreError::InvalidState)?;
-        self.device_sequence = self.device_sequence.saturating_add(1);
-        let rejection = match last.outcome {
-            StoredCommandOutcome::Accepted => None,
-            StoredCommandOutcome::Rejected(reason) => Some(reason),
-        };
         self.outbox.push(StoredOutbound::Ack {
             event_id: event_id("ack", &last.command_id),
-            payload: StoredAck {
-                command_id: last.command_id,
-                desired_generation: last.desired_generation,
-                fence_epoch: last.fence_epoch,
-                device_sequence: self.device_sequence,
-                observed_at,
-                rejection,
-            },
+            payload: last.acknowledgement,
         });
         Ok(())
     }
@@ -380,15 +448,15 @@ impl StateV1 {
         else {
             return false;
         };
-        let was_ack = matches!(self.outbox[index], StoredOutbound::Ack { .. });
-        self.outbox.remove(index);
-        if was_ack
-            && self
-                .outbox
-                .iter()
-                .any(|item| matches!(item, StoredOutbound::ReportBlocked { .. }))
+        let confirmed = self.outbox.remove(index);
+        if let StoredOutbound::Ack { payload, .. } = confirmed
+            && let Some(revision) = payload.activates_revision
+            && self.outbox.iter().any(|item| {
+                matches!(item, StoredOutbound::ReportBlocked { payload, .. }
+                    if payload.credential_revision == revision)
+            })
         {
-            self.reconnect_revision = Some(self.current.credential_revision);
+            self.reconnect_revision = Some(revision);
         }
         true
     }
@@ -440,22 +508,20 @@ struct StoredCurrent {
 pub(crate) struct StoredCommand {
     command_id: String,
     fingerprint: String,
-    desired_generation: u64,
-    fence_epoch: u64,
-    outcome: StoredCommandOutcome,
+    acknowledgement: StoredAck,
 }
 
 impl StoredCommand {
     pub fn matches(&self, command_id: &str, fingerprint: &str) -> Option<bool> {
         (self.command_id == command_id).then(|| self.fingerprint == fingerprint)
     }
-}
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", tag = "kind", content = "reason")]
-enum StoredCommandOutcome {
-    Accepted,
-    Rejected(StoredRejection),
+    fn semantic_valid(&self) -> bool {
+        self.command_id == self.acknowledgement.command_id
+            && !self.command_id.is_empty()
+            && Sha256Digest::try_from(self.fingerprint.clone()).is_ok()
+            && self.acknowledgement.semantic_valid()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -497,6 +563,35 @@ impl StoredOutbound {
             Self::ReportBlocked { .. } => None,
         }
     }
+
+    const fn sequence(&self) -> u64 {
+        match self {
+            Self::Ack { payload, .. } => payload.device_sequence,
+            Self::ReportBlocked { payload, .. } | Self::ReportReady { payload, .. } => {
+                payload.device_sequence
+            }
+        }
+    }
+
+    fn semantic_valid(&self) -> bool {
+        let event_valid = valid_event_id(self.event_id());
+        event_valid
+            && match self {
+                Self::Ack { payload, .. } => payload.semantic_valid(),
+                Self::ReportBlocked { payload, .. } | Self::ReportReady { payload, .. } => {
+                    payload.semantic_valid()
+                }
+            }
+    }
+
+    const fn report_payload(&self) -> Option<&StoredReport> {
+        match self {
+            Self::ReportBlocked { payload, .. } | Self::ReportReady { payload, .. } => {
+                Some(payload)
+            }
+            Self::Ack { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -508,6 +603,19 @@ struct StoredAck {
     device_sequence: u64,
     observed_at: i64,
     rejection: Option<StoredRejection>,
+    activates_revision: Option<u64>,
+}
+
+impl StoredAck {
+    fn semantic_valid(&self) -> bool {
+        !self.command_id.is_empty()
+            && self.desired_generation > 0
+            && self.fence_epoch > 0
+            && self.device_sequence > 0
+            && self.observed_at >= 0
+            && self.activates_revision.is_none_or(|revision| revision > 0)
+            && !(self.rejection.is_some() && self.activates_revision.is_some())
+    }
 }
 
 impl From<StoredAck> for AckFact {
@@ -533,6 +641,22 @@ struct StoredReport {
     state_hash: String,
     artifact_digest: String,
     expires_at: Option<i64>,
+    credential_generation: u64,
+    credential_revision: u64,
+}
+
+impl StoredReport {
+    fn semantic_valid(&self) -> bool {
+        self.observed_generation > 0
+            && self.fence_epoch > 0
+            && self.device_sequence > 0
+            && self.observed_at >= 0
+            && self.expires_at.is_some_and(|expires_at| expires_at > 0)
+            && self.credential_generation > 0
+            && self.credential_revision > 0
+            && Sha256Digest::try_from(self.artifact_digest.clone()).is_ok()
+            && Sha256Digest::try_from(self.state_hash.clone()).is_ok()
+    }
 }
 
 impl From<StoredReport> for ReportFact {
@@ -596,6 +720,19 @@ fn event_id(kind: &str, command_id: &str) -> String {
     hasher.update([0]);
     hasher.update(command_id.as_bytes());
     format!("reference-{kind}-{:x}", hasher.finalize())
+}
+
+fn valid_event_id(value: &str) -> bool {
+    let Some((prefix, digest)) = value.rsplit_once('-') else {
+        return false;
+    };
+    matches!(
+        prefix,
+        "reference-ack" | "reference-report" | "reference-rejected"
+    ) && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 #[allow(clippy::too_many_arguments)]

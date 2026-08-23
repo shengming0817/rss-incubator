@@ -27,7 +27,7 @@ fallback.
   "mqtt": {
     "host": "127.0.0.1",
     "port": 8883,
-    "clientId": "reference-device-00000000-0000-0000-0000-000000000101",
+    "clientId": "rss-reference-device-00000000-0000-0000-0000-000000000001-00000000-0000-0000-0000-000000000101",
     "sessionExpirySeconds": 3600,
     "requestCapacity": 16
   },
@@ -45,7 +45,9 @@ fallback.
 Relative paths are resolved from the configuration directory. The artifact catalog maps opaque IDs
 to controlled local files; IDs are never interpreted as paths. Each strict catalog entry binds the
 artifact digest, tenant, device, credential generation, desired generation, fence, intent digest,
-and policy hash. The certificate must chain to the configured CA, match its private key, be currently
+policy hash, and mandatory local `revoked` status. A revoked entry is rejected before any revision is
+installed. Catalog paths and every path component must be regular, non-symlink files contained by
+the catalog root. The certificate must chain to the configured CA, match its private key, be currently
 valid, and contain the exact URI SAN
 `urn:rss:mqtt-device:v1:<tenant>:<device>:<credential-generation>`. Private keys must be owner-only
 on Unix.

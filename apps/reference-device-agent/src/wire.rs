@@ -274,4 +274,44 @@ mod tests {
         assert_eq!(value["reason"], "FenceEpochStale");
         assert_eq!(encoded.event_id, "ack-event");
     }
+
+    #[test]
+    fn report_encoding_uses_the_complete_canonical_dto() {
+        let encoded = encode_outbound(
+            &identity(),
+            OutboundFact::CertificateReported {
+                event_id: "report-event".to_owned(),
+                payload: ReportFact {
+                    observed_generation: 8,
+                    fence_epoch: 3,
+                    device_sequence: 5,
+                    observed_at: 1_800_000_000,
+                    state_hash:
+                        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            .to_owned(),
+                    artifact_digest:
+                        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                            .to_owned(),
+                    expires_at: Some(1_900_000_000),
+                },
+            },
+        )
+        .expect("report");
+        let value: serde_json::Value = serde_json::from_slice(&encoded.payload).expect("JSON");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "artifactDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "deviceId": "00000000-0000-0000-0000-000000000101",
+                "deviceSequence": 5,
+                "expiresAt": 1_900_000_000,
+                "fenceEpoch": 3,
+                "observedAt": 1_800_000_000,
+                "observedGeneration": 8,
+                "stateHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            })
+        );
+        assert_eq!(encoded.event_id, "report-event");
+        assert!(matches!(encoded.kind, OutboundKind::Report));
+    }
 }

@@ -19,6 +19,10 @@ pub enum ValueError {
     InvalidArtifactId,
     #[error("MQTT client id is invalid")]
     InvalidClientId,
+    #[error("MQTT host is invalid")]
+    InvalidHost,
+    #[error("MQTT port is invalid")]
+    InvalidPort,
     #[error("command id is invalid")]
     InvalidCommandId,
     #[error("SHA-256 digest is invalid")]
@@ -89,6 +93,12 @@ impl DeviceIdentity {
             self.device.hyphenated(),
             self.credential_generation.get()
         )
+    }
+
+    /// Stable persistent-session identity bound to tenant and device coordinates.
+    #[must_use]
+    pub fn mqtt_client_id(&self) -> String {
+        format!("rss-reference-device-{}-{}", self.tenant, self.device)
     }
 }
 
@@ -473,12 +483,19 @@ impl MqttConnectionConfig {
         session_expiry_seconds: NonZeroU32,
         request_capacity: NonZeroUsize,
     ) -> Result<Self, ValueError> {
+        let host = host.into();
         let client_id = client_id.into();
+        if host.trim().is_empty() || host.chars().any(char::is_control) {
+            return Err(ValueError::InvalidHost);
+        }
+        if port == 0 {
+            return Err(ValueError::InvalidPort);
+        }
         if client_id.is_empty() || client_id.chars().any(char::is_control) {
             return Err(ValueError::InvalidClientId);
         }
         Ok(Self {
-            host: host.into(),
+            host,
             port,
             client_id,
             session_expiry_seconds,

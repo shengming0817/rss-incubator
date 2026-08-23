@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use rotation_model::InstalledCredentialPosition;
+use rotation_model::{CredentialRevision, InstalledCredentialPosition};
 use sha2::{Digest as _, Sha256};
 
 use crate::catalog::{CatalogError, ResolvedArtifact};
@@ -80,6 +80,11 @@ impl ReferenceDeviceAgent {
             let current_identity = state.current_identity()?;
             let current_files = store.credential_files(state.current_revision());
             validate_credential(&current_files, &current_identity, now_epoch_seconds)?;
+            let digest = compute_artifact_digest(&current_files)
+                .map_err(|_| AgentError::InitialArtifactUnavailable)?;
+            if digest.expose() != state.current_artifact_digest() {
+                return Err(AgentError::Store(StoreError::InvalidState));
+            }
             (store, state)
         } else {
             let initial = validate_credential(
@@ -134,21 +139,23 @@ impl ReferenceDeviceAgent {
         {
             if same_payload {
                 if !self.state.has_command_ack(command.command_id().expose()) {
-                    self.state.reserve_outbox(1)?;
-                    self.state.replay_last(observed_at)?;
-                    self.store.persist(&self.state)?;
+                    let mut candidate = self.state.clone();
+                    candidate.reserve_outbox(1)?;
+                    candidate.replay_last()?;
+                    self.persist_candidate(candidate)?;
                 }
                 return Ok(ApplyOutcome::Duplicate);
             }
-            self.state.reserve_outbox(1)?;
-            self.state.reject_conflicting_replay(
+            let mut candidate = self.state.clone();
+            candidate.reserve_outbox(1)?;
+            candidate.reject_conflicting_replay(
                 command.command_id().expose().to_owned(),
                 &fingerprint,
                 command.desired_generation().get(),
                 command.fence_epoch().get(),
                 observed_at,
             );
-            self.store.persist(&self.state)?;
+            self.persist_candidate(candidate)?;
             return Ok(ApplyOutcome::Rejected(CommandRejection::MalformedCommand));
         }
         if command.deadline_epoch_seconds().get() <= now_epoch_seconds {
@@ -211,16 +218,25 @@ impl ReferenceDeviceAgent {
     ///
     /// Returns an error for an unknown event or a persistence failure.
     pub fn confirm_outbound(&mut self, event_id: &str) -> Result<(), AgentError> {
-        if !self.state.confirm_outbound(event_id) {
+        let mut candidate = self.state.clone();
+        if !candidate.confirm_outbound(event_id) {
             return Err(AgentError::UnknownOutbound);
         }
-        self.store.persist(&self.state)?;
+        self.persist_candidate(candidate)?;
         Ok(())
     }
 
-    #[must_use]
-    pub fn reconnect_revision(&self) -> Option<u64> {
-        self.state.reconnect_revision()
+    /// Returns the committed revision that must establish the next MQTT session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if durable state contains an invalid revision.
+    pub fn reconnect_revision(&self) -> Result<Option<CredentialRevision>, AgentError> {
+        self.state
+            .reconnect_revision()
+            .map(CredentialRevision::try_from)
+            .transpose()
+            .map_err(|_| AgentError::Store(StoreError::InvalidState))
     }
 
     /// Records that the committed credential revision established its MQTT session.
@@ -228,11 +244,15 @@ impl ReferenceDeviceAgent {
     /// # Errors
     ///
     /// Returns an error when the revision is not awaiting reconnect or persistence fails.
-    pub fn mark_current_credential_connected(&mut self, revision: u64) -> Result<(), AgentError> {
-        if !self.state.mark_reconnected(revision) {
+    pub fn mark_current_credential_connected(
+        &mut self,
+        revision: CredentialRevision,
+    ) -> Result<(), AgentError> {
+        let mut candidate = self.state.clone();
+        if !candidate.mark_reconnected(revision.get()) {
             return Err(AgentError::UnexpectedReconnect);
         }
-        self.store.persist(&self.state)?;
+        self.persist_candidate(candidate)?;
         Ok(())
     }
 
@@ -257,12 +277,13 @@ impl ReferenceDeviceAgent {
         artifact: &ResolvedArtifact,
         observed_at: i64,
     ) -> Result<ApplyOutcome, AgentError> {
-        self.state.reserve_outbox(2)?;
-        let revision = next_revision(&self.state)?;
+        let mut candidate = self.state.clone();
+        candidate.reserve_outbox(2)?;
+        let revision = next_revision(&candidate)?;
         self.store
             .install_revision(revision, &artifact.credential)?;
-        self.state.accept(
-            command.command_id().expose().to_owned(),
+        candidate.accept(
+            command.command_id().expose(),
             fingerprint,
             command.desired_generation().get(),
             command.fence_epoch().get(),
@@ -272,7 +293,7 @@ impl ReferenceDeviceAgent {
             artifact.credential.expires_at,
             observed_at,
         );
-        self.store.persist(&self.state)?;
+        self.persist_candidate(candidate)?;
         Ok(ApplyOutcome::Accepted)
     }
 
@@ -283,17 +304,24 @@ impl ReferenceDeviceAgent {
         rejection: CommandRejection,
         observed_at: i64,
     ) -> Result<ApplyOutcome, AgentError> {
-        self.state.reserve_outbox(1)?;
-        self.state.reject(
-            command.command_id().expose().to_owned(),
+        let mut candidate = self.state.clone();
+        candidate.reserve_outbox(1)?;
+        candidate.reject(
+            command.command_id().expose(),
             fingerprint,
             command.desired_generation().get(),
             command.fence_epoch().get(),
             rejection,
             observed_at,
         );
-        self.store.persist(&self.state)?;
+        self.persist_candidate(candidate)?;
         Ok(ApplyOutcome::Rejected(rejection))
+    }
+
+    fn persist_candidate(&mut self, candidate: StateV1) -> Result<(), AgentError> {
+        self.store.persist(&candidate)?;
+        self.state = candidate;
+        Ok(())
     }
 }
 
@@ -327,6 +355,7 @@ fn catalog_rejection(error: &CatalogError) -> CommandRejection {
         CatalogError::NotFound | CatalogError::Unavailable => CommandRejection::ArtifactUnavailable,
         CatalogError::DigestMismatch => CommandRejection::ArtifactDigestMismatch,
         CatalogError::BindingMismatch
+        | CatalogError::Revoked
         | CatalogError::Credential(
             CredentialError::Untrusted | CredentialError::IdentityMismatch,
         ) => CommandRejection::PolicyRejected,

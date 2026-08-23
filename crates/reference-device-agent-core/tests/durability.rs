@@ -38,7 +38,13 @@ fn accepted_command_is_durable_and_report_waits_for_ack_and_new_session() {
     assert!(matches!(ack, OutboundFact::CommandAcknowledged { .. }));
     agent.confirm_outbound(ack.event_id()).expect("confirm ACK");
     assert!(agent.next_outbound().is_none());
-    assert_eq!(agent.reconnect_revision(), Some(2));
+    assert_eq!(
+        agent
+            .reconnect_revision()
+            .expect("revision")
+            .map(CredentialRevision::get),
+        Some(2)
+    );
     assert_eq!(
         agent
             .current_identity()
@@ -52,7 +58,7 @@ fn accepted_command_is_durable_and_report_waits_for_ack_and_new_session() {
     let mut reopened = fixture.open_agent();
     assert!(reopened.next_outbound().is_none());
     reopened
-        .mark_current_credential_connected(2)
+        .mark_current_credential_connected(CredentialRevision::try_from(2).expect("revision"))
         .expect("new credential connected");
     let report = reopened.next_outbound().expect("report after reconnect");
     assert!(matches!(report, OutboundFact::CertificateReported { .. }));
@@ -70,10 +76,7 @@ fn accepted_command_is_durable_and_report_waits_for_ack_and_new_session() {
             .expect("duplicate"),
         ApplyOutcome::Duplicate
     );
-    assert!(matches!(
-        reopened.next_outbound().expect("replayed ACK"),
-        OutboundFact::CommandAcknowledged { .. }
-    ));
+    assert_eq!(reopened.next_outbound().expect("replayed ACK"), ack);
 }
 
 #[test]
@@ -92,6 +95,28 @@ fn unknown_state_fields_fail_closed_without_resetting_state() {
 }
 
 #[test]
+fn semantically_corrupt_known_state_fields_fail_closed() {
+    let fixture = Fixture::new();
+    let (mut agent, command) = fixture.agent_and_command();
+    agent
+        .apply_command(&fixture.command_topic(), &command, NOW)
+        .expect("accept");
+    drop(agent);
+    let state_path = fixture.root.path().join("state/state.v1.json");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_path).expect("state")).expect("JSON");
+    state["outbox"][1]["payload"]["stateHash"] = serde_json::json!(
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    );
+    fs::write(&state_path, serde_json::to_vec(&state).expect("serialize")).expect("corrupt");
+
+    assert!(matches!(
+        ReferenceDeviceAgent::open(fixture.config(), NOW),
+        Err(AgentError::Store(StoreError::InvalidState))
+    ));
+}
+
+#[test]
 fn stale_temporary_files_are_recovered_without_becoming_current() {
     let fixture = Fixture::new_unopened();
     let state_root = fixture.root.path().join("state");
@@ -100,7 +125,7 @@ fn stale_temporary_files_are_recovered_without_becoming_current() {
 
     let agent = fixture.open_agent();
 
-    assert_eq!(agent.reconnect_revision(), None);
+    assert_eq!(agent.reconnect_revision().expect("revision"), None);
     assert!(state_root.join("credentials/revision-1").is_dir());
     assert!(!state_root.join("credentials/.revision-1.staging").exists());
     assert!(!state_root.join("state.v1.json.tmp").exists());
@@ -295,6 +320,179 @@ fn stale_fence_is_checked_before_stale_generation() {
     );
 }
 
+#[test]
+fn only_the_accepted_command_ack_can_unlock_credential_reconnect() {
+    let fixture = Fixture::new();
+    let (mut agent, accepted) = fixture.agent_and_command();
+    let rejected = fixture.command(
+        "rejected-before-rotation",
+        &fixture.artifact_id,
+        &fixture.artifact_digest,
+        NOW + 600,
+        2,
+        2,
+    );
+    assert_eq!(
+        agent
+            .apply_command("rss/v1/wrong", &rejected, NOW)
+            .expect("reject"),
+        ApplyOutcome::Rejected(CommandRejection::MalformedCommand)
+    );
+    assert_eq!(
+        agent
+            .apply_command(&fixture.command_topic(), &accepted, NOW)
+            .expect("accept"),
+        ApplyOutcome::Accepted
+    );
+
+    let rejection_ack = agent.next_outbound().expect("rejection ACK");
+    agent
+        .confirm_outbound(rejection_ack.event_id())
+        .expect("confirm rejection ACK");
+    assert_eq!(agent.reconnect_revision().expect("revision"), None);
+
+    let accepted_ack = agent.next_outbound().expect("accepted ACK");
+    agent
+        .confirm_outbound(accepted_ack.event_id())
+        .expect("confirm accepted ACK");
+    assert_eq!(
+        agent
+            .reconnect_revision()
+            .expect("revision")
+            .map(CredentialRevision::get),
+        Some(2)
+    );
+}
+
+#[test]
+fn missing_manifest_with_a_committed_revision_fails_closed() {
+    let fixture = Fixture::new();
+    let state_path = fixture.root.path().join("state/state.v1.json");
+    fs::remove_file(&state_path).expect("remove state manifest");
+
+    let error = ReferenceDeviceAgent::open(fixture.config(), NOW).expect_err("must not reset");
+
+    assert!(matches!(error, AgentError::Store(StoreError::InvalidState)));
+    assert!(!state_path.exists());
+    assert!(
+        fixture
+            .root
+            .path()
+            .join("state/credentials/revision-1")
+            .is_dir()
+    );
+}
+
+#[test]
+fn revoked_catalog_artifact_is_rejected_without_installing_it() {
+    let fixture = Fixture::new();
+    fixture.set_catalog_revoked(true);
+    let (mut agent, command) = fixture.agent_and_command();
+
+    assert_eq!(
+        agent
+            .apply_command(&fixture.command_topic(), &command, NOW)
+            .expect("revoked rejection"),
+        ApplyOutcome::Rejected(CommandRejection::PolicyRejected)
+    );
+    assert_eq!(
+        agent
+            .current_identity()
+            .expect("identity")
+            .credential_generation()
+            .get(),
+        1
+    );
+    assert!(
+        !fixture
+            .root
+            .path()
+            .join("state/credentials/revision-2")
+            .exists()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn catalog_symlink_escape_is_rejected() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new();
+    let catalog_certificate = fixture.root.path().join("catalog/material/certificate.pem");
+    let outside = fixture.root.path().join("outside-certificate.pem");
+    fs::copy(&catalog_certificate, &outside).expect("outside certificate");
+    fs::remove_file(&catalog_certificate).expect("remove catalog certificate");
+    symlink(&outside, &catalog_certificate).expect("symlink");
+    let (mut agent, command) = fixture.agent_and_command();
+
+    assert_eq!(
+        agent
+            .apply_command(&fixture.command_topic(), &command, NOW)
+            .expect("symlink rejection"),
+        ApplyOutcome::Rejected(CommandRejection::MalformedCommand)
+    );
+    assert!(
+        !fixture
+            .root
+            .path()
+            .join("state/credentials/revision-2")
+            .exists()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn insecure_catalog_private_key_permissions_are_rejected() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = Fixture::new();
+    let private_key = fixture.root.path().join("catalog/material/private-key.pem");
+    fs::set_permissions(&private_key, fs::Permissions::from_mode(0o644))
+        .expect("widen key permissions");
+    let (mut agent, command) = fixture.agent_and_command();
+
+    assert_eq!(
+        agent
+            .apply_command(&fixture.command_topic(), &command, NOW)
+            .expect("permission rejection"),
+        ApplyOutcome::Rejected(CommandRejection::DeviceFailure)
+    );
+    assert!(
+        !fixture
+            .root
+            .path()
+            .join("state/credentials/revision-2")
+            .exists()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_persistence_does_not_advance_in_memory_protocol_state() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = Fixture::new();
+    let (mut agent, command) = fixture.agent_and_command();
+    agent
+        .apply_command(&fixture.command_topic(), &command, NOW)
+        .expect("accept");
+    let acknowledgement = agent.next_outbound().expect("ACK");
+    let state_root = fixture.root.path().join("state");
+    fs::set_permissions(&state_root, fs::Permissions::from_mode(0o500))
+        .expect("make state read-only");
+
+    let result = agent.confirm_outbound(acknowledgement.event_id());
+
+    fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700))
+        .expect("restore state permissions");
+    assert!(matches!(
+        result,
+        Err(AgentError::Store(StoreError::Unavailable))
+    ));
+    assert_eq!(agent.next_outbound(), Some(acknowledgement));
+    assert_eq!(agent.reconnect_revision().expect("revision"), None);
+}
+
 struct Fixture {
     root: TempDir,
     device: Uuid,
@@ -346,7 +544,8 @@ impl Fixture {
                 "policyHash": POLICY,
                 "caPath": "material/ca.pem",
                 "certificatePath": "material/certificate.pem",
-                "privateKeyPath": "material/private-key.pem"
+                "privateKeyPath": "material/private-key.pem",
+                "revoked": false
             }]
         });
         fs::create_dir_all(root.path().join("catalog")).expect("catalog dir");
@@ -405,6 +604,15 @@ impl Fixture {
             serde_json::from_slice(&fs::read(&path).expect("catalog")).expect("catalog JSON");
         catalog["artifacts"][0]["desiredGeneration"] = serde_json::json!(generation);
         catalog["artifacts"][0]["fenceEpoch"] = serde_json::json!(fence);
+        fs::write(path, serde_json::to_vec(&catalog).expect("catalog JSON"))
+            .expect("rewrite catalog");
+    }
+
+    fn set_catalog_revoked(&self, revoked: bool) {
+        let path = self.root.path().join("catalog/catalog.json");
+        let mut catalog: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("catalog")).expect("catalog JSON");
+        catalog["artifacts"][0]["revoked"] = serde_json::json!(revoked);
         fs::write(path, serde_json::to_vec(&catalog).expect("catalog JSON"))
             .expect("rewrite catalog");
     }

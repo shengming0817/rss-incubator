@@ -79,6 +79,14 @@ jobs:
           docker version
           docker compose version
 
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
+          rustc --version --verbose
+          cargo --version --verbose
+
       - name: Run disposable reference environment journey
         timeout-minutes: 18
         env:

@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use config::RuntimeConfig;
-use reference_device_agent_core::{MqttEvent, MqttSession, ReferenceDeviceAgent, TopicSet};
+use reference_device_agent_core::{
+    AgentError, MqttError, MqttEvent, MqttSession, ReferenceDeviceAgent, TopicSet,
+};
 use wire::{OutboundKind, decode_command, encode_outbound};
 
 #[derive(Debug, thiserror::Error)]
@@ -14,8 +16,20 @@ enum MainError {
     Usage,
     #[error(transparent)]
     Config(#[from] config::ConfigError),
-    #[error("reference device agent failed closed")]
-    Agent,
+    #[error(transparent)]
+    Agent(#[from] AgentError),
+    #[error(transparent)]
+    Session(#[from] SessionError),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum SessionError {
+    #[error(transparent)]
+    Agent(#[from] AgentError),
+    #[error(transparent)]
+    Mqtt(#[from] MqttError),
+    #[error(transparent)]
+    Wire(#[from] wire::WireError),
 }
 
 #[tokio::main]
@@ -26,12 +40,21 @@ async fn main() -> Result<(), MainError> {
         return Err(MainError::Usage);
     }
     let runtime = RuntimeConfig::load(&config_path)?;
-    let mut agent =
-        ReferenceDeviceAgent::open(runtime.agent, now()).map_err(|_| MainError::Agent)?;
+    let mut agent = ReferenceDeviceAgent::open(runtime.agent, now())?;
+    let mut retry_delay = Duration::from_secs(1);
 
     loop {
-        if run_session(&runtime.mqtt, &mut agent).await.is_err() {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+        match run_session(&runtime.mqtt, &mut agent).await {
+            Ok(()) => retry_delay = Duration::from_secs(1),
+            Err(SessionError::Mqtt(MqttError::Transport)) => {
+                eprintln!(
+                    "reference-device-agent event=mqtt_transport_retry delay_seconds={}",
+                    retry_delay.as_secs()
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(30));
+            }
+            Err(error) => return Err(error.into()),
         }
     }
 }
@@ -39,11 +62,10 @@ async fn main() -> Result<(), MainError> {
 async fn run_session(
     mqtt: &reference_device_agent_core::MqttConnectionConfig,
     agent: &mut ReferenceDeviceAgent,
-) -> Result<(), MainError> {
-    let session_identity = agent.current_identity().map_err(|_| MainError::Agent)?;
+) -> Result<(), SessionError> {
+    let session_identity = agent.current_identity()?;
     let session_topics = TopicSet::new(&session_identity);
-    let mut session = MqttSession::new(mqtt, &agent.current_credentials(), session_topics.clone())
-        .map_err(|_| MainError::Agent)?;
+    let mut session = MqttSession::new(mqtt, &agent.current_credentials(), session_topics.clone())?;
     let mut publish_pending = false;
     let mut reconnect_after_unsubscribe = false;
 
@@ -52,50 +74,35 @@ async fn run_session(
             && !reconnect_after_unsubscribe
             && let Some(outbound) = agent.next_outbound()
         {
-            let encoded =
-                encode_outbound(&session_identity, outbound).map_err(|_| MainError::Agent)?;
+            let encoded = encode_outbound(&session_identity, outbound)?;
             let topic = match encoded.kind {
                 OutboundKind::Acknowledgement => session_topics.command_acknowledged(),
                 OutboundKind::Report => session_topics.certificate_reported(),
             };
             session
                 .publish(&encoded.event_id, topic, encoded.payload)
-                .await
-                .map_err(|_| MainError::Agent)?;
+                .await?;
             publish_pending = true;
         }
 
-        match session.poll().await.map_err(|_| MainError::Agent)? {
+        match session.poll().await? {
             MqttEvent::Connected { .. } => {
-                if let Some(revision) = agent.reconnect_revision() {
-                    agent
-                        .mark_current_credential_connected(revision)
-                        .map_err(|_| MainError::Agent)?;
+                if let Some(revision) = agent.reconnect_revision()? {
+                    agent.mark_current_credential_connected(revision)?;
                 }
-                session.subscribe().await.map_err(|_| MainError::Agent)?;
+                session.subscribe().await?;
             }
             MqttEvent::Command(delivery) => {
-                let identity = agent.current_identity().map_err(|_| MainError::Agent)?;
-                let command = decode_command(&identity, delivery.command_id(), delivery.payload())
-                    .map_err(|_| MainError::Agent)?;
-                agent
-                    .apply_command(delivery.topic(), &command, now())
-                    .map_err(|_| MainError::Agent)?;
-                session
-                    .acknowledge_command(&delivery)
-                    .await
-                    .map_err(|_| MainError::Agent)?;
+                let identity = agent.current_identity()?;
+                let command = decode_command(&identity, delivery.command_id(), delivery.payload())?;
+                agent.apply_command(delivery.topic(), &command, now())?;
+                session.acknowledge_command(&delivery).await?;
             }
             MqttEvent::OutboundAcknowledged { event_id } => {
-                agent
-                    .confirm_outbound(&event_id)
-                    .map_err(|_| MainError::Agent)?;
+                agent.confirm_outbound(&event_id)?;
                 publish_pending = false;
-                if agent.reconnect_revision().is_some() {
-                    session
-                        .unsubscribe_command()
-                        .await
-                        .map_err(|_| MainError::Agent)?;
+                if agent.reconnect_revision()?.is_some() {
+                    session.unsubscribe_command().await?;
                     reconnect_after_unsubscribe = true;
                 }
             }
