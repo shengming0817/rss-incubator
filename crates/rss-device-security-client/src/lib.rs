@@ -40,10 +40,20 @@ use uuid::Uuid;
 /// Product correlation plus the public device UUID expected at this mapping boundary.
 ///
 /// This is shape context only; it does not authenticate a tenant or device.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct MappingContext {
     coordinates: RotationCoordinates,
     expected_device_id: Uuid,
+}
+
+impl fmt::Debug for MappingContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MappingContext")
+            .field("coordinates", &self.coordinates)
+            .field("expected_device_id", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl MappingContext {
@@ -109,8 +119,8 @@ impl StatusObservation {
     }
 
     #[must_use]
-    pub fn into_response(self) -> IdentityDeviceCertificateStatusGetResponse {
-        self.response
+    pub fn into_parts(self) -> (MappingContext, IdentityDeviceCertificateStatusGetResponse) {
+        (self.context, self.response)
     }
 }
 
@@ -138,37 +148,59 @@ impl CorrelatedCommand {
     }
 
     #[must_use]
-    pub fn into_request(self) -> IdentityApplyDeviceCertificateRequest {
-        self.request
+    pub fn into_parts(
+        self,
+    ) -> (
+        MappingContext,
+        CommandRef,
+        IdentityApplyDeviceCertificateRequest,
+    ) {
+        (self.context, self.envelope, self.request)
     }
 }
 
 /// Mapping rejection for invalid boundary correlations or product references.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum MappingError {
     DeviceMismatch { expected: Uuid, actual: Uuid },
     NegativeDeviceSequence(i64),
     InvalidProductReference(RotationModelError),
 }
 
-impl fmt::Display for MappingError {
+impl fmt::Debug for MappingError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::DeviceMismatch { expected, actual } => {
-                write!(
-                    formatter,
-                    "device mismatch: expected {expected}, got {actual}"
-                )
+            Self::DeviceMismatch { .. } => {
+                formatter.write_str("MappingError::DeviceMismatch([REDACTED])")
             }
-            Self::NegativeDeviceSequence(value) => {
-                write!(formatter, "device sequence must not be negative: {value}")
+            Self::NegativeDeviceSequence(_) => {
+                formatter.write_str("MappingError::NegativeDeviceSequence([REDACTED])")
             }
-            Self::InvalidProductReference(error) => error.fmt(formatter),
+            Self::InvalidProductReference(_) => {
+                formatter.write_str("MappingError::InvalidProductReference([REDACTED])")
+            }
         }
     }
 }
 
-impl std::error::Error for MappingError {}
+impl fmt::Display for MappingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeviceMismatch { .. } => formatter.write_str("device mismatch"),
+            Self::NegativeDeviceSequence(_) => formatter.write_str("negative device sequence"),
+            Self::InvalidProductReference(_) => formatter.write_str("invalid product reference"),
+        }
+    }
+}
+
+impl std::error::Error for MappingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidProductReference(error) => Some(error),
+            Self::DeviceMismatch { .. } | Self::NegativeDeviceSequence(_) => None,
+        }
+    }
+}
 
 impl From<RotationModelError> for MappingError {
     fn from(value: RotationModelError) -> Self {

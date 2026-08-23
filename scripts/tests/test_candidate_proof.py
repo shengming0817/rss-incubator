@@ -463,11 +463,13 @@ class CandidateBundleTests(unittest.TestCase):
         candidate_proof.validate_device_security_dependency_policy(
             repository, [(package, valid)]
         )
+        candidate_proof.validate_device_security_dependency_policy(
+            repository, [(package, dict(valid, req="=0.1.1"))]
+        )
 
         invalid = []
         for field, value in (
             ("name", "rss-platform"),
-            ("req", "=0.1.1"),
             ("kind", "dev"),
             ("rename", "contracts"),
             ("optional", True),

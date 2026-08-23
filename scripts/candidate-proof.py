@@ -484,7 +484,6 @@ def validate_device_security_dependency_policy(repository: Path, dependencies):
     device_security_dependency = device_security_dependencies[0]
     if (
         device_security_dependency["name"] != DEVICE_SECURITY_CONTRACT
-        or device_security_dependency["req"] != "=0.1.0"
         or device_security_dependency["kind"] is not None
         or device_security_dependency["rename"] is not None
         or device_security_dependency["optional"]
@@ -492,7 +491,7 @@ def validate_device_security_dependency_policy(repository: Path, dependencies):
     ):
         raise ProofError(
             "rss-device-security-client RSS dependency policy differs from "
-            "rss-device-security-contracts@=0.1.0"
+            "the canonical rss-device-security-contracts edge"
         )
 
 

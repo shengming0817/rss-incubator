@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::Debug, num::NonZeroU64, str::FromStr};
+use std::{collections::HashMap, error::Error as _, fmt::Debug, num::NonZeroU64, str::FromStr};
 
 use rotation_model::{
     AcceptanceCondition, ApplicationReceiptOutcome, ApplicationRejectionReason,
@@ -159,6 +159,9 @@ fn status_and_command_preserve_canonical_dtos_and_external_envelope() {
     );
     assert_eq!(observation.context().expected_device_id(), device_id());
     assert_eq!(observation.response().data.observed_generation, 3);
+    let (status_context, status_response) = observation.into_parts();
+    assert_eq!(status_context.expected_device_id(), device_id());
+    assert_eq!(status_response.data.observed_generation, 3);
 
     let correlated = correlate_command(
         context(),
@@ -168,6 +171,45 @@ fn status_and_command_preserve_canonical_dtos_and_external_envelope() {
     .expect("matching device");
     assert_eq!(correlated.envelope().expose(), "command-envelope-1");
     assert_eq!(correlated.request().device_id, device_id());
+    let (command_context, envelope, request) = correlated.into_parts();
+    assert_eq!(command_context.expected_device_id(), device_id());
+    assert_eq!(envelope.expose(), "command-envelope-1");
+    assert_eq!(request.device_id, device_id());
+}
+
+#[test]
+fn boundary_formatting_is_redacted_and_invalid_reference_keeps_its_source() {
+    let context = context();
+    assert!(!format!("{context:?}").contains(DEVICE));
+
+    let mismatch = MappingError::DeviceMismatch {
+        expected: device_id(),
+        actual: parsed(OTHER_DEVICE),
+    };
+    for rendered in [format!("{mismatch:?}"), mismatch.to_string()] {
+        assert!(!rendered.contains(DEVICE));
+        assert!(!rendered.contains(OTHER_DEVICE));
+    }
+
+    let negative = MappingError::NegativeDeviceSequence(-73);
+    for rendered in [format!("{negative:?}"), negative.to_string()] {
+        assert!(!rendered.contains("-73"));
+    }
+
+    let lower = rotation_model::RotationModelError::ControlCharacter {
+        kind: "command_ref",
+    };
+    let wrapped = MappingError::InvalidProductReference(lower);
+    assert_eq!(wrapped.to_string(), "invalid product reference");
+    let source = wrapped
+        .source()
+        .expect("product validation remains the source");
+    assert_eq!(source.to_string(), lower.to_string());
+    assert!(
+        source
+            .downcast_ref::<rotation_model::RotationModelError>()
+            .is_some()
+    );
 }
 
 #[test]
