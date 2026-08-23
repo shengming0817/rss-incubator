@@ -191,8 +191,10 @@ class CandidateBundleTests(unittest.TestCase):
             "-exec rustfmt --edition 2024 --check {} +",
             ci_job,
         )
-        self.assertIn("if: ${{ github.event_name == 'workflow_dispatch' }}", candidate_job)
+        self.assertNotIn("if: ${{ github.event_name == 'workflow_dispatch' }}", candidate_job)
         self.assertIn("needs: ci", candidate_job)
+        self.assertIn("github.event.pull_request.head.sha || github.sha", candidate_job)
+        self.assertIn(".incubatorRevision == $incubator_revision", candidate_job)
         self.assertEqual(workflow.count("python3 scripts/candidate-proof.py"), 1)
         self.assertIn("python3 scripts/candidate-proof.py", candidate_job)
 

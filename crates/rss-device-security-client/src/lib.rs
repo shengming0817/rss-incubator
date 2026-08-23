@@ -215,6 +215,10 @@ impl DiagnosticKind {
             Self::UnknownStatus => "unknown_status",
         }
     }
+
+    const fn retryable(self) -> bool {
+        matches!(self, Self::RateLimited | Self::Upstream)
+    }
 }
 
 /// Sanitized diagnostic; upstream payloads and provider messages are never retained.
@@ -252,10 +256,18 @@ impl Diagnostic {
     pub const fn retryable(&self) -> bool {
         self.retryable
     }
-    fn new(kind: DiagnosticKind, request_id: Option<String>, retryable: bool) -> Self {
+    fn new(kind: DiagnosticKind, request_id: Option<String>) -> Self {
         Self {
             kind,
             request_id,
+            retryable: kind.retryable(),
+        }
+    }
+
+    fn conflict(request_id: String, retryable: bool) -> Self {
+        Self {
+            kind: DiagnosticKind::Conflict,
+            request_id: Some(request_id),
             retryable,
         }
     }
@@ -291,8 +303,7 @@ pub enum PolicyResponse {
 /// Decodes only documented policy status/body pairs into a closed projection.
 #[must_use]
 pub fn decode_policy_response(status: u16, body: &[u8]) -> PolicyResponse {
-    let malformed =
-        || PolicyResponse::Rejected(Diagnostic::new(DiagnosticKind::Malformed, None, false));
+    let malformed = || PolicyResponse::Rejected(Diagnostic::new(DiagnosticKind::Malformed, None));
     match status {
         200 => serde_json::from_slice::<IdentityDeviceCertificatePolicyPutResponse>(body).map_or_else(
             |_| malformed(),
@@ -306,9 +317,9 @@ pub fn decode_policy_response(status: u16, body: &[u8]) -> PolicyResponse {
             }),
         ),
         400 => serde_json::from_slice::<IdentityDeviceCertificatePolicyPutValidationResponse>(body)
-            .map_or_else(|_| malformed(), |value| PolicyResponse::Rejected(Diagnostic::new(DiagnosticKind::Validation, Some(value.error.request_id), false))),
+            .map_or_else(|_| malformed(), |value| PolicyResponse::Rejected(Diagnostic::new(DiagnosticKind::Validation, Some(value.error.request_id)))),
         404 => serde_json::from_slice::<IdentityDeviceCertificatePolicyPutNotFoundResponse>(body)
-            .map_or_else(|_| malformed(), |value| PolicyResponse::Rejected(Diagnostic::new(DiagnosticKind::NotFound, Some(value.error.request_id), false))),
+            .map_or_else(|_| malformed(), |value| PolicyResponse::Rejected(Diagnostic::new(DiagnosticKind::NotFound, Some(value.error.request_id)))),
         409 => serde_json::from_slice::<IdentityDeviceCertificatePolicyPutConflictResponse>(body)
             .map_or_else(|_| malformed(), |value| {
                 use rss_device_security_contracts::policy_put::IdentityDeviceCertificatePolicyPutConflictError;
@@ -316,13 +327,13 @@ pub fn decode_policy_response(status: u16, body: &[u8]) -> PolicyResponse {
                     IdentityDeviceCertificatePolicyPutConflictError::ErrCoreVersionConflict { request_id, retryable, .. }
                     | IdentityDeviceCertificatePolicyPutConflictError::ErrCoreConflict { request_id, retryable, .. } => (request_id, retryable),
                 };
-                PolicyResponse::Rejected(Diagnostic::new(DiagnosticKind::Conflict, Some(request_id), retryable))
+                PolicyResponse::Rejected(Diagnostic::conflict(request_id, retryable))
             }),
-        401 => PolicyResponse::Rejected(Diagnostic::new(DiagnosticKind::Unauthorized, None, false)),
-        403 => PolicyResponse::Rejected(Diagnostic::new(DiagnosticKind::Forbidden, None, false)),
-        429 => PolicyResponse::Rejected(Diagnostic::new(DiagnosticKind::RateLimited, None, false)),
-        500..=599 => PolicyResponse::Rejected(Diagnostic::new(DiagnosticKind::Upstream, None, false)),
-        _ => PolicyResponse::Rejected(Diagnostic::new(DiagnosticKind::UnknownStatus, None, false)),
+        401 => PolicyResponse::Rejected(Diagnostic::new(DiagnosticKind::Unauthorized, None)),
+        403 => PolicyResponse::Rejected(Diagnostic::new(DiagnosticKind::Forbidden, None)),
+        429 => PolicyResponse::Rejected(Diagnostic::new(DiagnosticKind::RateLimited, None)),
+        500..=599 => PolicyResponse::Rejected(Diagnostic::new(DiagnosticKind::Upstream, None)),
+        _ => PolicyResponse::Rejected(Diagnostic::new(DiagnosticKind::UnknownStatus, None)),
     }
 }
 
@@ -445,11 +456,11 @@ pub fn decode_status_response(status: u16, body: &[u8]) -> StatusResponse {
             500..=599 => DiagnosticKind::Upstream,
             _ => DiagnosticKind::UnknownStatus,
         };
-        return StatusResponse::Rejected(Diagnostic::new(kind, None, false));
+        return StatusResponse::Rejected(Diagnostic::new(kind, None));
     }
     let Ok(value) = serde_json::from_slice::<IdentityDeviceCertificateStatusGetResponse>(body)
     else {
-        return StatusResponse::Rejected(Diagnostic::new(DiagnosticKind::Malformed, None, false));
+        return StatusResponse::Rejected(Diagnostic::new(DiagnosticKind::Malformed, None));
     };
     let desired_generation = value
         .data
@@ -475,16 +486,12 @@ pub fn decode_status_response(status: u16, body: &[u8]) -> StatusResponse {
             },
         });
     let Ok(observed_generation) = u64::try_from(value.data.observed_generation) else {
-        return StatusResponse::Rejected(Diagnostic::new(DiagnosticKind::Malformed, None, false));
+        return StatusResponse::Rejected(Diagnostic::new(DiagnosticKind::Malformed, None));
     };
     let mut conditions = Vec::with_capacity(value.data.conditions.len());
     for condition in value.data.conditions {
         let Ok(generation) = u64::try_from(condition.observed_generation) else {
-            return StatusResponse::Rejected(Diagnostic::new(
-                DiagnosticKind::Malformed,
-                None,
-                false,
-            ));
+            return StatusResponse::Rejected(Diagnostic::new(DiagnosticKind::Malformed, None));
         };
         conditions.push(ConditionProjection {
             observed_generation: generation,

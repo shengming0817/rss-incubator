@@ -17,13 +17,15 @@ Commands:
 - `audit --input FILE|-` validates and re-renders the correlation in one schema-v1 successful
   `rotate` result. It is not a server-side durable audit/history query.
 
-Remote issuer, JWKS, token, and RSS endpoints require HTTPS. HTTP is accepted only for an OIDC
-loopback redirect; tests use an injected HTTP port rather than weakening the production URL gate.
+Remote issuer, JWKS, token, and RSS endpoints require HTTPS. `--rss-base-url` must be an origin
+without path, query, fragment, or user information so canonical API paths cannot be silently
+rewritten. HTTP is accepted only for an OIDC loopback redirect; tests use an injected HTTP port
+rather than weakening the production URL gate.
 `--ca-certificate` adds an explicit private CA to the shared rustls trust store without disabling
 certificate verification. Login waits at most 120 seconds; API calls wait at
 most 30 seconds; every response is capped at 1 MiB. The CLI has no password grant, token argument or
 persistence, automatic mutation retry, certificate/private-key output, raw provider error, or raw
-response-body diagnostic.
+response-body diagnostic. Every failure includes a closed `stage` value without exposing secrets.
 
 Exit codes are stable: `0` success, `2` CLI/input, `3` authentication/authorization, `4` typed
 validation/not-found/conflict, `5` transport/upstream, and `6` malformed or untrusted response.

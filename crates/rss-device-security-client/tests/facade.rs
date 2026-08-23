@@ -72,6 +72,11 @@ fn policy_decode_is_typed_and_closed_for_all_status_classes() {
         match decode_policy_response(status, body) {
             PolicyResponse::Rejected(value) => {
                 assert_eq!(value.kind(), kind);
+                assert_eq!(
+                    value.retryable(),
+                    matches!(kind, DiagnosticKind::RateLimited | DiagnosticKind::Upstream)
+                        || kind == DiagnosticKind::Conflict
+                );
                 assert!(!format!("{value:?}").contains("bait"));
             }
             other @ PolicyResponse::Accepted(_) => panic!("unexpected {other:?}"),
@@ -95,5 +100,22 @@ fn status_decode_preserves_canonical_fields_without_ready_inference() {
             assert_eq!(value.conditions()[0].type_(), ConditionType::PendingDevice);
         }
         other @ StatusResponse::Rejected(_) => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn transient_status_failures_have_closed_retry_semantics() {
+    for (status, expected) in [
+        (401, false),
+        (403, false),
+        (404, false),
+        (429, true),
+        (503, true),
+    ] {
+        let StatusResponse::Rejected(diagnostic) = decode_status_response(status, b"provider-bait")
+        else {
+            panic!("expected rejection");
+        };
+        assert_eq!(diagnostic.retryable(), expected, "status {status}");
     }
 }

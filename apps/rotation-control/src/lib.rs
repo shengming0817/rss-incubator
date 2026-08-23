@@ -9,10 +9,16 @@ use std::{
 };
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, error::ErrorKind};
 use futures_util::StreamExt;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
-use openidconnect::PkceCodeChallenge;
+use openidconnect::{
+    AdditionalClaims, ClientId, IdToken, IssuerUrl, Nonce, PkceCodeChallenge,
+    core::{
+        CoreGenderClaim, CoreIdTokenVerifier, CoreJsonWebKeySet, CoreJweContentEncryptionAlgorithm,
+        CoreJwsSigningAlgorithm,
+    },
+};
 use reqwest::{
     Client, Method, StatusCode,
     header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue},
@@ -35,6 +41,8 @@ use uuid::Uuid;
 pub const LOGIN_TIMEOUT: Duration = Duration::from_mins(2);
 pub const API_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const CALLBACK_CONNECTION_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_CALLBACK_BYTES: usize = 8192;
 
 #[derive(Parser, Debug)]
 #[command(name = "rotation-control", version, disable_help_subcommand = true)]
@@ -172,36 +180,22 @@ struct Discovery {
 #[derive(Deserialize)]
 struct TokenWire {
     access_token: String,
-    id_token: String,
+    id_token: RotationIdToken,
 }
 
-#[derive(Deserialize)]
-struct IdClaims {
-    iss: String,
-    aud: Audience,
-    exp: u64,
-    nonce: String,
-    #[serde(default)]
-    azp: Option<String>,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct TenantClaims {
     #[serde(rename = "tenantId")]
     tenant_id: String,
 }
+impl AdditionalClaims for TenantClaims {}
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum Audience {
-    One(String),
-    Many(Vec<String>),
-}
-
-impl Audience {
-    fn contains(&self, expected: &str) -> bool {
-        match self {
-            Self::One(value) => value == expected,
-            Self::Many(values) => values.iter().any(|value| value == expected),
-        }
-    }
-}
+type RotationIdToken = IdToken<
+    TenantClaims,
+    CoreGenderClaim,
+    CoreJweContentEncryptionAlgorithm,
+    CoreJwsSigningAlgorithm,
+>;
 
 const CALLBACK_INVALID: &str = "callback_invalid";
 const INVALID_DISCOVERY: &str = "invalid_discovery";
@@ -212,6 +206,7 @@ const RESPONSE_OVERSIZE: &str = "response_oversize";
 pub struct AppError {
     code: &'static str,
     class: ErrorClass,
+    stage: ErrorStage,
     request_id: Option<String>,
     retryable: bool,
 }
@@ -225,11 +220,41 @@ enum ErrorClass {
     Untrusted,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ErrorStage {
+    Input,
+    Runtime,
+    Discovery,
+    Callback,
+    TokenExchange,
+    Jwks,
+    IdToken,
+    Api,
+    Transport,
+}
+
+impl ErrorStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::Runtime => "runtime",
+            Self::Discovery => "discovery",
+            Self::Callback => "callback",
+            Self::TokenExchange => "token_exchange",
+            Self::Jwks => "jwks",
+            Self::IdToken => "id_token",
+            Self::Api => "api",
+            Self::Transport => "transport",
+        }
+    }
+}
+
 impl AppError {
     fn input(code: &'static str) -> Self {
         Self {
             code,
             class: ErrorClass::Input,
+            stage: ErrorStage::Input,
             request_id: None,
             retryable: false,
         }
@@ -238,6 +263,7 @@ impl AppError {
         Self {
             code,
             class: ErrorClass::Auth,
+            stage: ErrorStage::IdToken,
             request_id: None,
             retryable: false,
         }
@@ -246,6 +272,7 @@ impl AppError {
         Self {
             code,
             class: ErrorClass::Transport,
+            stage: ErrorStage::Transport,
             request_id: None,
             retryable,
         }
@@ -254,6 +281,7 @@ impl AppError {
         Self {
             code,
             class: ErrorClass::Untrusted,
+            stage: ErrorStage::Transport,
             request_id: None,
             retryable: false,
         }
@@ -270,9 +298,14 @@ impl AppError {
         Self {
             code: value.kind().code(),
             class,
+            stage: ErrorStage::Api,
             request_id: value.request_id().map(ToOwned::to_owned),
             retryable: value.retryable(),
         }
+    }
+    fn at(mut self, stage: ErrorStage) -> Self {
+        self.stage = stage;
+        self
     }
     fn exit_code(&self) -> i32 {
         match self.class {
@@ -284,7 +317,7 @@ impl AppError {
         }
     }
     fn render(&self) -> Value {
-        json!({"schemaVersion":"1","outcome":"error","diagnostic":{"category":match self.class { ErrorClass::Input => "input", ErrorClass::Auth => "auth", ErrorClass::Typed => "typed", ErrorClass::Transport => "transport", ErrorClass::Untrusted => "untrusted" },"code":self.code,"retryable":self.retryable,"requestId":self.request_id}})
+        json!({"schemaVersion":"1","outcome":"error","diagnostic":{"category":match self.class { ErrorClass::Input => "input", ErrorClass::Auth => "auth", ErrorClass::Typed => "typed", ErrorClass::Transport => "transport", ErrorClass::Untrusted => "untrusted" },"stage":self.stage.as_str(),"code":self.code,"retryable":self.retryable,"requestId":self.request_id}})
     }
 }
 
@@ -321,7 +354,9 @@ pub fn main_entry() -> i32 {
     else {
         println!(
             "{}",
-            AppError::transport("runtime_unavailable", false).render()
+            AppError::transport("runtime_unavailable", false)
+                .at(ErrorStage::Runtime)
+                .render()
         );
         return 5;
     };
@@ -384,6 +419,19 @@ fn secure_remote_url(url: &Url, allow_loopback_http: bool) -> Result<(), AppErro
     }
 }
 
+fn validate_rss_base_url(url: &Url) -> Result<(), AppError> {
+    secure_remote_url(url, false)?;
+    if url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(AppError::input("rss_base_url_must_be_origin"));
+    }
+    Ok(())
+}
+
 struct HttpReply {
     status: u16,
     body: Vec<u8>,
@@ -417,8 +465,8 @@ trait ClockPort: Send + Sync {
 trait IdTokenVerifierPort: Send + Sync {
     fn verify(
         &self,
-        token: &str,
-        jwks: &JwkSet,
+        token: &RotationIdToken,
+        jwks: &CoreJsonWebKeySet,
         auth: &AuthArgs,
         nonce: &str,
         now: u64,
@@ -439,7 +487,8 @@ trait CallbackPort: Send + Sync {
 struct SystemBrowser;
 impl BrowserPort for SystemBrowser {
     fn open(&self, url: &Url) -> Result<(), AppError> {
-        webbrowser::open(url.as_str()).map_err(|_| AppError::auth("browser_launch_failed"))
+        webbrowser::open(url.as_str())
+            .map_err(|_| AppError::auth("browser_launch_failed").at(ErrorStage::Callback))
     }
 }
 
@@ -456,8 +505,8 @@ struct Rs256IdTokenVerifier;
 impl IdTokenVerifierPort for Rs256IdTokenVerifier {
     fn verify(
         &self,
-        token: &str,
-        jwks: &JwkSet,
+        token: &RotationIdToken,
+        jwks: &CoreJsonWebKeySet,
         auth: &AuthArgs,
         nonce: &str,
         now: u64,
@@ -486,11 +535,9 @@ impl CallbackPort for LoopbackCallback {
                 .ok_or_else(|| AppError::input("invalid_redirect"))?,
         ))
         .await
-        .map_err(|_| AppError::auth("callback_bind_failed"))?;
+        .map_err(|_| AppError::auth("callback_bind_failed").at(ErrorStage::Callback))?;
         browser.open(authorize)?;
-        timeout(LOGIN_TIMEOUT, receive_callback(listener, redirect, state))
-            .await
-            .map_err(|_| AppError::auth("login_timeout"))?
+        receive_callback(listener, redirect, state).await
     }
 }
 
@@ -593,6 +640,43 @@ async fn authenticate(
     callback: &dyn CallbackPort,
     verifier: &dyn IdTokenVerifierPort,
 ) -> Result<TokenSet, AppError> {
+    authenticate_with_limit(
+        auth,
+        http,
+        browser,
+        clock,
+        callback,
+        verifier,
+        LOGIN_TIMEOUT,
+    )
+    .await
+}
+
+async fn authenticate_with_limit(
+    auth: &AuthArgs,
+    http: &dyn HttpPort,
+    browser: &dyn BrowserPort,
+    clock: &dyn ClockPort,
+    callback: &dyn CallbackPort,
+    verifier: &dyn IdTokenVerifierPort,
+    limit: Duration,
+) -> Result<TokenSet, AppError> {
+    timeout(
+        limit,
+        authenticate_inner(auth, http, browser, clock, callback, verifier),
+    )
+    .await
+    .map_err(|_| AppError::auth("login_timeout").at(ErrorStage::Callback))?
+}
+
+async fn authenticate_inner(
+    auth: &AuthArgs,
+    http: &dyn HttpPort,
+    browser: &dyn BrowserPort,
+    clock: &dyn ClockPort,
+    callback: &dyn CallbackPort,
+    verifier: &dyn IdTokenVerifierPort,
+) -> Result<TokenSet, AppError> {
     secure_remote_url(&auth.issuer, false)?;
     secure_remote_url(&auth.redirect_uri, true)?;
     let callback_host = auth
@@ -606,17 +690,22 @@ async fn authenticate(
     {
         return Err(AppError::input("redirect_not_loopback"));
     }
-    let discovery: Discovery =
-        fetch_json(http, discovery_url(&auth.issuer)?, LOGIN_TIMEOUT).await?;
+    let discovery: Discovery = fetch_json(
+        http,
+        discovery_url(&auth.issuer)?,
+        LOGIN_TIMEOUT,
+        ErrorStage::Discovery,
+    )
+    .await?;
     if discovery.issuer != auth.issuer.as_str() {
-        return Err(AppError::auth("issuer_mismatch"));
+        return Err(AppError::auth("issuer_mismatch").at(ErrorStage::Discovery));
     }
     let authorization_endpoint = Url::parse(&discovery.authorization_endpoint)
-        .map_err(|_| AppError::untrusted(INVALID_DISCOVERY))?;
+        .map_err(|_| AppError::untrusted(INVALID_DISCOVERY).at(ErrorStage::Discovery))?;
     let token_endpoint = Url::parse(&discovery.token_endpoint)
-        .map_err(|_| AppError::untrusted(INVALID_DISCOVERY))?;
-    let jwks_uri =
-        Url::parse(&discovery.jwks_uri).map_err(|_| AppError::untrusted(INVALID_DISCOVERY))?;
+        .map_err(|_| AppError::untrusted(INVALID_DISCOVERY).at(ErrorStage::Discovery))?;
+    let jwks_uri = Url::parse(&discovery.jwks_uri)
+        .map_err(|_| AppError::untrusted(INVALID_DISCOVERY).at(ErrorStage::Discovery))?;
     secure_remote_url(&authorization_endpoint, false)?;
     secure_remote_url(&token_endpoint, false)?;
     secure_remote_url(&jwks_uri, false)?;
@@ -636,7 +725,8 @@ async fn authenticate(
         .append_pair("code_challenge_method", "S256");
     let code = callback
         .authorize(&auth.redirect_uri, &state, &authorize, browser)
-        .await?;
+        .await
+        .map_err(|error| error.at(ErrorStage::Callback))?;
     let response = http
         .post_form(
             token_endpoint,
@@ -652,11 +742,12 @@ async fn authenticate(
             ],
             LOGIN_TIMEOUT,
         )
-        .await?;
+        .await
+        .map_err(|error| error.at(ErrorStage::TokenExchange))?;
     classify_token_response(response.status)?;
     let token: TokenWire = serde_json::from_slice(&response.body)
-        .map_err(|_| AppError::untrusted("malformed_json"))?;
-    let jwks: JwkSet = fetch_json(http, jwks_uri, LOGIN_TIMEOUT).await?;
+        .map_err(|_| AppError::untrusted("malformed_json").at(ErrorStage::TokenExchange))?;
+    let jwks = fetch_jwks(http, jwks_uri).await?;
     verifier.verify(&token.id_token, &jwks, auth, &nonce, clock.unix_seconds()?)?;
     Ok(TokenSet {
         access_token: token.access_token,
@@ -666,12 +757,13 @@ async fn authenticate(
 fn classify_token_response(status: u16) -> Result<(), AppError> {
     match status {
         200 => Ok(()),
-        400 | 401 | 403 => Err(AppError::auth("token_exchange_rejected")),
-        429 | 500..=599 => Err(AppError::transport(
-            "token_upstream_rejected",
-            status >= 500,
-        )),
-        _ => Err(AppError::untrusted("token_status_unknown")),
+        400 | 401 | 403 => {
+            Err(AppError::auth("token_exchange_rejected").at(ErrorStage::TokenExchange))
+        }
+        429 | 500..=599 => {
+            Err(AppError::transport("token_upstream_rejected", true).at(ErrorStage::TokenExchange))
+        }
+        _ => Err(AppError::untrusted("token_status_unknown").at(ErrorStage::TokenExchange)),
     }
 }
 
@@ -680,101 +772,152 @@ async fn receive_callback(
     redirect: &Url,
     expected_state: &str,
 ) -> Result<String, AppError> {
-    let (mut socket, _) = listener
-        .accept()
-        .await
-        .map_err(|_| AppError::auth("callback_failed"))?;
-    let mut request = vec![0_u8; 8192];
-    let count = socket
-        .read(&mut request)
-        .await
-        .map_err(|_| AppError::auth("callback_failed"))?;
-    let first = std::str::from_utf8(&request[..count])
-        .map_err(|_| AppError::auth(CALLBACK_INVALID))?
-        .lines()
-        .next()
-        .ok_or_else(|| AppError::auth(CALLBACK_INVALID))?;
-    let target = first
-        .strip_prefix("GET ")
-        .and_then(|value| value.split_once(' ').map(|pair| pair.0))
-        .ok_or_else(|| AppError::auth(CALLBACK_INVALID))?;
-    let callback = redirect
-        .join(target)
-        .map_err(|_| AppError::auth(CALLBACK_INVALID))?;
-    if callback.path() != redirect.path() {
-        return Err(AppError::auth(CALLBACK_INVALID));
+    loop {
+        let (mut socket, _) = listener
+            .accept()
+            .await
+            .map_err(|_| AppError::auth("callback_failed").at(ErrorStage::Callback))?;
+        let outcome = read_callback_headers(&mut socket)
+            .await
+            .ok()
+            .and_then(|request| parse_callback_request(&request, redirect, expected_state));
+        match outcome {
+            Some(CallbackOutcome::Code(code)) => {
+                write_callback_page(&mut socket, "200 OK", "Authentication complete.").await;
+                return Ok(code);
+            }
+            Some(CallbackOutcome::Rejected) => {
+                write_callback_page(&mut socket, "400 Bad Request", "Authentication rejected.")
+                    .await;
+                return Err(AppError::auth("authorization_rejected").at(ErrorStage::Callback));
+            }
+            None => {
+                write_callback_page(&mut socket, "400 Bad Request", "Authentication ignored.")
+                    .await;
+            }
+        }
     }
-    let params = callback
+}
+
+enum CallbackOutcome {
+    Code(String),
+    Rejected,
+}
+
+async fn read_callback_headers(socket: &mut tokio::net::TcpStream) -> Result<Vec<u8>, AppError> {
+    let mut request = Vec::new();
+    while request.len() < MAX_CALLBACK_BYTES {
+        let remaining = MAX_CALLBACK_BYTES - request.len();
+        let mut chunk = vec![0_u8; remaining.min(1024)];
+        let count = timeout(CALLBACK_CONNECTION_TIMEOUT, socket.read(&mut chunk))
+            .await
+            .map_err(|_| AppError::auth("callback_connection_timeout").at(ErrorStage::Callback))?
+            .map_err(|_| AppError::auth("callback_failed").at(ErrorStage::Callback))?;
+        if count == 0 {
+            break;
+        }
+        request.extend_from_slice(&chunk[..count]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            return Ok(request);
+        }
+    }
+    Err(AppError::auth(CALLBACK_INVALID).at(ErrorStage::Callback))
+}
+
+fn parse_callback_request(
+    request: &[u8],
+    redirect: &Url,
+    expected_state: &str,
+) -> Option<CallbackOutcome> {
+    let first = std::str::from_utf8(request).ok()?.split("\r\n").next()?;
+    let mut parts = first.split_whitespace();
+    if parts.next()? != "GET" {
+        return None;
+    }
+    let target = parts.next()?;
+    if parts.next()? != "HTTP/1.1"
+        || parts.next().is_some()
+        || !target.starts_with('/')
+        || target.starts_with("//")
+    {
+        return None;
+    }
+    let callback = redirect.join(target).ok()?;
+    if callback.scheme() != redirect.scheme()
+        || callback.host_str() != redirect.host_str()
+        || callback.port_or_known_default() != redirect.port_or_known_default()
+        || callback.path() != redirect.path()
+        || callback.fragment().is_some()
+    {
+        return None;
+    }
+    let mut states = callback
         .query_pairs()
-        .collect::<std::collections::HashMap<_, _>>();
-    if params.get("state").map(std::convert::AsRef::as_ref) != Some(expected_state) {
-        return Err(AppError::auth("state_mismatch"));
+        .filter(|(key, _)| key == "state")
+        .map(|(_, value)| value);
+    if states.next().as_deref() != Some(expected_state) || states.next().is_some() {
+        return None;
     }
-    let code = params
-        .get("code")
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| AppError::auth("authorization_rejected"))?
-        .to_string();
-    let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 24\r\nConnection: close\r\n\r\nAuthentication complete.").await;
-    Ok(code)
+    if callback.query_pairs().any(|(key, _)| key == "error") {
+        return Some(CallbackOutcome::Rejected);
+    }
+    let mut codes = callback
+        .query_pairs()
+        .filter(|(key, _)| key == "code")
+        .map(|(_, value)| value);
+    let code = codes.next()?.to_string();
+    if code.is_empty() || codes.next().is_some() {
+        return None;
+    }
+    Some(CallbackOutcome::Code(code))
+}
+
+async fn write_callback_page(socket: &mut tokio::net::TcpStream, status: &str, body: &str) {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = socket.write_all(response.as_bytes()).await;
 }
 
 fn validate_id_token(
-    token: &str,
-    jwks: &JwkSet,
+    token: &RotationIdToken,
+    jwks: &CoreJsonWebKeySet,
     auth: &AuthArgs,
     nonce: &str,
     now: u64,
 ) -> Result<(), AppError> {
-    let header = decode_header(token).map_err(|_| AppError::auth("id_token_invalid"))?;
-    if header.alg != Algorithm::RS256 {
-        return Err(AppError::auth("id_token_algorithm"));
-    }
-    let kid = header
-        .kid
-        .ok_or_else(|| AppError::auth("id_token_key_missing"))?;
-    let jwk = jwks
-        .find(&kid)
-        .ok_or_else(|| AppError::auth("id_token_key_unknown"))?;
-    let key = DecodingKey::from_jwk(jwk).map_err(|_| AppError::auth("id_token_key_invalid"))?;
-    let mut validation = Validation::new(Algorithm::RS256);
-    validation.validate_aud = false;
-    validation.set_issuer(&[auth.issuer.as_str()]);
-    let claims = decode::<IdClaims>(token, &key, &validation)
-        .map_err(|_| AppError::auth("id_token_invalid"))?
-        .claims;
-    validate_claims(&claims, auth, nonce, now)
-}
-
-fn validate_claims(
-    claims: &IdClaims,
-    auth: &AuthArgs,
-    nonce: &str,
-    now: u64,
-) -> Result<(), AppError> {
-    if claims.iss != auth.issuer.as_str() {
-        return Err(AppError::auth("issuer_mismatch"));
-    }
-    if claims.exp <= now {
-        return Err(AppError::auth("token_expired"));
-    }
-    if !claims.aud.contains(&auth.client_id) {
-        return Err(AppError::auth("audience_mismatch"));
-    }
-    if matches!(claims.aud, Audience::Many(_)) && claims.azp.as_deref() != Some(&auth.client_id) {
+    let now = i64::try_from(now)
+        .ok()
+        .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0))
+        .ok_or_else(|| AppError::auth("clock_invalid"))?;
+    let verifier = CoreIdTokenVerifier::new_public_client(
+        ClientId::new(auth.client_id.clone()),
+        IssuerUrl::new(auth.issuer.to_string()).map_err(|_| AppError::auth("issuer_invalid"))?,
+        jwks.clone(),
+    )
+    .set_allowed_algs([CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256])
+    .set_other_audience_verifier_fn(|_| true)
+    .set_time_fn(move || now)
+    .set_issue_time_verifier_fn(move |issued_at| {
+        (issued_at <= now)
+            .then_some(())
+            .ok_or_else(|| "ID token issue time is in the future".to_owned())
+    });
+    let claims = token
+        .claims(&verifier, &Nonce::new(nonce.to_owned()))
+        .map_err(|_| AppError::auth("id_token_invalid"))?;
+    let client_id = ClientId::new(auth.client_id.clone());
+    if claims.audiences().len() > 1 && claims.authorized_party() != Some(&client_id) {
         return Err(AppError::auth("authorized_party_mismatch"));
     }
     if claims
-        .azp
-        .as_deref()
-        .is_some_and(|azp| azp != auth.client_id)
+        .authorized_party()
+        .is_some_and(|authorized_party| authorized_party != &client_id)
     {
         return Err(AppError::auth("authorized_party_mismatch"));
     }
-    if claims.nonce != nonce {
-        return Err(AppError::auth("nonce_mismatch"));
-    }
-    if claims.tenant_id != auth.tenant_id {
+    if claims.additional_claims().tenant_id != auth.tenant_id {
         return Err(AppError::auth("tenant_mismatch"));
     }
     Ok(())
@@ -801,7 +944,7 @@ async fn rotate_with_ports(
     callback: &dyn CallbackPort,
     verifier: &dyn IdTokenVerifierPort,
 ) -> Result<Value, AppError> {
-    secure_remote_url(&args.rss_base_url, false)?;
+    validate_rss_base_url(&args.rss_base_url)?;
     let policy = read_policy(&args.input)?;
     let token = authenticate(&args.auth, http, browser, clock, callback, verifier).await?;
     let request_id = Uuid::new_v4();
@@ -852,7 +995,7 @@ async fn status_with_ports(
     callback: &dyn CallbackPort,
     verifier: &dyn IdTokenVerifierPort,
 ) -> Result<Value, AppError> {
-    secure_remote_url(&args.rss_base_url, false)?;
+    validate_rss_base_url(&args.rss_base_url)?;
     let token = authenticate(&args.auth, http, browser, clock, callback, verifier).await?;
     let request_id = Uuid::new_v4();
     let correlation_id = Uuid::new_v4();
@@ -885,7 +1028,7 @@ async fn send_api(
     http: &dyn HttpPort,
 ) -> Result<(u16, Vec<u8>), AppError> {
     let url = base
-        .join(prepared.path().trim_start_matches('/'))
+        .join(prepared.path())
         .map_err(|_| AppError::input("invalid_rss_url"))?;
     let method = Method::from_bytes(prepared.method().as_bytes())
         .map_err(|_| AppError::untrusted("invalid_operation"))?;
@@ -915,7 +1058,8 @@ async fn send_api(
             prepared.body().map(<[u8]>::to_vec),
             API_TIMEOUT,
         )
-        .await?;
+        .await
+        .map_err(|error| error.at(ErrorStage::Api))?;
     Ok((response.status, response.body))
 }
 
@@ -942,12 +1086,50 @@ async fn fetch_json<T: for<'de> Deserialize<'de>>(
     http: &dyn HttpPort,
     url: Url,
     limit: Duration,
+    stage: ErrorStage,
 ) -> Result<T, AppError> {
-    let response = http.get(url, limit).await?;
+    let response = http
+        .get(url, limit)
+        .await
+        .map_err(|error| error.at(stage))?;
     if response.status != StatusCode::OK.as_u16() {
-        return Err(AppError::transport("upstream_rejected", false));
+        return Err(AppError::transport("upstream_rejected", false).at(stage));
     }
-    serde_json::from_slice(&response.body).map_err(|_| AppError::untrusted("malformed_json"))
+    serde_json::from_slice(&response.body)
+        .map_err(|_| AppError::untrusted("malformed_json").at(stage))
+}
+
+async fn fetch_jwks(http: &dyn HttpPort, url: Url) -> Result<CoreJsonWebKeySet, AppError> {
+    let response = http
+        .get(url, LOGIN_TIMEOUT)
+        .await
+        .map_err(|error| error.at(ErrorStage::Jwks))?;
+    if response.status != StatusCode::OK.as_u16() {
+        return Err(AppError::transport("upstream_rejected", false).at(ErrorStage::Jwks));
+    }
+    validate_jwks_key_operations(&response.body)?;
+    serde_json::from_slice(&response.body)
+        .map_err(|_| AppError::untrusted("malformed_json").at(ErrorStage::Jwks))
+}
+
+fn validate_jwks_key_operations(body: &[u8]) -> Result<(), AppError> {
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|_| AppError::untrusted("malformed_json").at(ErrorStage::Jwks))?;
+    let keys = value
+        .get("keys")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AppError::untrusted("malformed_json").at(ErrorStage::Jwks))?;
+    for key in keys {
+        if let Some(operations) = key.get("key_ops") {
+            let Some(operations) = operations.as_array() else {
+                return Err(AppError::auth("id_token_key_usage").at(ErrorStage::Jwks));
+            };
+            if operations.len() != 1 || operations[0].as_str() != Some("verify") {
+                return Err(AppError::auth("id_token_key_usage").at(ErrorStage::Jwks));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Deserialize, Serialize)]
@@ -994,6 +1176,10 @@ fn audit(input: &str) -> Result<Value, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openidconnect::{
+        Audience, IdTokenClaims, JsonWebKeyId, PrivateSigningKey, StandardClaims,
+        SubjectIdentifier, core::CoreRsaPrivateSigningKey,
+    };
     use std::{collections::VecDeque, sync::Mutex};
     use tempfile::tempdir;
     use wiremock::{
@@ -1011,15 +1197,40 @@ mod tests {
         }
     }
 
-    fn claims() -> IdClaims {
-        IdClaims {
-            iss: "https://issuer.example/".to_owned(),
-            aud: Audience::One("client".to_owned()),
-            exp: 2_000,
-            nonce: "nonce".to_owned(),
-            azp: None,
-            tenant_id: "tenant".to_owned(),
-        }
+    fn signed_token(
+        audiences: Vec<Audience>,
+        authorized_party: Option<ClientId>,
+        tenant: &str,
+    ) -> (RotationIdToken, CoreJsonWebKeySet) {
+        let key = CoreRsaPrivateSigningKey::from_pem(
+            include_str!("../tests/test-rsa-private.pem"),
+            Some(JsonWebKeyId::new("test-key".to_owned())),
+        )
+        .expect("test key");
+        let claims = IdTokenClaims::new(
+            IssuerUrl::new("https://issuer.example/".to_owned()).expect("issuer"),
+            audiences,
+            DateTime::from_timestamp(2_000, 0).expect("expiry"),
+            DateTime::from_timestamp(900, 0).expect("issued"),
+            StandardClaims::new(SubjectIdentifier::new("subject".to_owned())),
+            TenantClaims {
+                tenant_id: tenant.to_owned(),
+            },
+        )
+        .set_nonce(Some(Nonce::new("nonce".to_owned())))
+        .set_authorized_party(authorized_party);
+        let token = RotationIdToken::new(
+            claims,
+            &key,
+            CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256,
+            None,
+            None,
+        )
+        .expect("token");
+        (
+            token,
+            CoreJsonWebKeySet::new(vec![key.as_verification_key()]),
+        )
     }
 
     struct FakeBrowser;
@@ -1062,13 +1273,12 @@ mod tests {
     impl IdTokenVerifierPort for FakeVerifier {
         fn verify(
             &self,
-            token: &str,
-            _: &JwkSet,
+            _: &RotationIdToken,
+            _: &CoreJsonWebKeySet,
             _: &AuthArgs,
             _: &str,
             now: u64,
         ) -> Result<(), AppError> {
-            assert_eq!(token, "id-token-bait");
             assert_eq!(now, 1_000);
             Ok(())
         }
@@ -1122,6 +1332,37 @@ mod tests {
             self.next()
         }
     }
+    struct DelayedHttp {
+        inner: FakeHttp,
+        delay: Duration,
+    }
+    #[async_trait]
+    impl HttpPort for DelayedHttp {
+        async fn get(&self, url: Url, limit: Duration) -> Result<HttpReply, AppError> {
+            tokio::time::sleep(self.delay).await;
+            self.inner.get(url, limit).await
+        }
+        async fn post_form(
+            &self,
+            url: Url,
+            form: Vec<(String, String)>,
+            limit: Duration,
+        ) -> Result<HttpReply, AppError> {
+            tokio::time::sleep(self.delay).await;
+            self.inner.post_form(url, form, limit).await
+        }
+        async fn send(
+            &self,
+            method: Method,
+            url: Url,
+            headers: HeaderMap,
+            body: Option<Vec<u8>>,
+            limit: Duration,
+        ) -> Result<HttpReply, AppError> {
+            tokio::time::sleep(self.delay).await;
+            self.inner.send(method, url, headers, body, limit).await
+        }
+    }
     fn reply(status: u16, body: &Value) -> HttpReply {
         HttpReply {
             status,
@@ -1129,6 +1370,7 @@ mod tests {
         }
     }
     fn auth_replies(api_status: u16, api_body: &Value) -> Vec<Result<HttpReply, AppError>> {
+        let (id_token, _) = signed_token(vec![Audience::new("client".to_owned())], None, "tenant");
         vec![
             Ok(reply(
                 200,
@@ -1136,7 +1378,7 @@ mod tests {
             )),
             Ok(reply(
                 200,
-                &json!({"access_token":"token-bait","id_token":"id-token-bait"}),
+                &json!({"access_token":"token-bait","id_token":id_token}),
             )),
             Ok(reply(200, &json!({"keys":[]}))),
             Ok(reply(api_status, api_body)),
@@ -1173,43 +1415,192 @@ mod tests {
     }
 
     #[test]
-    fn claims_reject_issuer_audience_nonce_expiry_and_tenant_mismatch() {
-        assert!(validate_claims(&claims(), &auth(), "nonce", 1_000).is_ok());
-        let mut value = claims();
-        value.iss = "https://other.example/".to_owned();
-        assert_eq!(
-            validate_claims(&value, &auth(), "nonce", 1_000)
-                .expect_err("issuer")
-                .code,
-            "issuer_mismatch"
+    fn typed_verifier_rejects_audience_nonce_expiry_tenant_and_authorized_party() {
+        let (token, jwks) = signed_token(vec![Audience::new("client".to_owned())], None, "tenant");
+        assert!(validate_id_token(&token, &jwks, &auth(), "nonce", 1_000).is_ok());
+        for (configured, nonce, now, expected) in [
+            (
+                {
+                    let mut value = auth();
+                    value.client_id = "other".to_owned();
+                    value
+                },
+                "nonce",
+                1_000,
+                "id_token_invalid",
+            ),
+            (auth(), "wrong", 1_000, "id_token_invalid"),
+            (auth(), "nonce", 2_000, "id_token_invalid"),
+            (
+                {
+                    let mut value = auth();
+                    value.tenant_id = "other".to_owned();
+                    value
+                },
+                "nonce",
+                1_000,
+                "tenant_mismatch",
+            ),
+        ] {
+            assert_eq!(
+                validate_id_token(&token, &jwks, &configured, nonce, now)
+                    .expect_err("rejected")
+                    .code,
+                expected
+            );
+        }
+        let (token, jwks) = signed_token(
+            vec![
+                Audience::new("client".to_owned()),
+                Audience::new("api".to_owned()),
+            ],
+            None,
+            "tenant",
         );
-        let mut value = claims();
-        value.aud = Audience::One("other".to_owned());
         assert_eq!(
-            validate_claims(&value, &auth(), "nonce", 1_000)
-                .expect_err("aud")
+            validate_id_token(&token, &jwks, &auth(), "nonce", 1_000)
+                .expect_err("missing azp")
                 .code,
-            "audience_mismatch"
+            "authorized_party_mismatch"
         );
-        assert_eq!(
-            validate_claims(&claims(), &auth(), "wrong", 1_000)
-                .expect_err("nonce")
-                .code,
-            "nonce_mismatch"
+    }
+
+    #[test]
+    fn id_token_shape_requires_subject_and_issue_time() {
+        let missing = json!({
+            "iss":"https://issuer.example/", "aud":"client", "exp":2_000,
+            "nonce":"nonce", "tenantId":"tenant"
+        });
+        assert!(
+            serde_json::from_value::<IdTokenClaims<TenantClaims, CoreGenderClaim>>(missing)
+                .is_err()
         );
+    }
+
+    #[test]
+    fn rendered_diagnostics_include_a_closed_stage() {
+        let rendered = AppError::transport("request_failed", true).render();
+        assert_eq!(rendered["diagnostic"]["stage"], "transport");
+    }
+
+    #[test]
+    fn jwks_policy_and_typed_verifier_reject_non_signing_wrong_alg_and_duplicate_keys() {
+        assert!(validate_jwks_key_operations(br#"{"keys":[{"key_ops":["verify"]}]}"#).is_ok());
+        for body in [
+            br#"{"keys":[{"key_ops":["encrypt"]}]}"#.as_slice(),
+            br#"{"keys":[{"key_ops":["verify","sign"]}]}"#.as_slice(),
+        ] {
+            assert_eq!(
+                validate_jwks_key_operations(body)
+                    .expect_err("key operations")
+                    .code,
+                "id_token_key_usage"
+            );
+        }
+
+        let (token, jwks) = signed_token(vec![Audience::new("client".to_owned())], None, "tenant");
+        for mutation in ["use", "alg", "duplicate"] {
+            let mut value = serde_json::to_value(&jwks).expect("jwks");
+            let keys = value["keys"].as_array_mut().expect("keys");
+            match mutation {
+                "use" => keys[0]["use"] = json!("enc"),
+                "alg" => keys[0]["alg"] = json!("RS512"),
+                "duplicate" => keys.push(keys[0].clone()),
+                _ => unreachable!(),
+            }
+            let invalid: CoreJsonWebKeySet = serde_json::from_value(value).expect("typed jwks");
+            assert_eq!(
+                validate_id_token(&token, &invalid, &auth(), "nonce", 1_000)
+                    .expect_err("invalid key policy")
+                    .code,
+                "id_token_invalid",
+                "mutation {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn rss_base_url_is_an_https_origin() {
+        assert!(validate_rss_base_url(&Url::parse("https://rss.example/").expect("url")).is_ok());
+        for value in [
+            "http://rss.example/",
+            "https://rss.example/proxy",
+            "https://rss.example/proxy/",
+            "https://rss.example/?query=1",
+            "https://user@rss.example/",
+        ] {
+            assert!(
+                validate_rss_base_url(&Url::parse(value).expect("url")).is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn callback_ignores_invalid_connections_reads_fragments_and_completes_browser_pages() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let redirect = Url::parse(&format!("http://{address}/callback")).expect("redirect");
+        let task =
+            tokio::spawn(async move { receive_callback(listener, &redirect, "expected").await });
+
+        let mut invalid = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect");
+        invalid
+            .write_all(
+                b"GET /wrong?state=expected&code=ignored HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .await
+            .expect("invalid request");
+        let mut invalid_response = Vec::new();
+        invalid
+            .read_to_end(&mut invalid_response)
+            .await
+            .expect("response");
+        assert!(String::from_utf8_lossy(&invalid_response).contains("400 Bad Request"));
+
+        let mut valid = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect");
+        valid
+            .write_all(b"GET /callback?state=expected&code=split")
+            .await
+            .expect("fragment one");
+        tokio::task::yield_now().await;
+        valid
+            .write_all(b" HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("fragment two");
+        let mut valid_response = Vec::new();
+        valid
+            .read_to_end(&mut valid_response)
+            .await
+            .expect("response");
+        assert!(String::from_utf8_lossy(&valid_response).contains("200 OK"));
+        assert_eq!(task.await.expect("task").expect("callback"), "split");
+    }
+
+    #[tokio::test]
+    async fn callback_reports_authorization_rejection_to_browser_before_returning() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let redirect = Url::parse(&format!("http://{address}/callback")).expect("redirect");
+        let task =
+            tokio::spawn(async move { receive_callback(listener, &redirect, "expected").await });
+        let mut socket = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect");
+        socket
+            .write_all(b"GET /callback?state=expected&error=access_denied HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("request");
+        let mut response = Vec::new();
+        socket.read_to_end(&mut response).await.expect("response");
+        assert!(String::from_utf8_lossy(&response).contains("Authentication rejected."));
         assert_eq!(
-            validate_claims(&claims(), &auth(), "nonce", 2_000)
-                .expect_err("expiry")
-                .code,
-            "token_expired"
-        );
-        let mut value = claims();
-        value.tenant_id = "other".to_owned();
-        assert_eq!(
-            validate_claims(&value, &auth(), "nonce", 1_000)
-                .expect_err("tenant")
-                .code,
-            "tenant_mismatch"
+            task.await.expect("task").expect_err("rejected").code,
+            "authorization_rejected"
         );
     }
 
@@ -1233,31 +1624,36 @@ mod tests {
         );
         let mut configured = auth();
         configured.issuer = issuer;
-        let mut value = claims();
-        value.iss = "https://issuer.example/realms/device/".to_owned();
+        let (token, jwks) = signed_token(vec![Audience::new("client".to_owned())], None, "tenant");
         assert_eq!(
-            validate_claims(&value, &configured, "nonce", 1_000)
+            validate_id_token(&token, &jwks, &configured, "nonce", 1_000)
                 .expect_err("exact issuer")
                 .code,
-            "issuer_mismatch"
+            "id_token_invalid"
         );
     }
 
     #[test]
     fn multiple_audiences_require_matching_authorized_party() {
-        let mut value = claims();
-        value.aud = Audience::Many(vec!["client".to_owned(), "api".to_owned()]);
-        assert_eq!(
-            validate_claims(&value, &auth(), "nonce", 1_000)
-                .expect_err("missing azp")
-                .code,
-            "authorized_party_mismatch"
+        let (token, jwks) = signed_token(
+            vec![
+                Audience::new("client".to_owned()),
+                Audience::new("api".to_owned()),
+            ],
+            Some(ClientId::new("client".to_owned())),
+            "tenant",
         );
-        value.azp = Some("client".to_owned());
-        assert!(validate_claims(&value, &auth(), "nonce", 1_000).is_ok());
-        value.azp = Some("other".to_owned());
+        assert!(validate_id_token(&token, &jwks, &auth(), "nonce", 1_000).is_ok());
+        let (token, jwks) = signed_token(
+            vec![
+                Audience::new("client".to_owned()),
+                Audience::new("api".to_owned()),
+            ],
+            Some(ClientId::new("other".to_owned())),
+            "tenant",
+        );
         assert_eq!(
-            validate_claims(&value, &auth(), "nonce", 1_000)
+            validate_id_token(&token, &jwks, &auth(), "nonce", 1_000)
                 .expect_err("wrong azp")
                 .code,
             "authorized_party_mismatch"
@@ -1325,38 +1721,63 @@ mod tests {
     #[tokio::test]
     async fn oidc_transport_and_malformed_responses_keep_exit_classes() {
         let transport = FakeHttp::new(vec![Err(AppError::transport("request_timeout", true))]);
-        assert_eq!(
-            authenticate(
-                &auth(),
-                &transport,
-                &FakeBrowser,
-                &FakeClock,
-                &FakeCallback,
-                &FakeVerifier
-            )
-            .await
-            .expect_err("transport")
-            .exit_code(),
-            5
-        );
+        let error = authenticate(
+            &auth(),
+            &transport,
+            &FakeBrowser,
+            &FakeClock,
+            &FakeCallback,
+            &FakeVerifier,
+        )
+        .await
+        .expect_err("transport");
+        assert_eq!(error.exit_code(), 5);
+        assert_eq!(error.render()["diagnostic"]["stage"], "discovery");
         let malformed = FakeHttp::new(vec![Ok(HttpReply {
             status: 200,
             body: b"not-json".to_vec(),
         })]);
-        assert_eq!(
-            authenticate(
-                &auth(),
-                &malformed,
-                &FakeBrowser,
-                &FakeClock,
-                &FakeCallback,
-                &FakeVerifier
-            )
-            .await
-            .expect_err("malformed")
-            .exit_code(),
-            6
-        );
+        let error = authenticate(
+            &auth(),
+            &malformed,
+            &FakeBrowser,
+            &FakeClock,
+            &FakeCallback,
+            &FakeVerifier,
+        )
+        .await
+        .expect_err("malformed");
+        assert_eq!(error.exit_code(), 6);
+        assert_eq!(error.render()["diagnostic"]["stage"], "discovery");
+    }
+
+    #[tokio::test]
+    async fn login_timeout_is_one_end_to_end_budget() {
+        let http = DelayedHttp {
+            inner: FakeHttp::new(vec![
+                Ok(reply(
+                    200,
+                    &json!({"issuer":"https://issuer.example/","authorization_endpoint":"https://issuer.example/authorize","token_endpoint":"https://issuer.example/token","jwks_uri":"https://issuer.example/jwks"}),
+                )),
+                Ok(reply(
+                    200,
+                    &json!({"access_token":"token-bait","id_token":"id-token-bait"}),
+                )),
+            ]),
+            delay: Duration::from_millis(30),
+        };
+        let error = authenticate_with_limit(
+            &auth(),
+            &http,
+            &FakeBrowser,
+            &FakeClock,
+            &FakeCallback,
+            &FakeVerifier,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("single budget");
+        assert_eq!(error.code, "login_timeout");
     }
 
     #[tokio::test]
@@ -1380,6 +1801,7 @@ mod tests {
             .await
             .expect_err("token status");
             assert_eq!(error.exit_code(), exit, "status {status}");
+            assert_eq!(error.render()["diagnostic"]["stage"], "token_exchange");
             assert!(!error.render().to_string().contains("secret-bait"));
         }
 
