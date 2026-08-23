@@ -167,12 +167,14 @@ class CandidateBundleTests(unittest.TestCase):
         excluded_members = set(manifest["workspace"]["exclude"])
         repository_members = {
             str(path.parent.relative_to(REPOSITORY))
-            for path in (REPOSITORY / "crates").glob("*/Cargo.toml")
+            for root in (REPOSITORY / "apps", REPOSITORY / "crates")
+            for path in root.glob("*/Cargo.toml")
         }
 
         self.assertEqual(
             excluded_members,
             {
+                "apps/reference-device-agent",
                 "crates/platform-authoring-smoke",
                 "crates/rss-device-security-client",
             },
@@ -186,7 +188,7 @@ class CandidateBundleTests(unittest.TestCase):
         ):
             self.assertIn(command, ci_job)
         self.assertIn(
-            "find crates -type f -name '*.rs' "
+            "find apps crates -type f -name '*.rs' "
             "-exec rustfmt --edition 2024 --check {} +",
             ci_job,
         )
@@ -194,6 +196,67 @@ class CandidateBundleTests(unittest.TestCase):
         self.assertIn("needs: ci", candidate_job)
         self.assertEqual(workflow.count("python3 scripts/candidate-proof.py"), 1)
         self.assertIn("python3 scripts/candidate-proof.py", candidate_job)
+
+    def test_reference_agent_local_client_exception_is_exact(self):
+        repository = REPOSITORY
+        manifest = repository / candidate_proof.REFERENCE_DEVICE_AGENT_MANIFEST
+        valid = {
+            "path": candidate_proof.REFERENCE_DEVICE_AGENT_CLIENT_PATH,
+        }
+        self.assertTrue(
+            candidate_proof.allowed_local_device_client_dependency(
+                repository,
+                manifest,
+                candidate_proof.DEVICE_SECURITY_CLIENT,
+                candidate_proof.DEVICE_SECURITY_CLIENT,
+                valid,
+                None,
+                None,
+            )
+        )
+        for alias, declared, specification, target, kind in (
+            ("client", candidate_proof.DEVICE_SECURITY_CLIENT, valid, None, None),
+            (
+                candidate_proof.DEVICE_SECURITY_CLIENT,
+                "rss-device-security-client-decoy",
+                valid,
+                None,
+                None,
+            ),
+            (
+                candidate_proof.DEVICE_SECURITY_CLIENT,
+                candidate_proof.DEVICE_SECURITY_CLIENT,
+                {"path": "../../crates/rss-device-security-client-decoy"},
+                None,
+                None,
+            ),
+            (
+                candidate_proof.DEVICE_SECURITY_CLIENT,
+                candidate_proof.DEVICE_SECURITY_CLIENT,
+                valid,
+                "cfg(unix)",
+                None,
+            ),
+            (
+                candidate_proof.DEVICE_SECURITY_CLIENT,
+                candidate_proof.DEVICE_SECURITY_CLIENT,
+                valid,
+                None,
+                "dev",
+            ),
+        ):
+            with self.subTest(alias=alias, declared=declared, specification=specification):
+                self.assertFalse(
+                    candidate_proof.allowed_local_device_client_dependency(
+                        repository,
+                        manifest,
+                        alias,
+                        declared,
+                        specification,
+                        target,
+                        kind,
+                    )
+                )
 
     def test_candidate_workspace_activation_is_exact_and_snapshot_local(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -232,6 +295,42 @@ class CandidateBundleTests(unittest.TestCase):
                 "workspace candidate exclusions must be a non-empty sorted unique array",
             ):
                 candidate_proof.activate_candidate_workspace_members(repository)
+
+    def test_candidate_workspace_activation_adds_excluded_non_glob_member(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            regular = repository / "crates/regular/Cargo.toml"
+            regular.parent.mkdir(parents=True)
+            regular.write_text(
+                '[package]\nname = "regular"\nversion = "0.0.0"\n',
+                encoding="utf-8",
+            )
+            candidate = repository / "apps/reference-device-agent/Cargo.toml"
+            candidate.parent.mkdir(parents=True)
+            candidate.write_text(
+                '[package]\nname = "reference-device-agent"\nversion = "0.0.0"\n',
+                encoding="utf-8",
+            )
+            root_manifest = repository / "Cargo.toml"
+            root_manifest.write_text(
+                '[workspace]\nmembers = ["crates/*"]\n'
+                'exclude = [\n    "apps/reference-device-agent",\n]\n',
+                encoding="utf-8",
+            )
+
+            candidate_proof.activate_candidate_workspace_members(repository)
+
+            workspace = tomllib.loads(root_manifest.read_text(encoding="utf-8"))[
+                "workspace"
+            ]
+            self.assertEqual(
+                workspace["members"],
+                ["crates/*", "apps/reference-device-agent"],
+            )
+            self.assertIn(
+                candidate,
+                candidate_proof.workspace_member_manifests(repository),
+            )
 
     def test_valid_bundle_is_generic_and_sorted(self):
         with tempfile.TemporaryDirectory() as directory:

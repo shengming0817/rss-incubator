@@ -2,6 +2,7 @@
 resolver = "3"
 members = ["crates/*"]
 exclude = [
+    "apps/reference-device-agent",
     "crates/platform-authoring-smoke",
     "crates/rss-device-security-client",
 ]

@@ -2443,6 +2443,50 @@ SELECT json_build_object(
             self.mqtt_expect_no_delivery(common=common, identity=device_auth, topic=topic)
         for topic in downlinks:
             self.mqtt_expect_no_delivery(common=common, identity=service_auth, topic=topic)
+        self.verify_reference_agent_mqtt_session()
+
+    def verify_reference_agent_mqtt_session(self) -> None:
+        mapping = self.compose("port", "mosquitto", "8883", timeout=15).stdout.strip()
+        try:
+            port = mapping.rsplit(":", 1)[1]
+        except IndexError as error:
+            raise ReferenceEnvironmentError(
+                f"cannot resolve Mosquitto loopback port: {mapping}"
+            ) from error
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "RSS_AGENT_MQTT_HOST": "localhost",
+                "RSS_AGENT_MQTT_PORT": port,
+                "RSS_AGENT_TENANT_ID": str(self.fixture["tenantId"]),
+                "RSS_AGENT_DEVICE_ID": str(self.fixture["deviceId"]),
+                "RSS_AGENT_CREDENTIAL_GENERATION": str(self.fixture["generation"]),
+                "RSS_AGENT_RUN_ID": secrets.token_hex(12),
+                "RSS_AGENT_CA_PATH": str(self.state / "pki/ca.pem"),
+                "RSS_AGENT_DEVICE_CERT_PATH": str(self.state / "pki/device.crt"),
+                "RSS_AGENT_DEVICE_KEY_PATH": str(self.state / "pki/device.key"),
+                "RSS_AGENT_SERVICE_CERT_PATH": str(self.state / "pki/service.crt"),
+                "RSS_AGENT_SERVICE_KEY_PATH": str(self.state / "pki/service.key"),
+                # Candidate proofs build committed snapshots with identical package identities.
+                # Keep the live broker test isolated from those intentionally parallel artifacts.
+                "CARGO_TARGET_DIR": str(ROOT / "target/reference-agent-t2"),
+            }
+        )
+        run(
+            [
+                "cargo",
+                "test",
+                "-p",
+                "reference-device-agent-core",
+                "--test",
+                "mqtt_mtls",
+                "--",
+                "--ignored",
+                "--test-threads=1",
+            ],
+            env=environment,
+            timeout=120,
+        )
 
     def verify(self) -> None:
         self.require_state()

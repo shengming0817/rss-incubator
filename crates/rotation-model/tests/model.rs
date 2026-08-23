@@ -4,10 +4,10 @@ use rotation_model::{
     AcceptanceCondition, ApplicationReceiptObservation, ApplicationReceiptOutcome,
     ApplicationRejectionReason, ApplicationStaleReason, ArtifactDigest, AuthorizationReceiptRef,
     CommandAckPosition, CommandAcknowledgement, CommandAcknowledgementOutcome, CommandRef,
-    CommandRejectionReason, CredentialReport, DeviceRef, DeviceSequence, EventRef, FenceEpoch,
-    Generation, IngressEnvelopeRef, PrincipalRef, ReceiptLineage, ReportPosition, RotationAccepted,
-    RotationCoordinates, RotationId, RotationIntent, RotationModelError, StateHash, TenantRef,
-    UnixTimestamp,
+    CommandRejectionReason, CredentialReport, CredentialRevision, DeviceRef, DeviceSequence,
+    EventRef, FenceEpoch, Generation, IngressEnvelopeRef, InstalledCredentialPosition,
+    PrincipalRef, ReceiptLineage, ReportPosition, RotationAccepted, RotationCoordinates,
+    RotationId, RotationIntent, RotationModelError, StateHash, TenantRef, UnixTimestamp,
 };
 
 #[test]
@@ -59,6 +59,33 @@ fn generation_and_fence_epoch_are_positive() {
         7
     );
     assert_eq!(FenceEpoch::try_from(3).expect("positive fence").get(), 3);
+}
+
+#[test]
+fn credential_revision_is_positive_and_distinct_from_command_generation() {
+    assert_eq!(
+        CredentialRevision::try_from(0),
+        Err(RotationModelError::ZeroCredentialRevision)
+    );
+    let revision = CredentialRevision::try_from(3).expect("positive revision");
+    assert_eq!(revision.get(), 3);
+    assert_ne!(
+        TypeId::of::<CredentialRevision>(),
+        TypeId::of::<Generation>()
+    );
+}
+
+#[test]
+fn installed_credential_position_keeps_three_monotonic_axes_distinct() {
+    let position = InstalledCredentialPosition::new(
+        Generation::try_from(9).expect("positive generation"),
+        FenceEpoch::try_from(4).expect("positive fence"),
+        CredentialRevision::try_from(2).expect("positive revision"),
+    );
+
+    assert_eq!(position.desired_generation().get(), 9);
+    assert_eq!(position.fence_epoch().get(), 4);
+    assert_eq!(position.credential_revision().get(), 2);
 }
 
 #[test]

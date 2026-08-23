@@ -209,10 +209,7 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
             set(fixture["mqtt"]["uplinkContracts"]),
         )
         self.assertEqual(
-            {
-                "identity.apply-device-certificate",
-                "identity.device-ingress-receipted",
-            },
+            {"identity.commands.apply-device-certificate"},
             set(fixture["mqtt"]["downlinkContracts"]),
         )
         self.assertNotIn("#", json.dumps(fixture))

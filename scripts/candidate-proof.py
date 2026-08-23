@@ -37,6 +37,9 @@ CANDIDATE_SOURCE = f"registry+{CANDIDATE_REGISTRY_URL}"
 DEVICE_SECURITY_CLIENT = "rss-device-security-client"
 DEVICE_SECURITY_CONTRACT = "rss-device-security-contracts"
 DEVICE_SECURITY_CLIENT_MANIFEST = Path("crates/rss-device-security-client/Cargo.toml")
+REFERENCE_DEVICE_AGENT = "reference-device-agent"
+REFERENCE_DEVICE_AGENT_MANIFEST = Path("apps/reference-device-agent/Cargo.toml")
+REFERENCE_DEVICE_AGENT_CLIENT_PATH = "../../crates/rss-device-security-client"
 
 
 class ProofError(RuntimeError):
@@ -396,8 +399,30 @@ def candidate_workspace_members(repository: Path):
 def activate_candidate_workspace_members(repository: Path):
     manifest_path = repository / "Cargo.toml"
     manifest, exclusion, candidate_manifests = candidate_workspace_members(repository)
+    parsed = tomllib.loads(manifest)
+    members = parsed["workspace"]["members"]
+    member_declarations = "members = [" + ", ".join(
+        json.dumps(member) for member in members
+    ) + "]"
+    if manifest.count(member_declarations) != 1:
+        raise ProofError("workspace member declarations are not canonical")
+
+    matched_paths = {
+        path.resolve()
+        for pattern in members
+        for path in repository.glob(pattern)
+    }
+    activated_members = list(members)
+    for candidate in candidate_manifests:
+        if candidate.parent.resolve() not in matched_paths:
+            activated_members.append(str(candidate.parent.relative_to(repository)))
+    activated_declarations = "members = [" + ", ".join(
+        json.dumps(member) for member in activated_members
+    ) + "]"
     manifest_path.write_text(
-        manifest.replace(exclusion, "exclude = []"),
+        manifest.replace(member_declarations, activated_declarations).replace(
+            exclusion, "exclude = []"
+        ),
         encoding="utf-8",
     )
     activated = workspace_member_manifests(repository)
@@ -423,6 +448,10 @@ def manifest_rss_dependencies(repository: Path, bundle_names: set[str]):
                     if isinstance(specification, dict)
                     else alias
                 )
+                if allowed_local_device_client_dependency(
+                    repository, manifest_path, alias, declared_name, specification, target, kind
+                ):
+                    continue
                 if not is_rss_package_name(declared_name):
                     continue
                 canonical = canonical_package_name(declared_name)
@@ -495,6 +524,46 @@ def validate_device_security_dependency_policy(repository: Path, dependencies):
         )
 
 
+def allowed_local_device_client_dependency(
+    repository, manifest_path, alias, declared_name, specification, target, kind
+):
+    expected_manifest = (repository / REFERENCE_DEVICE_AGENT_MANIFEST).resolve()
+    return (
+        manifest_path.resolve() == expected_manifest
+        and alias == DEVICE_SECURITY_CLIENT
+        and declared_name == DEVICE_SECURITY_CLIENT
+        and target is None
+        and kind is None
+        and specification == {"path": REFERENCE_DEVICE_AGENT_CLIENT_PATH}
+    )
+
+
+def validate_reference_device_agent_dependencies(repository: Path, dependencies):
+    manifest_path = repository / REFERENCE_DEVICE_AGENT_MANIFEST
+    try:
+        manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        raise ProofError("reference-device-agent manifest is invalid") from error
+    if manifest.get("package", {}).get("name") != REFERENCE_DEVICE_AGENT:
+        raise ProofError("reference-device-agent package identity differs")
+    dependency = manifest.get("dependencies", {}).get(DEVICE_SECURITY_CLIENT)
+    if dependency != {"path": REFERENCE_DEVICE_AGENT_CLIENT_PATH}:
+        raise ProofError(
+            "reference-device-agent local client edge must target the canonical manifest exactly"
+        )
+    expected_manifest = manifest_path.resolve()
+    contract_edges = [
+        dependency
+        for package, dependency in dependencies
+        if Path(package["manifest_path"]).resolve() == expected_manifest
+        and dependency["name"] == DEVICE_SECURITY_CONTRACT
+    ]
+    if len(contract_edges) != 1 or contract_edges[0]["kind"] is not None:
+        raise ProofError(
+            "reference-device-agent must directly consume the exact public contracts once"
+        )
+
+
 def validate_manifest_dependency_sources(metadata, bundle_names: set[str]):
     workspace_ids = set(metadata.get("workspace_members", []))
     found = set()
@@ -513,6 +582,16 @@ def validate_manifest_dependency_sources(metadata, bundle_names: set[str]):
                     if isinstance(specification, dict)
                     else alias
                 )
+                if allowed_local_device_client_dependency(
+                    manifest_path.parents[2],
+                    manifest_path,
+                    alias,
+                    declared_name,
+                    specification,
+                    None,
+                    None,
+                ):
+                    continue
                 if not is_rss_package_name(declared_name):
                     continue
                 canonical = canonical_package_name(declared_name)
@@ -537,6 +616,12 @@ def direct_rss_dependencies(metadata, bundle_names: set[str]):
                 continue
             canonical = canonical_package_name(name)
             source = dependency.get("source")
+            if (
+                package.get("name") == REFERENCE_DEVICE_AGENT
+                and canonical == DEVICE_SECURITY_CLIENT
+                and source is None
+            ):
+                continue
             if canonical not in bundle_names:
                 raise ProofError(f"RSS dependency `{name}` is outside the Release Surface bundle")
             if not isinstance(source, str) or not source.startswith("registry+"):
@@ -918,6 +1003,8 @@ def execute(repository: Path, bundle_root: Path):
             snapshot, {package.name for package in bundle.packages}
         )
         validate_device_security_dependency_policy(snapshot, dependencies)
+        if (snapshot / REFERENCE_DEVICE_AGENT_MANIFEST).is_file():
+            validate_reference_device_agent_dependencies(snapshot, dependencies)
         config = snapshot / ".cargo/config.toml"
         config.parent.mkdir(parents=True, exist_ok=True)
         config.write_text(
