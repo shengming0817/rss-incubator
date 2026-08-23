@@ -60,6 +60,8 @@ async fn main() -> Result<(), MainError> {
     }
 }
 
+// Keeping the event ordering in one loop makes broker acknowledgements and reconnect exits auditable.
+#[allow(clippy::too_many_lines)]
 async fn run_session(
     mqtt: &reference_device_agent_core::MqttConnectionConfig,
     agent: &mut ReferenceDeviceAgent,
@@ -103,7 +105,7 @@ async fn run_session(
 
         let event = session.poll().await;
         if connected_at.is_some_and(|connected_at: tokio::time::Instant| {
-            connected_at.elapsed() >= Duration::from_secs(60)
+            connected_at.elapsed() >= Duration::from_mins(1)
         }) {
             *retry_delay = Duration::from_secs(1);
         }
