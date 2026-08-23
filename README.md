@@ -116,7 +116,8 @@ released baseline; the candidate lock exists only for the proof lifetime.
 
 On a fresh runner, the proof starts from the committed baseline lock and preserves every existing
 non-RSS registry identity. Any newly required non-RSS identity must be proven reachable from an RSS
-candidate package in Cargo's resolved dependency graph; unrelated lock additions fail closed. A
+candidate package or an excluded candidate member atomically activated for this proof in Cargo's
+resolved dependency graph; unrelated lock additions fail closed. A
 stable logical candidate source is mapped to the already-validated local registry, so temporary
 filesystem paths never enter the candidate lock. The candidate metadata/build/test/lint matrix is
 explicitly locked and offline; the real checkout and committed baseline lock remain unchanged.

@@ -18,7 +18,9 @@ Commands:
   `rotate` result. It is not a server-side durable audit/history query.
 
 Remote issuer, JWKS, token, and RSS endpoints require HTTPS. HTTP is accepted only for an OIDC
-loopback redirect and local mock-contract testing. Login waits at most 120 seconds; API calls wait at
+loopback redirect; tests use an injected HTTP port rather than weakening the production URL gate.
+`--ca-certificate` adds an explicit private CA to the shared rustls trust store without disabling
+certificate verification. Login waits at most 120 seconds; API calls wait at
 most 30 seconds; every response is capped at 1 MiB. The CLI has no password grant, token argument or
 persistence, automatic mutation retry, certificate/private-key output, raw provider error, or raw
 response-body diagnostic.

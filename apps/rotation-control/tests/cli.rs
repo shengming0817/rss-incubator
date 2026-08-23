@@ -10,6 +10,28 @@ fn binary() -> Command {
 }
 
 #[test]
+fn help_and_version_are_json_successes() {
+    binary()
+        .env_clear()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("\"operation\":\"help\"")
+                .and(predicate::str::contains("rotate")),
+        );
+    binary()
+        .env_clear()
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("\"operation\":\"version\"")
+                .and(predicate::str::contains("rotation-control")),
+        );
+}
+
+#[test]
 fn policy_check_reports_counts_without_sans_or_environment_bait() {
     let directory = tempdir().expect("tempdir");
     let input = directory.path().join("policy.json");

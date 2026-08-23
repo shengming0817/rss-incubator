@@ -37,7 +37,11 @@ use rss_device_security_contracts::{
         IdentityDeviceCertificatePolicyPutRequest, IdentityDeviceCertificatePolicyPutResponse,
         IdentityDeviceCertificatePolicyPutValidationResponse,
     },
-    status_get::IdentityDeviceCertificateStatusGetResponse,
+    status_get::{
+        ActiveCommandState as CanonicalActiveCommandState,
+        ConditionReason as CanonicalConditionReason, ConditionStatus as CanonicalConditionStatus,
+        ConditionType as CanonicalConditionType, IdentityDeviceCertificateStatusGetResponse,
+    },
 };
 use uuid::Uuid;
 
@@ -46,6 +50,13 @@ use uuid::Uuid;
 pub struct OperationDescriptor {
     pub method: &'static str,
     pub path_template: &'static str,
+}
+
+impl OperationDescriptor {
+    fn path_for(self, device_id: Uuid) -> String {
+        self.path_template
+            .replace("{deviceId}", &device_id.to_string())
+    }
 }
 
 pub const POLICY_PUT_OPERATION: OperationDescriptor = OperationDescriptor {
@@ -161,7 +172,7 @@ pub fn prepare_policy_put(
     let body = serde_json::to_vec(&request).map_err(|_| FacadeError::Serialization)?;
     Ok(PreparedRequest {
         method: POLICY_PUT_OPERATION.method,
-        path: format!("/api/v2/identity/devices/{device_id}/certificate-policy"),
+        path: POLICY_PUT_OPERATION.path_for(device_id),
         body: Some(body),
     })
 }
@@ -170,7 +181,7 @@ pub fn prepare_policy_put(
 pub fn prepare_status_get(device_id: Uuid) -> PreparedRequest {
     PreparedRequest {
         method: STATUS_GET_OPERATION.method,
-        path: format!("/api/v2/identity/devices/{device_id}/certificate-status"),
+        path: STATUS_GET_OPERATION.path_for(device_id),
         body: None,
     }
 }
@@ -254,7 +265,7 @@ impl Diagnostic {
 pub struct PolicyAcceptedProjection {
     receipt_id: Uuid,
     generation: u64,
-    condition: &'static str,
+    condition: PolicyCondition,
 }
 impl PolicyAcceptedProjection {
     #[must_use]
@@ -266,7 +277,7 @@ impl PolicyAcceptedProjection {
         self.generation
     }
     #[must_use]
-    pub const fn condition(&self) -> &'static str {
+    pub const fn condition(&self) -> PolicyCondition {
         self.condition
     }
 }
@@ -289,8 +300,8 @@ pub fn decode_policy_response(status: u16, body: &[u8]) -> PolicyResponse {
                 receipt_id: value.data.authorization_receipt_id.as_uuid(),
                 generation: value.data.accepted_generation.get(),
                 condition: match value.data.condition {
-                    IdentityDeviceCertificatePolicyPutDataCondition::Reconciling => "Reconciling",
-                    IdentityDeviceCertificatePolicyPutDataCondition::PendingDevice => "PendingDevice",
+                    IdentityDeviceCertificatePolicyPutDataCondition::Reconciling => PolicyCondition::Reconciling,
+                    IdentityDeviceCertificatePolicyPutDataCondition::PendingDevice => PolicyCondition::PendingDevice,
                 },
             }),
         ),
@@ -315,26 +326,107 @@ pub fn decode_policy_response(status: u16, body: &[u8]) -> PolicyResponse {
     }
 }
 
+macro_rules! closed_text_enum {
+    ($name:ident { $($variant:ident => $text:literal),+ $(,)? }) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub enum $name { $($variant),+ }
+        impl $name {
+            #[must_use]
+            pub const fn as_str(self) -> &'static str {
+                match self { $(Self::$variant => $text),+ }
+            }
+        }
+    };
+}
+
+closed_text_enum!(PolicyCondition { Reconciling => "Reconciling", PendingDevice => "PendingDevice" });
+closed_text_enum!(ActiveCommandState { Queued => "queued", Published => "published", Received => "received" });
+closed_text_enum!(ConditionStatus { True => "True", False => "False", Unknown => "Unknown" });
+closed_text_enum!(ConditionType { Ready => "Ready", Reconciling => "Reconciling", PendingDevice => "PendingDevice", Degraded => "Degraded", Quarantined => "Quarantined", Deleting => "Deleting" });
+closed_text_enum!(ConditionReason {
+    DesiredAccepted => "DesiredAccepted", CommandQueued => "CommandQueued",
+    AwaitingDevice => "AwaitingDevice", DeviceReported => "DeviceReported",
+    StateMatches => "StateMatches", StateDrift => "StateDrift",
+    CommandRejected => "CommandRejected", CommandTimedOut => "CommandTimedOut",
+    ProtocolViolation => "ProtocolViolation", QuarantinedByOperator => "QuarantinedByOperator",
+    DeletionPending => "DeletionPending", DeletionComplete => "DeletionComplete",
+    ArtifactUnavailable => "ArtifactUnavailable", TransportUnavailable => "TransportUnavailable"
+});
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActiveCommandProjection {
-    pub fence_epoch: u64,
-    pub state: String,
+    fence_epoch: u64,
+    state: ActiveCommandState,
+}
+impl ActiveCommandProjection {
+    #[must_use]
+    pub const fn fence_epoch(&self) -> u64 {
+        self.fence_epoch
+    }
+    #[must_use]
+    pub const fn state(&self) -> ActiveCommandState {
+        self.state
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConditionProjection {
-    pub observed_generation: u64,
-    pub reason: String,
-    pub status: String,
-    pub type_: String,
-    pub last_transition_at: i64,
+    observed_generation: u64,
+    reason: ConditionReason,
+    status: ConditionStatus,
+    type_: ConditionType,
+    last_transition_at: i64,
+}
+impl ConditionProjection {
+    #[must_use]
+    pub const fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    #[must_use]
+    pub const fn reason(&self) -> ConditionReason {
+        self.reason
+    }
+    #[must_use]
+    pub const fn status(&self) -> ConditionStatus {
+        self.status
+    }
+    #[must_use]
+    pub const fn type_(&self) -> ConditionType {
+        self.type_
+    }
+    #[must_use]
+    pub const fn last_transition_at(&self) -> i64 {
+        self.last_transition_at
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatusProjection {
-    pub desired_generation: Option<u64>,
-    pub authorization_receipt_id: Option<Uuid>,
-    pub observed_generation: u64,
-    pub active_command: Option<ActiveCommandProjection>,
-    pub conditions: Vec<ConditionProjection>,
+    desired_generation: Option<u64>,
+    authorization_receipt_id: Option<Uuid>,
+    observed_generation: u64,
+    active_command: Option<ActiveCommandProjection>,
+    conditions: Vec<ConditionProjection>,
+}
+impl StatusProjection {
+    #[must_use]
+    pub const fn desired_generation(&self) -> Option<u64> {
+        self.desired_generation
+    }
+    #[must_use]
+    pub const fn authorization_receipt_id(&self) -> Option<Uuid> {
+        self.authorization_receipt_id
+    }
+    #[must_use]
+    pub const fn observed_generation(&self) -> u64 {
+        self.observed_generation
+    }
+    #[must_use]
+    pub const fn active_command(&self) -> Option<&ActiveCommandProjection> {
+        self.active_command.as_ref()
+    }
+    #[must_use]
+    pub fn conditions(&self) -> &[ConditionProjection] {
+        &self.conditions
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StatusResponse {
@@ -376,7 +468,11 @@ pub fn decode_status_response(status: u16, body: &[u8]) -> StatusResponse {
         .and_then(|desired| desired.active_command.as_ref())
         .map(|command| ActiveCommandProjection {
             fence_epoch: command.fence_epoch.get(),
-            state: command.state.to_string(),
+            state: match command.state {
+                CanonicalActiveCommandState::Queued => ActiveCommandState::Queued,
+                CanonicalActiveCommandState::Published => ActiveCommandState::Published,
+                CanonicalActiveCommandState::Received => ActiveCommandState::Received,
+            },
         });
     let Ok(observed_generation) = u64::try_from(value.data.observed_generation) else {
         return StatusResponse::Rejected(Diagnostic::new(DiagnosticKind::Malformed, None, false));
@@ -392,9 +488,41 @@ pub fn decode_status_response(status: u16, body: &[u8]) -> StatusResponse {
         };
         conditions.push(ConditionProjection {
             observed_generation: generation,
-            reason: condition.reason.to_string(),
-            status: condition.status.to_string(),
-            type_: condition.type_.to_string(),
+            reason: match condition.reason {
+                CanonicalConditionReason::DesiredAccepted => ConditionReason::DesiredAccepted,
+                CanonicalConditionReason::CommandQueued => ConditionReason::CommandQueued,
+                CanonicalConditionReason::AwaitingDevice => ConditionReason::AwaitingDevice,
+                CanonicalConditionReason::DeviceReported => ConditionReason::DeviceReported,
+                CanonicalConditionReason::StateMatches => ConditionReason::StateMatches,
+                CanonicalConditionReason::StateDrift => ConditionReason::StateDrift,
+                CanonicalConditionReason::CommandRejected => ConditionReason::CommandRejected,
+                CanonicalConditionReason::CommandTimedOut => ConditionReason::CommandTimedOut,
+                CanonicalConditionReason::ProtocolViolation => ConditionReason::ProtocolViolation,
+                CanonicalConditionReason::QuarantinedByOperator => {
+                    ConditionReason::QuarantinedByOperator
+                }
+                CanonicalConditionReason::DeletionPending => ConditionReason::DeletionPending,
+                CanonicalConditionReason::DeletionComplete => ConditionReason::DeletionComplete,
+                CanonicalConditionReason::ArtifactUnavailable => {
+                    ConditionReason::ArtifactUnavailable
+                }
+                CanonicalConditionReason::TransportUnavailable => {
+                    ConditionReason::TransportUnavailable
+                }
+            },
+            status: match condition.status {
+                CanonicalConditionStatus::True => ConditionStatus::True,
+                CanonicalConditionStatus::False => ConditionStatus::False,
+                CanonicalConditionStatus::Unknown => ConditionStatus::Unknown,
+            },
+            type_: match condition.type_ {
+                CanonicalConditionType::Ready => ConditionType::Ready,
+                CanonicalConditionType::Reconciling => ConditionType::Reconciling,
+                CanonicalConditionType::PendingDevice => ConditionType::PendingDevice,
+                CanonicalConditionType::Degraded => ConditionType::Degraded,
+                CanonicalConditionType::Quarantined => ConditionType::Quarantined,
+                CanonicalConditionType::Deleting => ConditionType::Deleting,
+            },
             last_transition_at: condition.last_transition_at,
         });
     }

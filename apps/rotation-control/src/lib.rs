@@ -8,7 +8,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use clap::{Args, Parser, Subcommand};
+use async_trait::async_trait;
+use clap::{Args, Parser, Subcommand, error::ErrorKind};
 use futures_util::StreamExt;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
 use openidconnect::PkceCodeChallenge;
@@ -69,6 +70,8 @@ struct AuthArgs {
     tenant_id: String,
     #[arg(long, default_value = "http://127.0.0.1:8765/callback")]
     redirect_uri: Url,
+    #[arg(long)]
+    ca_certificate: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -178,6 +181,8 @@ struct IdClaims {
     aud: Audience,
     exp: u64,
     nonce: String,
+    #[serde(default)]
+    azp: Option<String>,
     #[serde(rename = "tenantId")]
     tenant_id: String,
 }
@@ -197,6 +202,11 @@ impl Audience {
         }
     }
 }
+
+const CALLBACK_INVALID: &str = "callback_invalid";
+const INVALID_DISCOVERY: &str = "invalid_discovery";
+const INPUT_UNREADABLE: &str = "input_unreadable";
+const RESPONSE_OVERSIZE: &str = "response_oversize";
 
 #[derive(Debug)]
 pub struct AppError {
@@ -283,6 +293,16 @@ pub fn main_entry() -> i32 {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) {
+                println!(
+                    "{}",
+                    json!({"schemaVersion":"1","operation":if error.kind() == ErrorKind::DisplayHelp { "help" } else { "version" },"outcome":"success","text":error.to_string()})
+                );
+                return 0;
+            }
             println!(
                 "{}",
                 AppError::input(if error.use_stderr() {
@@ -340,7 +360,7 @@ async fn run(cli: Cli) -> Result<Value, AppError> {
 }
 
 fn read_policy(path: &PathBuf) -> Result<RotationPolicy, AppError> {
-    let bytes = fs::read(path).map_err(|_| AppError::input("input_unreadable"))?;
+    let bytes = fs::read(path).map_err(|_| AppError::input(INPUT_UNREADABLE))?;
     if bytes.len() > MAX_RESPONSE_BYTES {
         return Err(AppError::input("input_oversize"));
     }
@@ -364,15 +384,211 @@ fn secure_remote_url(url: &Url, allow_loopback_http: bool) -> Result<(), AppErro
     }
 }
 
-fn client() -> Result<Client, AppError> {
-    Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(API_TIMEOUT)
-        .build()
-        .map_err(|_| AppError::transport("http_client_unavailable", false))
+struct HttpReply {
+    status: u16,
+    body: Vec<u8>,
+}
+
+#[async_trait]
+trait HttpPort: Send + Sync {
+    async fn get(&self, url: Url, limit: Duration) -> Result<HttpReply, AppError>;
+    async fn post_form(
+        &self,
+        url: Url,
+        form: Vec<(String, String)>,
+        limit: Duration,
+    ) -> Result<HttpReply, AppError>;
+    async fn send(
+        &self,
+        method: Method,
+        url: Url,
+        headers: HeaderMap,
+        body: Option<Vec<u8>>,
+        limit: Duration,
+    ) -> Result<HttpReply, AppError>;
+}
+
+trait BrowserPort: Send + Sync {
+    fn open(&self, url: &Url) -> Result<(), AppError>;
+}
+trait ClockPort: Send + Sync {
+    fn unix_seconds(&self) -> Result<u64, AppError>;
+}
+trait IdTokenVerifierPort: Send + Sync {
+    fn verify(
+        &self,
+        token: &str,
+        jwks: &JwkSet,
+        auth: &AuthArgs,
+        nonce: &str,
+        now: u64,
+    ) -> Result<(), AppError>;
+}
+
+#[async_trait]
+trait CallbackPort: Send + Sync {
+    async fn authorize(
+        &self,
+        redirect: &Url,
+        state: &str,
+        authorize: &Url,
+        browser: &dyn BrowserPort,
+    ) -> Result<String, AppError>;
+}
+
+struct SystemBrowser;
+impl BrowserPort for SystemBrowser {
+    fn open(&self, url: &Url) -> Result<(), AppError> {
+        webbrowser::open(url.as_str()).map_err(|_| AppError::auth("browser_launch_failed"))
+    }
+}
+
+struct SystemClock;
+impl ClockPort for SystemClock {
+    fn unix_seconds(&self) -> Result<u64, AppError> {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| AppError::auth("clock_invalid"))
+            .map(|value| value.as_secs())
+    }
+}
+struct Rs256IdTokenVerifier;
+impl IdTokenVerifierPort for Rs256IdTokenVerifier {
+    fn verify(
+        &self,
+        token: &str,
+        jwks: &JwkSet,
+        auth: &AuthArgs,
+        nonce: &str,
+        now: u64,
+    ) -> Result<(), AppError> {
+        validate_id_token(token, jwks, auth, nonce, now)
+    }
+}
+
+struct LoopbackCallback;
+#[async_trait]
+impl CallbackPort for LoopbackCallback {
+    async fn authorize(
+        &self,
+        redirect: &Url,
+        state: &str,
+        authorize: &Url,
+        browser: &dyn BrowserPort,
+    ) -> Result<String, AppError> {
+        let host = redirect
+            .host_str()
+            .ok_or_else(|| AppError::input("invalid_redirect"))?;
+        let listener = TcpListener::bind((
+            host,
+            redirect
+                .port_or_known_default()
+                .ok_or_else(|| AppError::input("invalid_redirect"))?,
+        ))
+        .await
+        .map_err(|_| AppError::auth("callback_bind_failed"))?;
+        browser.open(authorize)?;
+        timeout(LOGIN_TIMEOUT, receive_callback(listener, redirect, state))
+            .await
+            .map_err(|_| AppError::auth("login_timeout"))?
+    }
+}
+
+struct ReqwestHttpPort {
+    client: Client,
+}
+impl ReqwestHttpPort {
+    fn new(ca_certificate: Option<&PathBuf>) -> Result<Self, AppError> {
+        let mut builder = Client::builder().redirect(reqwest::redirect::Policy::none());
+        if let Some(path) = ca_certificate {
+            let bytes = fs::read(path).map_err(|_| AppError::input(INPUT_UNREADABLE))?;
+            if bytes.len() > MAX_RESPONSE_BYTES {
+                return Err(AppError::input("ca_certificate_oversize"));
+            }
+            let certificate = reqwest::Certificate::from_pem(&bytes)
+                .map_err(|_| AppError::input("invalid_ca_certificate"))?;
+            builder = builder.add_root_certificate(certificate);
+        }
+        builder
+            .build()
+            .map(|client| Self { client })
+            .map_err(|_| AppError::transport("http_client_unavailable", false))
+    }
+
+    async fn execute(
+        &self,
+        request: reqwest::RequestBuilder,
+        limit: Duration,
+    ) -> Result<HttpReply, AppError> {
+        let response = timeout(limit, request.send())
+            .await
+            .map_err(|_| AppError::transport("request_timeout", true))?
+            .map_err(|_| AppError::transport("request_failed", true))?;
+        let status = response.status().as_u16();
+        let body = bounded_bytes(response).await?;
+        Ok(HttpReply { status, body })
+    }
+}
+
+#[async_trait]
+impl HttpPort for ReqwestHttpPort {
+    async fn get(&self, url: Url, limit: Duration) -> Result<HttpReply, AppError> {
+        self.execute(self.client.get(url), limit).await
+    }
+    async fn post_form(
+        &self,
+        url: Url,
+        form: Vec<(String, String)>,
+        limit: Duration,
+    ) -> Result<HttpReply, AppError> {
+        self.execute(self.client.post(url).form(&form), limit).await
+    }
+    async fn send(
+        &self,
+        method: Method,
+        url: Url,
+        headers: HeaderMap,
+        body: Option<Vec<u8>>,
+        limit: Duration,
+    ) -> Result<HttpReply, AppError> {
+        let mut request = self.client.request(method, url).headers(headers);
+        if let Some(body) = body {
+            request = request.header(CONTENT_TYPE, "application/json").body(body);
+        }
+        self.execute(request, limit).await
+    }
+}
+
+fn discovery_url(issuer: &Url) -> Result<Url, AppError> {
+    let mut value = issuer.clone();
+    let path = format!("{}/", value.path().trim_end_matches('/'));
+    value.set_path(&path);
+    value
+        .join(".well-known/openid-configuration")
+        .map_err(|_| AppError::input("invalid_issuer"))
 }
 
 async fn login(auth: &AuthArgs) -> Result<TokenSet, AppError> {
+    let http = ReqwestHttpPort::new(auth.ca_certificate.as_ref())?;
+    authenticate(
+        auth,
+        &http,
+        &SystemBrowser,
+        &SystemClock,
+        &LoopbackCallback,
+        &Rs256IdTokenVerifier,
+    )
+    .await
+}
+
+async fn authenticate(
+    auth: &AuthArgs,
+    http: &dyn HttpPort,
+    browser: &dyn BrowserPort,
+    clock: &dyn ClockPort,
+    callback: &dyn CallbackPort,
+    verifier: &dyn IdTokenVerifierPort,
+) -> Result<TokenSet, AppError> {
     secure_remote_url(&auth.issuer, false)?;
     secure_remote_url(&auth.redirect_uri, true)?;
     let callback_host = auth
@@ -386,29 +602,23 @@ async fn login(auth: &AuthArgs) -> Result<TokenSet, AppError> {
     {
         return Err(AppError::input("redirect_not_loopback"));
     }
-    let discovery_url = auth
-        .issuer
-        .join(".well-known/openid-configuration")
-        .map_err(|_| AppError::input("invalid_issuer"))?;
-    let http = client()?;
-    let discovery: Discovery = fetch_json(&http, discovery_url, LOGIN_TIMEOUT)
-        .await
-        .map_err(|_| AppError::auth("discovery_failed"))?;
-    if discovery.issuer.trim_end_matches('/') != auth.issuer.as_str().trim_end_matches('/') {
+    let discovery: Discovery =
+        fetch_json(http, discovery_url(&auth.issuer)?, LOGIN_TIMEOUT).await?;
+    if discovery.issuer != auth.issuer.as_str() {
         return Err(AppError::auth("issuer_mismatch"));
     }
     let authorization_endpoint = Url::parse(&discovery.authorization_endpoint)
-        .map_err(|_| AppError::auth("invalid_discovery"))?;
+        .map_err(|_| AppError::auth(INVALID_DISCOVERY))?;
     let token_endpoint =
-        Url::parse(&discovery.token_endpoint).map_err(|_| AppError::auth("invalid_discovery"))?;
+        Url::parse(&discovery.token_endpoint).map_err(|_| AppError::auth(INVALID_DISCOVERY))?;
     let jwks_uri =
-        Url::parse(&discovery.jwks_uri).map_err(|_| AppError::auth("invalid_discovery"))?;
+        Url::parse(&discovery.jwks_uri).map_err(|_| AppError::auth(INVALID_DISCOVERY))?;
     secure_remote_url(&authorization_endpoint, false)?;
     secure_remote_url(&token_endpoint, false)?;
     secure_remote_url(&jwks_uri, false)?;
     let state = Uuid::new_v4().to_string();
     let nonce = Uuid::new_v4().to_string();
-    let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
+    let (challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
     let mut authorize = authorization_endpoint;
     authorize
         .query_pairs_mut()
@@ -420,43 +630,32 @@ async fn login(auth: &AuthArgs) -> Result<TokenSet, AppError> {
         .append_pair("nonce", &nonce)
         .append_pair("code_challenge", challenge.as_str())
         .append_pair("code_challenge_method", "S256");
-    let listener = TcpListener::bind((
-        callback_host,
-        auth.redirect_uri
-            .port_or_known_default()
-            .ok_or_else(|| AppError::input("invalid_redirect"))?,
-    ))
-    .await
-    .map_err(|_| AppError::auth("callback_bind_failed"))?;
-    webbrowser::open(authorize.as_str()).map_err(|_| AppError::auth("browser_launch_failed"))?;
-    let code = timeout(
-        LOGIN_TIMEOUT,
-        receive_callback(listener, &auth.redirect_uri, &state),
-    )
-    .await
-    .map_err(|_| AppError::auth("login_timeout"))??;
+    let code = callback
+        .authorize(&auth.redirect_uri, &state, &authorize, browser)
+        .await?;
     let response = http
-        .post(token_endpoint)
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", code.as_str()),
-            ("redirect_uri", auth.redirect_uri.as_str()),
-            ("client_id", auth.client_id.as_str()),
-            ("code_verifier", verifier.secret()),
-        ])
-        .send()
-        .await
-        .map_err(|_| AppError::auth("token_exchange_failed"))?;
-    if response.status() != StatusCode::OK {
+        .post_form(
+            token_endpoint,
+            vec![
+                ("grant_type".to_owned(), "authorization_code".to_owned()),
+                ("code".to_owned(), code),
+                ("redirect_uri".to_owned(), auth.redirect_uri.to_string()),
+                ("client_id".to_owned(), auth.client_id.clone()),
+                (
+                    "code_verifier".to_owned(),
+                    pkce_verifier.secret().to_owned(),
+                ),
+            ],
+            LOGIN_TIMEOUT,
+        )
+        .await?;
+    if response.status != StatusCode::OK.as_u16() {
         return Err(AppError::auth("token_exchange_rejected"));
     }
-    let token: TokenWire = bounded_json(response)
-        .await
-        .map_err(|_| AppError::auth("token_response_invalid"))?;
-    let jwks: JwkSet = fetch_json(&http, jwks_uri, LOGIN_TIMEOUT)
-        .await
-        .map_err(|_| AppError::auth("jwks_failed"))?;
-    validate_id_token(&token.id_token, &jwks, auth, &nonce)?;
+    let token: TokenWire = serde_json::from_slice(&response.body)
+        .map_err(|_| AppError::untrusted("malformed_json"))?;
+    let jwks: JwkSet = fetch_json(http, jwks_uri, LOGIN_TIMEOUT).await?;
+    verifier.verify(&token.id_token, &jwks, auth, &nonce, clock.unix_seconds()?)?;
     Ok(TokenSet {
         access_token: token.access_token,
     })
@@ -477,19 +676,19 @@ async fn receive_callback(
         .await
         .map_err(|_| AppError::auth("callback_failed"))?;
     let first = std::str::from_utf8(&request[..count])
-        .map_err(|_| AppError::auth("callback_invalid"))?
+        .map_err(|_| AppError::auth(CALLBACK_INVALID))?
         .lines()
         .next()
-        .ok_or_else(|| AppError::auth("callback_invalid"))?;
+        .ok_or_else(|| AppError::auth(CALLBACK_INVALID))?;
     let target = first
         .strip_prefix("GET ")
         .and_then(|value| value.split_once(' ').map(|pair| pair.0))
-        .ok_or_else(|| AppError::auth("callback_invalid"))?;
+        .ok_or_else(|| AppError::auth(CALLBACK_INVALID))?;
     let callback = redirect
         .join(target)
-        .map_err(|_| AppError::auth("callback_invalid"))?;
+        .map_err(|_| AppError::auth(CALLBACK_INVALID))?;
     if callback.path() != redirect.path() {
-        return Err(AppError::auth("callback_invalid"));
+        return Err(AppError::auth(CALLBACK_INVALID));
     }
     let params = callback
         .query_pairs()
@@ -511,6 +710,7 @@ fn validate_id_token(
     jwks: &JwkSet,
     auth: &AuthArgs,
     nonce: &str,
+    now: u64,
 ) -> Result<(), AppError> {
     let header = decode_header(token).map_err(|_| AppError::auth("id_token_invalid"))?;
     if header.alg != Algorithm::RS256 {
@@ -529,10 +729,6 @@ fn validate_id_token(
     let claims = decode::<IdClaims>(token, &key, &validation)
         .map_err(|_| AppError::auth("id_token_invalid"))?
         .claims;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| AppError::auth("clock_invalid"))?
-        .as_secs();
     validate_claims(&claims, auth, nonce, now)
 }
 
@@ -542,7 +738,7 @@ fn validate_claims(
     nonce: &str,
     now: u64,
 ) -> Result<(), AppError> {
-    if claims.iss.trim_end_matches('/') != auth.issuer.as_str().trim_end_matches('/') {
+    if claims.iss != auth.issuer.as_str() {
         return Err(AppError::auth("issuer_mismatch"));
     }
     if claims.exp <= now {
@@ -550,6 +746,16 @@ fn validate_claims(
     }
     if !claims.aud.contains(&auth.client_id) {
         return Err(AppError::auth("audience_mismatch"));
+    }
+    if matches!(claims.aud, Audience::Many(_)) && claims.azp.as_deref() != Some(&auth.client_id) {
+        return Err(AppError::auth("authorized_party_mismatch"));
+    }
+    if claims
+        .azp
+        .as_deref()
+        .is_some_and(|azp| azp != auth.client_id)
+    {
+        return Err(AppError::auth("authorized_party_mismatch"));
     }
     if claims.nonce != nonce {
         return Err(AppError::auth("nonce_mismatch"));
@@ -561,9 +767,29 @@ fn validate_claims(
 }
 
 async fn rotate(args: RotateArgs) -> Result<Value, AppError> {
-    secure_remote_url(&args.rss_base_url, true)?;
+    let http = ReqwestHttpPort::new(args.auth.ca_certificate.as_ref())?;
+    rotate_with_ports(
+        args,
+        &http,
+        &SystemBrowser,
+        &SystemClock,
+        &LoopbackCallback,
+        &Rs256IdTokenVerifier,
+    )
+    .await
+}
+
+async fn rotate_with_ports(
+    args: RotateArgs,
+    http: &dyn HttpPort,
+    browser: &dyn BrowserPort,
+    clock: &dyn ClockPort,
+    callback: &dyn CallbackPort,
+    verifier: &dyn IdTokenVerifierPort,
+) -> Result<Value, AppError> {
+    secure_remote_url(&args.rss_base_url, false)?;
     let policy = read_policy(&args.input)?;
-    let token = login(&args.auth).await?;
+    let token = authenticate(&args.auth, http, browser, clock, callback, verifier).await?;
     let request_id = Uuid::new_v4();
     let correlation_id = Uuid::new_v4();
     let prepared = prepare_policy_put(
@@ -580,19 +806,40 @@ async fn rotate(args: RotateArgs) -> Result<Value, AppError> {
         &args.auth.tenant_id,
         request_id,
         correlation_id,
+        http,
     )
     .await?;
     match decode_policy_response(response.0, &response.1) {
         PolicyResponse::Accepted(value) => Ok(
-            json!({"schemaVersion":"1","operation":"rotate","outcome":"accepted","requestId":request_id,"correlationId":correlation_id,"authorizationReceiptId":value.receipt_id(),"acceptedGeneration":value.generation(),"condition":value.condition()}),
+            json!({"schemaVersion":"1","operation":"rotate","outcome":"accepted","requestId":request_id,"correlationId":correlation_id,"authorizationReceiptId":value.receipt_id(),"acceptedGeneration":value.generation(),"condition":value.condition().as_str()}),
         ),
         PolicyResponse::Rejected(error) => Err(AppError::from_diagnostic(&error)),
     }
 }
 
 async fn status(args: StatusArgs) -> Result<Value, AppError> {
-    secure_remote_url(&args.rss_base_url, true)?;
-    let token = login(&args.auth).await?;
+    let http = ReqwestHttpPort::new(args.auth.ca_certificate.as_ref())?;
+    status_with_ports(
+        args,
+        &http,
+        &SystemBrowser,
+        &SystemClock,
+        &LoopbackCallback,
+        &Rs256IdTokenVerifier,
+    )
+    .await
+}
+
+async fn status_with_ports(
+    args: StatusArgs,
+    http: &dyn HttpPort,
+    browser: &dyn BrowserPort,
+    clock: &dyn ClockPort,
+    callback: &dyn CallbackPort,
+    verifier: &dyn IdTokenVerifierPort,
+) -> Result<Value, AppError> {
+    secure_remote_url(&args.rss_base_url, false)?;
+    let token = authenticate(&args.auth, http, browser, clock, callback, verifier).await?;
     let request_id = Uuid::new_v4();
     let correlation_id = Uuid::new_v4();
     let prepared = prepare_status_get(args.device_id);
@@ -603,11 +850,12 @@ async fn status(args: StatusArgs) -> Result<Value, AppError> {
         &args.auth.tenant_id,
         request_id,
         correlation_id,
+        http,
     )
     .await?;
     match decode_status_response(response.0, &response.1) {
         StatusResponse::Observed(value) => Ok(
-            json!({"schemaVersion":"1","operation":"status","outcome":"observed","requestId":request_id,"correlationId":correlation_id,"desiredGeneration":value.desired_generation,"authorizationReceiptId":value.authorization_receipt_id,"observedGeneration":value.observed_generation,"activeCommand":value.active_command.map(|item| json!({"fenceEpoch":item.fence_epoch,"state":item.state})),"conditions":value.conditions.into_iter().map(|item| json!({"observedGeneration":item.observed_generation,"reason":item.reason,"status":item.status,"type":item.type_,"lastTransitionAt":item.last_transition_at})).collect::<Vec<_>>() }),
+            json!({"schemaVersion":"1","operation":"status","outcome":"observed","requestId":request_id,"correlationId":correlation_id,"desiredGeneration":value.desired_generation(),"authorizationReceiptId":value.authorization_receipt_id(),"observedGeneration":value.observed_generation(),"activeCommand":value.active_command().map(|item| json!({"fenceEpoch":item.fence_epoch(),"state":item.state().as_str()})),"conditions":value.conditions().iter().map(|item| json!({"observedGeneration":item.observed_generation(),"reason":item.reason().as_str(),"status":item.status().as_str(),"type":item.type_().as_str(),"lastTransitionAt":item.last_transition_at()})).collect::<Vec<_>>() }),
         ),
         StatusResponse::Rejected(error) => Err(AppError::from_diagnostic(&error)),
     }
@@ -620,6 +868,7 @@ async fn send_api(
     tenant: &str,
     request_id: Uuid,
     correlation_id: Uuid,
+    http: &dyn HttpPort,
 ) -> Result<(u16, Vec<u8>), AppError> {
     let url = base
         .join(prepared.path().trim_start_matches('/'))
@@ -644,20 +893,16 @@ async fn send_api(
         "x-correlation-id",
         HeaderValue::from_str(&correlation_id.to_string()).expect("UUID header"),
     );
-    let http = client()?;
-    let mut request = http.request(method, url).headers(headers);
-    if let Some(body) = prepared.body() {
-        request = request
-            .header(CONTENT_TYPE, "application/json")
-            .body(body.to_vec());
-    }
-    let response = request
-        .send()
-        .await
-        .map_err(|_| AppError::transport("request_failed", true))?;
-    let status = response.status().as_u16();
-    let body = bounded_bytes(response).await?;
-    Ok((status, body))
+    let response = http
+        .send(
+            method,
+            url,
+            headers,
+            prepared.body().map(<[u8]>::to_vec),
+            API_TIMEOUT,
+        )
+        .await?;
+    Ok((response.status, response.body))
 }
 
 async fn bounded_bytes(response: reqwest::Response) -> Result<Vec<u8>, AppError> {
@@ -665,40 +910,30 @@ async fn bounded_bytes(response: reqwest::Response) -> Result<Vec<u8>, AppError>
         .content_length()
         .is_some_and(|size| size > MAX_RESPONSE_BYTES as u64)
     {
-        return Err(AppError::untrusted("response_oversize"));
+        return Err(AppError::untrusted(RESPONSE_OVERSIZE));
     }
     let mut bytes = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|_| AppError::transport("response_read_failed", true))?;
         if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
-            return Err(AppError::untrusted("response_oversize"));
+            return Err(AppError::untrusted(RESPONSE_OVERSIZE));
         }
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
 }
 
-async fn bounded_json<T: for<'de> Deserialize<'de>>(
-    response: reqwest::Response,
-) -> Result<T, AppError> {
-    let bytes = bounded_bytes(response).await?;
-    serde_json::from_slice(&bytes).map_err(|_| AppError::untrusted("malformed_json"))
-}
-
 async fn fetch_json<T: for<'de> Deserialize<'de>>(
-    http: &Client,
+    http: &dyn HttpPort,
     url: Url,
     limit: Duration,
 ) -> Result<T, AppError> {
-    let response = timeout(limit, http.get(url).send())
-        .await
-        .map_err(|_| AppError::transport("request_timeout", true))?
-        .map_err(|_| AppError::transport("request_failed", true))?;
-    if response.status() != StatusCode::OK {
+    let response = http.get(url, limit).await?;
+    if response.status != StatusCode::OK.as_u16() {
         return Err(AppError::transport("upstream_rejected", false));
     }
-    bounded_json(response).await
+    serde_json::from_slice(&response.body).map_err(|_| AppError::untrusted("malformed_json"))
 }
 
 #[derive(Deserialize, Serialize)]
@@ -720,9 +955,9 @@ fn audit(input: &str) -> Result<Value, AppError> {
         io::stdin()
             .take((MAX_RESPONSE_BYTES + 1) as u64)
             .read_to_end(&mut bytes)
-            .map_err(|_| AppError::input("input_unreadable"))?;
+            .map_err(|_| AppError::input(INPUT_UNREADABLE))?;
     } else {
-        bytes = fs::read(input).map_err(|_| AppError::input("input_unreadable"))?;
+        bytes = fs::read(input).map_err(|_| AppError::input(INPUT_UNREADABLE))?;
     }
     if bytes.len() > MAX_RESPONSE_BYTES {
         return Err(AppError::input("input_oversize"));
@@ -745,6 +980,8 @@ fn audit(input: &str) -> Result<Value, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{collections::VecDeque, sync::Mutex};
+    use tempfile::tempdir;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{body_json, header, method, path},
@@ -756,6 +993,7 @@ mod tests {
             client_id: "client".to_owned(),
             tenant_id: "tenant".to_owned(),
             redirect_uri: Url::parse("http://127.0.0.1:8765/callback").expect("redirect"),
+            ca_certificate: None,
         }
     }
 
@@ -765,8 +1003,159 @@ mod tests {
             aud: Audience::One("client".to_owned()),
             exp: 2_000,
             nonce: "nonce".to_owned(),
+            azp: None,
             tenant_id: "tenant".to_owned(),
         }
+    }
+
+    struct FakeBrowser;
+    impl BrowserPort for FakeBrowser {
+        fn open(&self, _: &Url) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+    struct FakeClock;
+    impl ClockPort for FakeClock {
+        fn unix_seconds(&self) -> Result<u64, AppError> {
+            Ok(1_000)
+        }
+    }
+    struct FakeCallback;
+    #[async_trait]
+    impl CallbackPort for FakeCallback {
+        async fn authorize(
+            &self,
+            _: &Url,
+            _: &str,
+            authorize: &Url,
+            _: &dyn BrowserPort,
+        ) -> Result<String, AppError> {
+            let query = authorize
+                .query_pairs()
+                .collect::<std::collections::HashMap<_, _>>();
+            assert_eq!(
+                query
+                    .get("code_challenge_method")
+                    .map(std::convert::AsRef::as_ref),
+                Some("S256")
+            );
+            assert!(query.contains_key("state"));
+            assert!(query.contains_key("nonce"));
+            Ok("authorization-code".to_owned())
+        }
+    }
+    struct FakeVerifier;
+    impl IdTokenVerifierPort for FakeVerifier {
+        fn verify(
+            &self,
+            token: &str,
+            _: &JwkSet,
+            _: &AuthArgs,
+            _: &str,
+            now: u64,
+        ) -> Result<(), AppError> {
+            assert_eq!(token, "id-token-bait");
+            assert_eq!(now, 1_000);
+            Ok(())
+        }
+    }
+    type RecordedRequest = (Method, Url, HeaderMap, Option<Vec<u8>>);
+    struct FakeHttp {
+        replies: Mutex<VecDeque<Result<HttpReply, AppError>>>,
+        requests: Mutex<Vec<RecordedRequest>>,
+    }
+    impl FakeHttp {
+        fn new(replies: Vec<Result<HttpReply, AppError>>) -> Self {
+            Self {
+                replies: Mutex::new(replies.into()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+        fn next(&self) -> Result<HttpReply, AppError> {
+            self.replies
+                .lock()
+                .expect("replies")
+                .pop_front()
+                .expect("fake reply")
+        }
+    }
+    #[async_trait]
+    impl HttpPort for FakeHttp {
+        async fn get(&self, _: Url, _: Duration) -> Result<HttpReply, AppError> {
+            self.next()
+        }
+        async fn post_form(
+            &self,
+            _: Url,
+            form: Vec<(String, String)>,
+            _: Duration,
+        ) -> Result<HttpReply, AppError> {
+            assert!(form.iter().any(|(key, _)| key == "code_verifier"));
+            self.next()
+        }
+        async fn send(
+            &self,
+            method: Method,
+            url: Url,
+            headers: HeaderMap,
+            body: Option<Vec<u8>>,
+            _: Duration,
+        ) -> Result<HttpReply, AppError> {
+            self.requests
+                .lock()
+                .expect("requests")
+                .push((method, url, headers, body));
+            self.next()
+        }
+    }
+    fn reply(status: u16, body: &Value) -> HttpReply {
+        HttpReply {
+            status,
+            body: serde_json::to_vec(body).expect("body"),
+        }
+    }
+    fn auth_replies(api_status: u16, api_body: &Value) -> Vec<Result<HttpReply, AppError>> {
+        vec![
+            Ok(reply(
+                200,
+                &json!({"issuer":"https://issuer.example/","authorization_endpoint":"https://issuer.example/authorize","token_endpoint":"https://issuer.example/token","jwks_uri":"https://issuer.example/jwks"}),
+            )),
+            Ok(reply(
+                200,
+                &json!({"access_token":"token-bait","id_token":"id-token-bait"}),
+            )),
+            Ok(reply(200, &json!({"keys":[]}))),
+            Ok(reply(api_status, api_body)),
+        ]
+    }
+    fn rotate_args(input: PathBuf) -> RotateArgs {
+        RotateArgs {
+            auth: auth(),
+            rss_base_url: Url::parse("https://rss.example/").expect("rss"),
+            device_id: Uuid::parse_str("0198d5f2-70de-7a2d-b3f4-012345678901").expect("device"),
+            input,
+            expected_generation: 4,
+            idempotency_key: Some(
+                Uuid::parse_str("0198d5f2-70de-7a2d-b3f4-012345678902").expect("key"),
+            ),
+        }
+    }
+    fn status_args() -> StatusArgs {
+        StatusArgs {
+            auth: auth(),
+            rss_base_url: Url::parse("https://rss.example/").expect("rss"),
+            device_id: Uuid::parse_str("0198d5f2-70de-7a2d-b3f4-012345678901").expect("device"),
+        }
+    }
+    fn policy_file() -> (tempfile::TempDir, PathBuf) {
+        let directory = tempdir().expect("temp");
+        let path = directory.path().join("policy.json");
+        fs::write(
+            &path,
+            r#"{"keyUsages":["clientAuth"],"renewBeforeSeconds":600,"validitySeconds":3600}"#,
+        )
+        .expect("policy");
+        (directory, path)
     }
 
     #[test]
@@ -821,6 +1210,163 @@ mod tests {
         );
     }
 
+    #[test]
+    fn discovery_preserves_keycloak_realm_path_and_issuer_identity_is_exact() {
+        let issuer = Url::parse("https://issuer.example/realms/device").expect("issuer");
+        assert_eq!(
+            discovery_url(&issuer).expect("discovery").as_str(),
+            "https://issuer.example/realms/device/.well-known/openid-configuration"
+        );
+        let mut configured = auth();
+        configured.issuer = issuer;
+        let mut value = claims();
+        value.iss = "https://issuer.example/realms/device/".to_owned();
+        assert_eq!(
+            validate_claims(&value, &configured, "nonce", 1_000)
+                .expect_err("exact issuer")
+                .code,
+            "issuer_mismatch"
+        );
+    }
+
+    #[test]
+    fn multiple_audiences_require_matching_authorized_party() {
+        let mut value = claims();
+        value.aud = Audience::Many(vec!["client".to_owned(), "api".to_owned()]);
+        assert_eq!(
+            validate_claims(&value, &auth(), "nonce", 1_000)
+                .expect_err("missing azp")
+                .code,
+            "authorized_party_mismatch"
+        );
+        value.azp = Some("client".to_owned());
+        assert!(validate_claims(&value, &auth(), "nonce", 1_000).is_ok());
+        value.azp = Some("other".to_owned());
+        assert_eq!(
+            validate_claims(&value, &auth(), "nonce", 1_000)
+                .expect_err("wrong azp")
+                .code,
+            "authorized_party_mismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn injected_ports_drive_complete_rotate_and_typed_exit_mapping() {
+        let (_directory, input) = policy_file();
+        let success = FakeHttp::new(auth_replies(
+            200,
+            &json!({"data":{"acceptedGeneration":5,"authorizationReceiptId":"0198d5f2-70de-7a2d-b3f4-012345678905","condition":"Reconciling"}}),
+        ));
+        let output = rotate_with_ports(
+            rotate_args(input.clone()),
+            &success,
+            &FakeBrowser,
+            &FakeClock,
+            &FakeCallback,
+            &FakeVerifier,
+        )
+        .await
+        .expect("rotate");
+        assert_eq!(output["acceptedGeneration"], 5);
+        assert_eq!(success.requests.lock().expect("requests").len(), 1);
+
+        for (status, body, exit) in [
+            (
+                400,
+                json!({"error":{"code":"ERR_CORE_VALIDATION","details":[],"message":"validation failed","requestId":"r400","retryable":false}}),
+                4,
+            ),
+            (401, json!({"provider":"bait"}), 3),
+            (403, json!({"provider":"bait"}), 3),
+            (
+                404,
+                json!({"error":{"code":"ERR_CORE_NOT_FOUND","details":[],"message":"not found","requestId":"r404","retryable":false}}),
+                4,
+            ),
+            (
+                409,
+                json!({"error":{"code":"ERR_CORE_VERSION_CONFLICT","details":[],"message":"version conflict","requestId":"r409","retryable":true}}),
+                4,
+            ),
+            (429, json!({"provider":"bait"}), 5),
+            (503, json!({"provider":"bait"}), 5),
+            (200, json!({"malformed":true}), 6),
+        ] {
+            let fake = FakeHttp::new(auth_replies(status, &body));
+            let error = rotate_with_ports(
+                rotate_args(input.clone()),
+                &fake,
+                &FakeBrowser,
+                &FakeClock,
+                &FakeCallback,
+                &FakeVerifier,
+            )
+            .await
+            .expect_err("classified");
+            assert_eq!(error.exit_code(), exit);
+            assert!(!error.render().to_string().contains("provider"));
+        }
+    }
+
+    #[tokio::test]
+    async fn oidc_transport_and_malformed_responses_keep_exit_classes() {
+        let transport = FakeHttp::new(vec![Err(AppError::transport("request_timeout", true))]);
+        assert_eq!(
+            authenticate(
+                &auth(),
+                &transport,
+                &FakeBrowser,
+                &FakeClock,
+                &FakeCallback,
+                &FakeVerifier
+            )
+            .await
+            .expect_err("transport")
+            .exit_code(),
+            5
+        );
+        let malformed = FakeHttp::new(vec![Ok(HttpReply {
+            status: 200,
+            body: b"not-json".to_vec(),
+        })]);
+        assert_eq!(
+            authenticate(
+                &auth(),
+                &malformed,
+                &FakeBrowser,
+                &FakeClock,
+                &FakeCallback,
+                &FakeVerifier
+            )
+            .await
+            .expect_err("malformed")
+            .exit_code(),
+            6
+        );
+    }
+
+    #[tokio::test]
+    async fn injected_ports_drive_complete_status_without_ready_inference() {
+        let fake = FakeHttp::new(auth_replies(
+            200,
+            &json!({"data":{"conditions":[{"lastTransitionAt":10,"observedGeneration":4,"reason":"AwaitingDevice","status":"Unknown","type":"PendingDevice"}],"desired":{"activeCommand":{"fenceEpoch":2,"state":"queued"},"authorizationReceiptId":"0198d5f2-70de-7a2d-b3f4-012345678905","generation":5},"observedGeneration":4}}),
+        ));
+        let output = status_with_ports(
+            status_args(),
+            &fake,
+            &FakeBrowser,
+            &FakeClock,
+            &FakeCallback,
+            &FakeVerifier,
+        )
+        .await
+        .expect("status");
+        assert_eq!(output["desiredGeneration"], 5);
+        assert_eq!(output["observedGeneration"], 4);
+        assert_eq!(output["conditions"][0]["type"], "PendingDevice");
+        assert!(output.get("ready").is_none());
+    }
+
     #[tokio::test]
     async fn api_port_sends_exact_headers_method_path_and_canonical_body() {
         let server = MockServer::start().await;
@@ -850,6 +1396,7 @@ mod tests {
             "tenant-one",
             request_id,
             correlation_id,
+            &ReqwestHttpPort::new(None).expect("http"),
         )
         .await
         .expect("response");
@@ -874,6 +1421,7 @@ mod tests {
             "tenant",
             Uuid::new_v4(),
             Uuid::new_v4(),
+            &ReqwestHttpPort::new(None).expect("http"),
         )
         .await
         .expect_err("oversize");

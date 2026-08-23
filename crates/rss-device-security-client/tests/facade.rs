@@ -1,7 +1,8 @@
 use rotation_model::{KeyUsage, RotationPolicy};
 use rss_device_security_client::{
-    DiagnosticKind, POLICY_PUT_OPERATION, PolicyResponse, STATUS_GET_OPERATION, StatusResponse,
-    decode_policy_response, decode_status_response, prepare_policy_put, prepare_status_get,
+    ConditionType, DiagnosticKind, POLICY_PUT_OPERATION, PolicyCondition, PolicyResponse,
+    STATUS_GET_OPERATION, StatusResponse, decode_policy_response, decode_status_response,
+    prepare_policy_put, prepare_status_get,
 };
 use uuid::Uuid;
 
@@ -49,7 +50,7 @@ fn policy_decode_is_typed_and_closed_for_all_status_classes() {
     match decode_policy_response(200, success.as_bytes()) {
         PolicyResponse::Accepted(value) => {
             assert_eq!(value.generation(), 8);
-            assert_eq!(value.condition(), "Reconciling");
+            assert_eq!(value.condition(), PolicyCondition::Reconciling);
         }
         other @ PolicyResponse::Rejected(_) => panic!("unexpected {other:?}"),
     }
@@ -89,9 +90,9 @@ fn status_decode_preserves_canonical_fields_without_ready_inference() {
     );
     match decode_status_response(200, body.as_bytes()) {
         StatusResponse::Observed(value) => {
-            assert_eq!(value.desired_generation, Some(5));
-            assert_eq!(value.observed_generation, 4);
-            assert_eq!(value.conditions[0].type_, "PendingDevice");
+            assert_eq!(value.desired_generation(), Some(5));
+            assert_eq!(value.observed_generation(), 4);
+            assert_eq!(value.conditions()[0].type_(), ConditionType::PendingDevice);
         }
         other @ StatusResponse::Rejected(_) => panic!("unexpected {other:?}"),
     }
