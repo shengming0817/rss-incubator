@@ -83,12 +83,15 @@ The sequence below is the single implementation path. Implemented items remain s
    committed credential; it never restores the old revision or reopens the old subscription. It
    consumes the canonical DTOs through one thin wire
    adapter and does not become an MDM/fleet agent.
-5. **Azure PBI #2123** implements the canonical external T2 journey and focused failures. It does
-   not register a T3 selector or production acceptance carrier.
+5. **Azure PBI #2123** implements the candidate-only external T2 journey. It composes exact public
+   contract projections with the real product mapping code, builds both consumer binaries, and
+   retains only stale-fact forbidden and revoked no-advance negatives. It does not start an RSS
+   image, claim server persistence/readiness, or register a T3 selector or production carrier.
 
 #2121 and the #2117 service mounting/image work may proceed in parallel: this change proves the
-real PKCE/HTTP CLI against mock contracts, while #2123 owns privileged disposable Resource Fact
-seeding and the live external T2 journey. The CLI consumes only #2115 authorization results. Its
+real PKCE/HTTP CLI against mock contracts, while #2123 owns only the public-contract external
+consumer composition. Privileged Resource Fact seeding and exact image lifecycle remain outside
+this T2. The CLI consumes only #2115 authorization results. Its
 closed 403 diagnostic never guesses whether a fact was missing, stale, or denied. `audit` validates
 only the request ID, authorization receipt, and generation from one prior schema-v1 `rotate` result;
 it does not query or claim durable server audit history.

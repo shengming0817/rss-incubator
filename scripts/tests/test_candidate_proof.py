@@ -13,6 +13,7 @@ from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / "candidate-proof.py"
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml"
+CANDIDATE_PIN = Path(__file__).resolve().parents[2] / ".github/rss-candidate.json"
 REPOSITORY = SCRIPT.parents[1]
 ROOT_MANIFEST = REPOSITORY / "Cargo.toml"
 SPEC = importlib.util.spec_from_file_location("candidate_proof", SCRIPT)
@@ -108,19 +109,62 @@ def write_bundle(root: Path, names=("rss-diag-context", "rss-trace-context", "rs
 
 
 class CandidateBundleTests(unittest.TestCase):
-    def test_release_binary_is_preserved_once_at_an_absolute_destination(self):
+    def test_release_binaries_are_preserved_atomically_with_a_bound_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            source = root / "source-agent"
-            source.write_bytes(b"candidate-binary")
-            destination = root / "reference-device-agent"
-            candidate_proof.preserve_release_binary(source, destination)
-            self.assertEqual(b"candidate-binary", destination.read_bytes())
-            self.assertTrue(destination.stat().st_mode & 0o100)
+            sources = root / "sources"
+            sources.mkdir()
+            (sources / "reference-device-agent").write_bytes(b"candidate-agent")
+            (sources / "rotation-control").write_bytes(b"candidate-control")
+            destination = root / "consumers"
+            manifest = candidate_proof.preserve_release_binaries(
+                sources,
+                destination,
+                rss_revision=REVISION,
+                incubator_revision="f" * 40,
+                candidate_lock_sha256="a" * 64,
+                contract_version="0.1.0",
+                contract_checksum="b" * 64,
+            )
+            self.assertEqual(
+                {"consumer-manifest.json", "reference-device-agent", "rotation-control"},
+                {path.name for path in destination.iterdir()},
+            )
+            self.assertEqual(b"candidate-agent", (destination / "reference-device-agent").read_bytes())
+            self.assertEqual(b"candidate-control", (destination / "rotation-control").read_bytes())
+            self.assertTrue((destination / "reference-device-agent").stat().st_mode & 0o100)
+            self.assertTrue((destination / "rotation-control").stat().st_mode & 0o100)
+            self.assertEqual(1, manifest["schemaVersion"])
+            self.assertEqual(REVISION, manifest["rssRevision"])
+            self.assertEqual("f" * 40, manifest["incubatorRevision"])
+            self.assertEqual(
+                ["reference-device-agent", "rotation-control"],
+                [entry["name"] for entry in manifest["binaries"]],
+            )
+            persisted = json.loads(
+                (destination / "consumer-manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest, persisted)
             with self.assertRaises(candidate_proof.ProofError):
-                candidate_proof.preserve_release_binary(source, destination)
+                candidate_proof.preserve_release_binaries(
+                    sources,
+                    destination,
+                    rss_revision=REVISION,
+                    incubator_revision="f" * 40,
+                    candidate_lock_sha256="a" * 64,
+                    contract_version="0.1.0",
+                    contract_checksum="b" * 64,
+                )
             with self.assertRaises(candidate_proof.ProofError):
-                candidate_proof.preserve_release_binary(source, Path("relative-agent"))
+                candidate_proof.preserve_release_binaries(
+                    sources,
+                    Path("relative-consumers"),
+                    rss_revision=REVISION,
+                    incubator_revision="f" * 40,
+                    candidate_lock_sha256="a" * 64,
+                    contract_version="0.1.0",
+                    contract_checksum="b" * 64,
+                )
 
     def test_candidate_cli_exposes_closed_coverage_and_binary_controls(self):
         parsed = candidate_proof.parse_args(
@@ -128,12 +172,43 @@ class CandidateBundleTests(unittest.TestCase):
                 "--bundle",
                 "/candidate",
                 "--coverage",
-                "--binary-output",
-                "/output/reference-device-agent",
+                "--binary-output-directory",
+                "/output/consumers",
             ]
         )
         self.assertTrue(parsed.coverage)
-        self.assertEqual(Path("/output/reference-device-agent"), parsed.binary_output)
+        self.assertEqual(Path("/output/consumers"), parsed.binary_output_directory)
+
+    def test_release_binary_staging_failure_removes_the_sibling_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sources = root / "sources"
+            sources.mkdir()
+            (sources / "reference-device-agent").write_bytes(b"candidate-agent")
+            (sources / "rotation-control").write_bytes(b"candidate-control")
+            destination = root / "consumers"
+
+            with mock.patch.object(
+                candidate_proof.tempfile,
+                "mkdtemp",
+                side_effect=OSError("synthetic staging failure"),
+            ):
+                with self.assertRaisesRegex(
+                    candidate_proof.ProofError,
+                    "cannot preserve candidate release binaries",
+                ):
+                    candidate_proof.preserve_release_binaries(
+                        sources,
+                        destination,
+                        rss_revision=REVISION,
+                        incubator_revision="f" * 40,
+                        candidate_lock_sha256="a" * 64,
+                        contract_version="0.1.0",
+                        contract_checksum="b" * 64,
+                    )
+
+            self.assertFalse(destination.exists())
+            self.assertFalse((root / ".consumers.lock").exists())
 
     def test_conformance_candidate_is_mandatory(self):
         package = candidate_proof.CandidatePackage(
@@ -194,7 +269,11 @@ class CandidateBundleTests(unittest.TestCase):
         excluded_members = set(manifest["workspace"]["exclude"])
         repository_members = {
             str(path.parent.relative_to(REPOSITORY))
-            for root in (REPOSITORY / "apps", REPOSITORY / "crates")
+            for root in (
+                REPOSITORY / "apps",
+                REPOSITORY / "crates",
+                REPOSITORY / "journeys",
+            )
             for path in root.glob("*/Cargo.toml")
         }
 
@@ -205,6 +284,7 @@ class CandidateBundleTests(unittest.TestCase):
                 "apps/rotation-control",
                 "crates/platform-authoring-smoke",
                 "crates/rss-device-security-client",
+                "journeys/secure-device-rotation",
             },
         )
         self.assertTrue(excluded_members < repository_members)
@@ -227,6 +307,16 @@ class CandidateBundleTests(unittest.TestCase):
         self.assertEqual(workflow.count("python3 scripts/candidate-proof.py"), 1)
         self.assertIn("python3 scripts/candidate-proof.py", candidate_job)
         self.assertIn("--coverage", candidate_job)
+        self.assertIn("--binary-output-directory", candidate_job)
+        self.assertIn("consumer-manifest.json", candidate_job)
+        self.assertIn(".github/rss-candidate.json", candidate_job)
+        self.assertNotIn("actions/workflows/candidate-bundle.yml/runs", candidate_job)
+        pin = json.loads(CANDIDATE_PIN.read_text(encoding="utf-8"))
+        self.assertEqual(1, pin["schemaVersion"])
+        self.assertRegex(pin["rssRevision"], r"^[0-9a-f]{40}$")
+        self.assertRegex(pin["artifactDigest"], r"^sha256:[0-9a-f]{64}$")
+        self.assertIn(str(pin["runId"]), pin["artifactName"])
+        self.assertIn(pin["rssRevision"], pin["artifactName"])
         self.assertEqual(workflow.count("RUST_VERSION: 1.96.0"), 1)
 
     def test_reference_agent_local_client_exception_is_exact(self):
@@ -289,6 +379,38 @@ class CandidateBundleTests(unittest.TestCase):
                         kind,
                     )
                 )
+
+    def test_t2_journey_local_client_exception_is_exact(self):
+        repository = REPOSITORY
+        manifest = repository / candidate_proof.T2_JOURNEY_MANIFEST
+        valid = {"path": candidate_proof.T2_JOURNEY_CLIENT_PATH}
+        self.assertTrue(
+            candidate_proof.allowed_local_device_client_dependency(
+                repository,
+                manifest,
+                candidate_proof.DEVICE_SECURITY_CLIENT,
+                candidate_proof.DEVICE_SECURITY_CLIENT,
+                valid,
+                None,
+                None,
+            )
+        )
+        candidate_proof.validate_t2_journey_dependencies(repository)
+        for specification in (
+            {"path": "../../crates/rss-device-security-client-decoy"},
+            {"path": candidate_proof.T2_JOURNEY_CLIENT_PATH, "version": "0.0.0"},
+        ):
+            self.assertFalse(
+                candidate_proof.allowed_local_device_client_dependency(
+                    repository,
+                    manifest,
+                    candidate_proof.DEVICE_SECURITY_CLIENT,
+                    candidate_proof.DEVICE_SECURITY_CLIENT,
+                    specification,
+                    None,
+                    None,
+                )
+            )
 
     def test_reference_agent_rejects_every_extra_or_weakened_rss_edge(self):
         repository = Path("/snapshot")

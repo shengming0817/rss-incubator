@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       rssRunId:
-        description: Exact successful RSS candidate-bundle workflow run ID.
+        description: Optional exact RSS candidate-bundle run override; otherwise use the committed pin.
         required: false
         type: string
 
@@ -138,13 +138,20 @@ jobs:
           RSS_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.rssRunId || '' }}
         run: |
           set -euo pipefail
+          pin="$(jq -ce '
+            if .schemaVersion == 1 and
+               (.runId | type == "number") and
+               (.runAttempt | type == "number") and
+               (.rssRevision | test("^[0-9a-f]{40}$")) and
+               (.artifactName | type == "string") and
+               (.artifactDigest | test("^sha256:[0-9a-f]{64}$"))
+            then . else error("candidate pin is malformed") end
+          ' .github/rss-candidate.json)"
           if [[ -z "$RSS_RUN_ID" ]]; then
-            runs="$(gh api --method GET \
-              repos/shengming0817/rss/actions/workflows/candidate-bundle.yml/runs \
-              -f branch=develop -f event=workflow_dispatch -f status=success -f per_page=1)"
-            RSS_RUN_ID="$(jq -er \
-              '.workflow_runs | if length == 1 then .[0].id else error("no successful candidate producer") end' \
-              <<< "$runs")"
+            RSS_RUN_ID="$(jq -er '.runId' <<< "$pin")"
+            pin_mode=true
+          else
+            pin_mode=false
           fi
           [[ "$RSS_RUN_ID" =~ ^[1-9][0-9]*$ ]]
           run_json="$(gh api "repos/shengming0817/rss/actions/runs/$RSS_RUN_ID")"
@@ -167,6 +174,20 @@ jobs:
           ' <<< "$artifacts")"
           digest="$(jq -r '.digest' <<< "$artifact")"
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          if [[ "$pin_mode" == true ]]; then
+            jq -e \
+              --argjson run_id "$RSS_RUN_ID" \
+              --argjson attempt "$attempt" \
+              --arg revision "$revision" \
+              --arg name "$artifact_name" \
+              --arg digest "$digest" \
+              '.runId == $run_id and
+               .runAttempt == $attempt and
+               .rssRevision == $revision and
+               .artifactName == $name and
+               .artifactDigest == $digest' \
+              <<< "$pin" >/dev/null
+          fi
           {
             echo "name=$artifact_name"
             echo "revision=$revision"
@@ -192,27 +213,50 @@ jobs:
         run: |
           set -euo pipefail
           proof_log="$RUNNER_TEMP/candidate-proof.log"
+          consumer_directory="$RUNNER_TEMP/device-security-consumers"
+          [[ ! -e "$consumer_directory" ]]
           python3 scripts/candidate-proof.py \
             --bundle "$RUNNER_TEMP/rss-candidate-bundle" \
+            --binary-output-directory "$consumer_directory" \
             --coverage | tee "$proof_log"
           summary="$(tail -n 1 "$proof_log")"
+          consumer_manifest="$(cat "$consumer_directory/consumer-manifest.json")"
           jq -e --arg revision "$RSS_EXPECTED_REVISION" \
             --arg incubator_revision "$INCUBATOR_EXPECTED_REVISION" \
             '.schemaVersion == 1 and
              .rssRevision == $revision and
              .incubatorRevision == $incubator_revision and
-             ([.packages[].name] | sort) == (.consumedPackages | sort)' \
+             ([.packages[].name] | sort) == (.consumedPackages | sort) and
+             ([.consumerBinaries[].name] | sort) ==
+               ["reference-device-agent","rotation-control"]' \
             <<< "$summary" >/dev/null
+          jq -e \
+            --arg revision "$RSS_EXPECTED_REVISION" \
+            --arg incubator_revision "$INCUBATOR_EXPECTED_REVISION" \
+            --arg lock "$(jq -r '.candidateLockSha256' <<< "$summary")" \
+            '.schemaVersion == 1 and
+             .rssRevision == $revision and
+             .incubatorRevision == $incubator_revision and
+             .candidateLockSha256 == $lock and
+             .contract.name == "rss-device-security-contracts" and
+             ([.binaries[].name] | sort) ==
+               ["reference-device-agent","rotation-control"] and
+             ([.binaries[].sha256] | all(test("^[0-9a-f]{64}$")))' \
+            <<< "$consumer_manifest" >/dev/null
           {
             echo 'summary<<RSS_CANDIDATE_SUMMARY'
             echo "$summary"
             echo 'RSS_CANDIDATE_SUMMARY'
+            echo 'consumer_manifest<<RSS_CONSUMER_MANIFEST'
+            echo "$consumer_manifest"
+            echo 'RSS_CONSUMER_MANIFEST'
           } >> "$GITHUB_OUTPUT"
 
       - name: Publish first-green summary
         env:
           RSS_ARTIFACT_DIGEST: ${{ steps.artifact.outputs.digest }}
           RSS_PROOF_SUMMARY: ${{ steps.proof.outputs.summary }}
+          RSS_CONSUMER_MANIFEST: ${{ steps.proof.outputs.consumer_manifest }}
         run: |
           set -euo pipefail
           {
@@ -225,9 +269,13 @@ jobs:
             echo "- Artifact identity: \`${{ steps.artifact.outputs.name }}\`"
             echo "- Artifact digest: \`$RSS_ARTIFACT_DIGEST\`"
             echo "- Candidate lock SHA-256: \`$(jq -r '.candidateLockSha256' <<< "$RSS_PROOF_SUMMARY")\`"
+            echo "- Device-security contract: \`$(jq -r '.contract.name + "@" + .contract.version' <<< "$RSS_CONSUMER_MANIFEST")\` — checksum \`$(jq -r '.contract.checksum' <<< "$RSS_CONSUMER_MANIFEST")\`"
             echo '- Registry-only resolution: verified'
             echo '- Candidate matrix: `cargo check`, `cargo test`, `cargo test --doc`, and `cargo clippy` passed with `--locked --offline`'
             echo '- Affected line coverage: at least 80% for the reference agent app and core'
+            echo '- External T2 journey: public acceptance/ACK/report/receipt/status lineage, stale-fact forbidden, and revoked no-advance passed'
+            echo '- Ephemeral consumer binaries:'
+            jq -r '.binaries[] | "  - `\(.name)` — SHA-256 `\(.sha256)`"' <<< "$RSS_CONSUMER_MANIFEST"
             echo '- Release Surface packages:'
             jq -r '.rssRevision as $revision | .packages[] | "  - `\(.name)@\(.version)` — checksum `\(.checksum)` — archive VCS `\($revision)`"' <<< "$RSS_PROOF_SUMMARY"
             echo '- Consumed RSS packages:'

@@ -5,17 +5,19 @@ device identity over MQTT v5 with mandatory mTLS, QoS 1, a persistent session, a
 PUBACK. It is deliberately not a generic SDK, fleet agent, enrollment client, CA client, artifact
 downloader, inventory system, or control plane.
 
-Build and preserve the executable only through the isolated candidate proof. The output path must
-be absolute, its parent must already exist, and the destination must not exist:
+Build and preserve both device-security consumer executables only through the isolated candidate
+proof. The output directory must be absolute, its parent must already exist, and the directory must
+not exist:
 
 ```sh
 python3 scripts/candidate-proof.py \
   --bundle /absolute/path/to/rss-candidate-bundle \
-  --binary-output /absolute/path/to/reference-device-agent
+  --binary-output-directory /absolute/path/to/device-security-consumers
 ```
 
-The proof writes the binary only after the locked/offline candidate matrix passes. The executable
-then accepts exactly one absolute configuration path:
+The proof writes `reference-device-agent`, `rotation-control`, and
+`consumer-manifest.json` only after the locked/offline candidate matrix passes. The agent
+executable then accepts exactly one absolute configuration path:
 
 ```sh
 reference-device-agent /absolute/path/to/config.json

@@ -108,9 +108,10 @@ python3 scripts/candidate-proof.py --bundle /absolute/path/to/rss-candidate-bund
 ```
 
 Add `--coverage` to enforce the affected reference-agent package line threshold. Add
-`--binary-output /absolute/nonexistent/path` to perform a release build and atomically preserve the
-executable after all locked/offline proof gates pass; temporary snapshot sources and locks are still
-discarded.
+`--binary-output-directory /absolute/nonexistent/directory` to perform a release build and
+atomically preserve `rotation-control`, `reference-device-agent`, and a checksum-bearing
+`consumer-manifest.json` after all locked/offline proof gates pass. Temporary snapshot sources and
+locks are still discarded.
 
 The bundle carries the complete RSS Release Surface exact-set. Before Cargo resolution, the proof
 statically discovers the subset directly consumed by this workspace, enforces the device-security
@@ -129,12 +130,19 @@ stable logical candidate source is mapped to the already-validated local registr
 filesystem paths never enter the candidate lock. The candidate metadata/build/test/lint matrix is
 explicitly locked and offline; the real checkout and committed baseline lock remain unchanged.
 
-The `CI` workflow uses its pinned successful RSS candidate-bundle run ID on pull requests and pushes;
-maintainers may override it from a manual dispatch. `RSS_ARTIFACTS_READ_TOKEN` is a fine-grained Actions secret with read-only access to the RSS
+The `CI` workflow reads its successful RSS candidate-bundle identity from the reviewed
+`.github/rss-candidate.json` pin on pull requests and pushes; maintainers may supply one exact run
+override from a manual dispatch. It never resolves a mutable latest-successful run.
+`RSS_ARTIFACTS_READ_TOKEN` is a fine-grained Actions secret with read-only access to the RSS
 repository's workflow artifacts. The workflow derives the RSS revision, run attempt, artifact name,
 and digest from that immutable run. The job summary publishes both canonical run URLs, both commits,
 artifact identity and digest, the dynamic package exact-set with checksums and verified archive VCS,
 the consumed set, candidate-lock digest, registry-only result, and locked/offline matrix result.
+
+A green candidate proof also runs the
+[Secure Device Rotation external T2 journey](journeys/secure-device-rotation/README.md) against the
+exact public contracts candidate and builds both consumer binaries. The binaries, candidate
+registry, manifest, logs, and test state remain runner-temporary and are not uploaded or committed.
 
 A green candidate proof establishes only this repository's product-consumption seam. It does not
 establish RSS release correctness, RC status, package maturity, publish approval, an official
