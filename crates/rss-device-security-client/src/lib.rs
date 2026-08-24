@@ -35,39 +35,20 @@ use rss_device_security_contracts::{
         IdentityDeviceCertificatePolicyPutPolicyKeyUsagesItem,
         IdentityDeviceCertificatePolicyPutPolicySansItem,
         IdentityDeviceCertificatePolicyPutRequest, IdentityDeviceCertificatePolicyPutResponse,
-        IdentityDeviceCertificatePolicyPutValidationResponse,
+        IdentityDeviceCertificatePolicyPutValidationResponse, OPERATION as POLICY_PUT_OPERATION,
     },
     status_get::{
         ActiveCommandState as CanonicalActiveCommandState,
         ConditionReason as CanonicalConditionReason, ConditionStatus as CanonicalConditionStatus,
         ConditionType as CanonicalConditionType, IdentityDeviceCertificateStatusGetResponse,
+        OPERATION as STATUS_GET_OPERATION,
     },
 };
 use uuid::Uuid;
 
-/// Canonical operation descriptor independent of any HTTP implementation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct OperationDescriptor {
-    pub method: &'static str,
-    pub path_template: &'static str,
+fn bind_device_path(path_template: &str, device_id: Uuid) -> String {
+    path_template.replace("{deviceId}", &device_id.to_string())
 }
-
-impl OperationDescriptor {
-    fn path_for(self, device_id: Uuid) -> String {
-        self.path_template
-            .replace("{deviceId}", &device_id.to_string())
-    }
-}
-
-pub const POLICY_PUT_OPERATION: OperationDescriptor = OperationDescriptor {
-    method: "PUT",
-    path_template: "/api/v2/identity/devices/{deviceId}/certificate-policy",
-};
-
-pub const STATUS_GET_OPERATION: OperationDescriptor = OperationDescriptor {
-    method: "GET",
-    path_template: "/api/v2/identity/devices/{deviceId}/certificate-status",
-};
 
 /// A fully prepared canonical request. Its body is intentionally redacted from `Debug`.
 #[derive(Clone, Eq, PartialEq)]
@@ -171,8 +152,8 @@ pub fn prepare_policy_put(
     .map_err(|_| FacadeError::InvalidInput)?;
     let body = serde_json::to_vec(&request).map_err(|_| FacadeError::Serialization)?;
     Ok(PreparedRequest {
-        method: POLICY_PUT_OPERATION.method,
-        path: POLICY_PUT_OPERATION.path_for(device_id),
+        method: POLICY_PUT_OPERATION.method().as_str(),
+        path: bind_device_path(POLICY_PUT_OPERATION.path_template(), device_id),
         body: Some(body),
     })
 }
@@ -180,8 +161,8 @@ pub fn prepare_policy_put(
 #[must_use]
 pub fn prepare_status_get(device_id: Uuid) -> PreparedRequest {
     PreparedRequest {
-        method: STATUS_GET_OPERATION.method,
-        path: STATUS_GET_OPERATION.path_for(device_id),
+        method: STATUS_GET_OPERATION.method().as_str(),
+        path: bind_device_path(STATUS_GET_OPERATION.path_template(), device_id),
         body: None,
     }
 }

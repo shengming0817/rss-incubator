@@ -1,9 +1,9 @@
 use rotation_model::{KeyUsage, RotationPolicy};
 use rss_device_security_client::{
-    ConditionType, DiagnosticKind, POLICY_PUT_OPERATION, PolicyCondition, PolicyResponse,
-    STATUS_GET_OPERATION, StatusResponse, decode_policy_response, decode_status_response,
-    prepare_policy_put, prepare_status_get,
+    ConditionType, DiagnosticKind, PolicyCondition, PolicyResponse, StatusResponse,
+    decode_policy_response, decode_status_response, prepare_policy_put, prepare_status_get,
 };
+use rss_device_security_contracts::{policy_put, status_get};
 use uuid::Uuid;
 
 const DEVICE: &str = "0198d5f2-70de-7a2d-b3f4-012345678901";
@@ -21,13 +21,14 @@ fn policy() -> RotationPolicy {
 
 #[test]
 fn descriptors_and_prepared_requests_are_canonical_and_redacted() {
-    assert_eq!(POLICY_PUT_OPERATION.method, "PUT");
-    assert_eq!(STATUS_GET_OPERATION.method, "GET");
     let device = Uuid::parse_str(DEVICE).expect("device");
     let request = prepare_policy_put(device, 7, Uuid::nil(), &policy()).expect("request");
+    assert_eq!(request.method(), policy_put::OPERATION.method().as_str());
     assert_eq!(
         request.path(),
-        format!("/api/v2/identity/devices/{DEVICE}/certificate-policy")
+        policy_put::OPERATION
+            .path_template()
+            .replace("{deviceId}", DEVICE)
     );
     let body: serde_json::Value =
         serde_json::from_slice(request.body().expect("body")).expect("JSON");
@@ -38,7 +39,13 @@ fn descriptors_and_prepared_requests_are_canonical_and_redacted() {
     assert!(!debug.contains(DEVICE));
     assert!(!debug.contains("private.device.example"));
     let status = prepare_status_get(device);
-    assert_eq!(status.method(), "GET");
+    assert_eq!(status.method(), status_get::OPERATION.method().as_str());
+    assert_eq!(
+        status.path(),
+        status_get::OPERATION
+            .path_template()
+            .replace("{deviceId}", DEVICE)
+    );
     assert!(status.body().is_none());
 }
 
