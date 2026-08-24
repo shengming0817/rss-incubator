@@ -692,7 +692,9 @@ dependencies = [
 name = "reference-device-agent-core"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "rcgen",
+ "ring",
  "rotation-model",
  "rumqttc",
  "rustix",

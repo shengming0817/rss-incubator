@@ -16,4 +16,5 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = "deny"
+cognitive_complexity = "deny"
 pedantic = "deny"

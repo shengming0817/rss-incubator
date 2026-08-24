@@ -5,7 +5,17 @@ device identity over MQTT v5 with mandatory mTLS, QoS 1, a persistent session, a
 PUBACK. It is deliberately not a generic SDK, fleet agent, enrollment client, CA client, artifact
 downloader, inventory system, or control plane.
 
-The executable accepts exactly one absolute configuration path:
+Build and preserve the executable only through the isolated candidate proof. The output path must
+be absolute, its parent must already exist, and the destination must not exist:
+
+```sh
+python3 scripts/candidate-proof.py \
+  --bundle /absolute/path/to/rss-candidate-bundle \
+  --binary-output /absolute/path/to/reference-device-agent
+```
+
+The proof writes the binary only after the locked/offline candidate matrix passes. The executable
+then accepts exactly one absolute configuration path:
 
 ```sh
 reference-device-agent /absolute/path/to/config.json
@@ -29,7 +39,8 @@ fallback.
     "port": 8883,
     "clientId": "rss-reference-device-00000000-0000-0000-0000-000000000001-00000000-0000-0000-0000-000000000101",
     "sessionExpirySeconds": 3600,
-    "requestCapacity": 16
+    "requestCapacity": 16,
+    "brokerAssertionPublicKey": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
   },
   "initial": {
     "desiredGeneration": 1,
@@ -51,6 +62,11 @@ the catalog root. The certificate must chain to the configured CA, match its pri
 valid, and contain the exact URI SAN
 `urn:rss:mqtt-device:v1:<tenant>:<device>:<credential-generation>`. Private keys must be owner-only
 on Unix.
+
+`brokerAssertionPublicKey` is the canonical unpadded base64url encoding of a 32-byte Ed25519 public
+key. Its private half belongs only to the broker plugin. Every command must carry a broker-minted
+assertion binding the target identity, topic, correlation ID, payload digest, QoS, and retain bit;
+retained commands and publisher-supplied reserved assertion properties are rejected.
 
 The only command subscription is:
 

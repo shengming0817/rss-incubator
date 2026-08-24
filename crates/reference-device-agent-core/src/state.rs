@@ -14,6 +14,30 @@ use crate::{
 };
 
 pub(crate) const OUTBOX_LIMIT: usize = 128;
+const COMMAND_JOURNAL_LIMIT: usize = 1024;
+
+pub(crate) struct AcceptedCommand {
+    pub command_id: String,
+    pub fingerprint: String,
+    pub generation: u64,
+    pub fence: u64,
+    pub credential_generation: u64,
+    pub revision: u64,
+    pub artifact_digest: String,
+    pub expires_at: i64,
+    pub observed_at: i64,
+    pub retain_until_epoch_seconds: u64,
+}
+
+pub(crate) struct RejectedCommand {
+    pub command_id: String,
+    pub fingerprint: String,
+    pub generation: u64,
+    pub fence: u64,
+    pub rejection: CommandRejection,
+    pub observed_at: i64,
+    pub retain_until_epoch_seconds: u64,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -25,18 +49,54 @@ pub enum StoreError {
     OutboxFull,
     #[error("credential revision already exists with different material")]
     RevisionConflict,
+    #[error("device state is already owned by another process")]
+    AlreadyOpen,
+    #[error("durable command journal is full")]
+    CommandJournalFull,
 }
 
 pub(crate) struct StateStore {
     root: PathBuf,
+    _owner_lock: File,
 }
 
 impl StateStore {
+    fn open(root: impl Into<PathBuf>) -> Result<Self, StoreError> {
+        let root = root.into();
+        fs::create_dir_all(&root).map_err(|_| StoreError::Unavailable)?;
+        let lock_path = root.join("state.owner.lock");
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let owner_lock = options
+            .open(lock_path)
+            .map_err(|_| StoreError::Unavailable)?;
+        rustix::fs::flock(
+            &owner_lock,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        )
+        .map_err(|error| {
+            if error == rustix::io::Errno::WOULDBLOCK {
+                StoreError::AlreadyOpen
+            } else {
+                StoreError::Unavailable
+            }
+        })?;
+        Ok(Self {
+            root,
+            _owner_lock: owner_lock,
+        })
+    }
+
     pub fn load(
         root: impl Into<PathBuf>,
         identity: &DeviceIdentity,
     ) -> Result<(Self, StateV1), StoreError> {
-        let store = Self { root: root.into() };
+        let store = Self::open(root)?;
         let bytes = fs::read(store.state_path()).map_err(|_| StoreError::Unavailable)?;
         let state: StateV1 =
             serde_json::from_slice(&bytes).map_err(|_| StoreError::InvalidState)?;
@@ -51,7 +111,7 @@ impl StateStore {
         initial: &ValidatedCredential,
         initial_digest: &Sha256Digest,
     ) -> Result<(Self, StateV1), StoreError> {
-        let store = Self { root: root.into() };
+        let store = Self::open(root)?;
         fs::create_dir_all(store.credentials_root()).map_err(|_| StoreError::Unavailable)?;
         let state_path = store.state_path();
         let state = if state_path.exists() {
@@ -163,7 +223,7 @@ pub(crate) struct StateV1 {
     identity: StoredIdentity,
     current: StoredCurrent,
     device_sequence: u64,
-    last_command: Option<StoredCommand>,
+    command_journal: Vec<StoredCommand>,
     outbox: Vec<StoredOutbound>,
     reconnect_revision: Option<u64>,
     pending_inbound: Option<StoredInboundSettlement>,
@@ -187,7 +247,7 @@ impl StateV1 {
                 expires_at,
             },
             device_sequence: 0,
-            last_command: None,
+            command_journal: Vec::new(),
             outbox: Vec::new(),
             reconnect_revision: None,
             pending_inbound: None,
@@ -205,7 +265,8 @@ impl StateV1 {
             && self.current.credential_revision > 0
             && self.current.expires_at > 0
             && Sha256Digest::try_from(self.current.artifact_digest.clone()).is_ok()
-            && self.outbox.len() <= OUTBOX_LIMIT;
+            && self.outbox.len() <= OUTBOX_LIMIT
+            && self.command_journal.len() <= COMMAND_JOURNAL_LIMIT;
         if !coordinates_valid {
             return Err(StoreError::InvalidState);
         }
@@ -243,23 +304,29 @@ impl StateV1 {
                 }
             }
         }
-        if let Some(last) = &self.last_command
-            && !last.semantic_valid()
-        {
-            return Err(StoreError::InvalidState);
+        let mut command_ids = std::collections::HashSet::new();
+        for command in &self.command_journal {
+            if !command_ids.insert(command.command_id.as_str()) || !command.semantic_valid() {
+                return Err(StoreError::InvalidState);
+            }
         }
         if let Some(pending) = &self.pending_inbound {
             let generation = CredentialGeneration::try_from(pending.credential_generation)
                 .map_err(|_| StoreError::InvalidState)?;
-            let identity =
-                DeviceIdentity::new(self.identity.tenant_id, self.identity.device_id, generation);
+            let identity = DeviceIdentity::try_new(
+                self.identity.tenant_id,
+                self.identity.device_id,
+                generation,
+            )
+            .map_err(|_| StoreError::InvalidState)?;
             let valid = !pending.command_id.is_empty()
                 && Sha256Digest::try_from(pending.fingerprint.clone()).is_ok()
                 && pending.topic == TopicSet::new(&identity).command()
                 && pending.settlement_token
                     == settlement_token(&pending.topic, &pending.command_id, &pending.fingerprint)
-                && self.last_command.as_ref().is_some_and(|last| {
-                    last.command_id == pending.command_id && last.fingerprint == pending.fingerprint
+                && self.command_journal.iter().any(|command| {
+                    command.command_id == pending.command_id
+                        && command.fingerprint == pending.fingerprint
                 });
             if !valid {
                 return Err(StoreError::InvalidState);
@@ -344,11 +411,8 @@ impl StateV1 {
     pub fn current_identity(&self) -> Result<DeviceIdentity, StoreError> {
         let generation = CredentialGeneration::try_from(self.identity.credential_generation)
             .map_err(|_| StoreError::InvalidState)?;
-        Ok(DeviceIdentity::new(
-            self.identity.tenant_id,
-            self.identity.device_id,
-            generation,
-        ))
+        DeviceIdentity::try_new(self.identity.tenant_id, self.identity.device_id, generation)
+            .map_err(|_| StoreError::InvalidState)
     }
     pub fn reconnect_revision(&self) -> Option<u64> {
         self.reconnect_revision
@@ -375,8 +439,47 @@ impl StateV1 {
                 .then_some(pending.settlement_token.as_str())
         })
     }
-    pub fn last_command(&self) -> Option<&StoredCommand> {
-        self.last_command.as_ref()
+    pub fn command_match(
+        &self,
+        command_id: &str,
+        fingerprint: &str,
+        now_epoch_seconds: u64,
+    ) -> Option<bool> {
+        self.command_journal
+            .iter()
+            .find(|command| {
+                command.command_id == command_id
+                    && command.retain_until_epoch_seconds > now_epoch_seconds
+            })
+            .map(|command| command.fingerprint == fingerprint)
+    }
+
+    pub fn expire_command_journal(&mut self, now_epoch_seconds: u64) {
+        let pending_command = self
+            .pending_inbound
+            .as_ref()
+            .map(|pending| pending.command_id.as_str());
+        self.command_journal.retain(|command| {
+            command.retain_until_epoch_seconds > now_epoch_seconds
+                || pending_command == Some(command.command_id.as_str())
+        });
+    }
+
+    pub fn reserve_command_journal(&self) -> Result<(), StoreError> {
+        (self.command_journal.len() < COMMAND_JOURNAL_LIMIT)
+            .then_some(())
+            .ok_or(StoreError::CommandJournalFull)
+    }
+
+    pub fn command_journal_has_capacity(&self, now_epoch_seconds: u64) -> bool {
+        self.command_journal.len() < COMMAND_JOURNAL_LIMIT
+            || self.command_journal.iter().any(|command| {
+                command.retain_until_epoch_seconds <= now_epoch_seconds
+                    && self
+                        .pending_inbound
+                        .as_ref()
+                        .is_none_or(|pending| pending.command_id != command.command_id)
+            })
     }
 
     pub fn reserve_outbox(&self, count: usize) -> Result<(), StoreError> {
@@ -385,26 +488,26 @@ impl StateV1 {
             .ok_or(StoreError::OutboxFull)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn accept(
-        &mut self,
-        command_id: &str,
-        fingerprint: String,
-        generation: u64,
-        fence: u64,
-        credential_generation: u64,
-        revision: u64,
-        artifact_digest: String,
-        expires_at: i64,
-        observed_at: i64,
-    ) {
-        let previous_identity = self.current_identity().expect("validated state identity");
+    pub fn accept(&mut self, command: AcceptedCommand) -> Result<(), StoreError> {
+        let AcceptedCommand {
+            command_id,
+            fingerprint,
+            generation,
+            fence,
+            credential_generation,
+            revision,
+            artifact_digest,
+            expires_at,
+            observed_at,
+            retain_until_epoch_seconds,
+        } = command;
+        let previous_identity = self.current_identity()?;
         self.device_sequence = self.device_sequence.saturating_add(1);
         let ack_sequence = self.device_sequence;
         self.device_sequence = self.device_sequence.saturating_add(1);
         let report_sequence = self.device_sequence;
-        let ack_event = event_id("ack", command_id);
-        let report_event = event_id("report", command_id);
+        let ack_event = event_id("ack", &command_id);
+        let report_event = event_id("report", &command_id);
         let state_hash = state_hash(
             self.identity.tenant_id,
             self.identity.device_id,
@@ -423,8 +526,8 @@ impl StateV1 {
             expires_at,
         };
         let acknowledgement = StoredAck {
-            command_id: command_id.to_owned(),
-            event_cause: command_id.to_owned(),
+            command_id: command_id.clone(),
+            event_cause: command_id.clone(),
             desired_generation: generation,
             fence_epoch: fence,
             device_sequence: ack_sequence,
@@ -433,22 +536,18 @@ impl StateV1 {
             activates_revision: Some(revision),
             settled_replay: false,
         };
-        self.last_command = Some(StoredCommand {
-            command_id: command_id.to_owned(),
+        let pending_fingerprint = fingerprint.clone();
+        self.command_journal.push(StoredCommand {
+            command_id: command_id.clone(),
             fingerprint,
             acknowledgement: acknowledgement.clone(),
+            retain_until_epoch_seconds,
         });
         let pending_topic = TopicSet::new(&previous_identity).command().to_owned();
-        let pending_fingerprint = self
-            .last_command
-            .as_ref()
-            .expect("stored command")
-            .fingerprint
-            .clone();
         self.pending_inbound = Some(StoredInboundSettlement {
-            settlement_token: settlement_token(&pending_topic, command_id, &pending_fingerprint),
+            settlement_token: settlement_token(&pending_topic, &command_id, &pending_fingerprint),
             topic: pending_topic,
-            command_id: command_id.to_owned(),
+            command_id: command_id.clone(),
             fingerprint: pending_fingerprint,
             credential_generation: previous_identity.credential_generation().get(),
             settled: false,
@@ -460,7 +559,7 @@ impl StateV1 {
         self.outbox.push(StoredOutbound::ReportBlocked {
             event_id: report_event,
             payload: StoredReport {
-                command_id: command_id.to_owned(),
+                command_id,
                 observed_generation: generation,
                 fence_epoch: fence,
                 device_sequence: report_sequence,
@@ -472,21 +571,23 @@ impl StateV1 {
                 credential_revision: revision,
             },
         });
+        Ok(())
     }
 
-    pub fn reject(
-        &mut self,
-        command_id: &str,
-        fingerprint: String,
-        generation: u64,
-        fence: u64,
-        rejection: CommandRejection,
-        observed_at: i64,
-    ) {
+    pub fn reject(&mut self, command: RejectedCommand) {
+        let RejectedCommand {
+            command_id,
+            fingerprint,
+            generation,
+            fence,
+            rejection,
+            observed_at,
+            retain_until_epoch_seconds,
+        } = command;
         self.device_sequence = self.device_sequence.saturating_add(1);
         let acknowledgement = StoredAck {
-            command_id: command_id.to_owned(),
-            event_cause: command_id.to_owned(),
+            command_id: command_id.clone(),
+            event_cause: command_id.clone(),
             desired_generation: generation,
             fence_epoch: fence,
             device_sequence: self.device_sequence,
@@ -495,13 +596,14 @@ impl StateV1 {
             activates_revision: None,
             settled_replay: false,
         };
-        self.last_command = Some(StoredCommand {
-            command_id: command_id.to_owned(),
+        self.command_journal.push(StoredCommand {
+            command_id: command_id.clone(),
             fingerprint,
             acknowledgement: acknowledgement.clone(),
+            retain_until_epoch_seconds,
         });
         self.outbox.push(StoredOutbound::Ack {
-            event_id: event_id("ack", command_id),
+            event_id: event_id("ack", &command_id),
             payload: acknowledgement,
         });
     }
@@ -548,15 +650,24 @@ impl StateV1 {
         })
     }
 
-    pub fn replay_last(&mut self) -> Result<(), StoreError> {
-        let last = self.last_command.clone().ok_or(StoreError::InvalidState)?;
-        let mut acknowledgement = last.acknowledgement;
+    pub fn replay_command(
+        &mut self,
+        command_id: &str,
+        fingerprint: &str,
+    ) -> Result<(), StoreError> {
+        let command = self
+            .command_journal
+            .iter()
+            .find(|command| command.command_id == command_id && command.fingerprint == fingerprint)
+            .cloned()
+            .ok_or(StoreError::InvalidState)?;
+        let mut acknowledgement = command.acknowledgement;
         if acknowledgement.rejection.is_none() {
             acknowledgement.activates_revision = None;
             acknowledgement.settled_replay = true;
         }
         self.outbox.push(StoredOutbound::Ack {
-            event_id: event_id("ack", &last.command_id),
+            event_id: event_id("ack", &command.command_id),
             payload: acknowledgement,
         });
         Ok(())
@@ -681,18 +792,16 @@ pub(crate) struct StoredCommand {
     command_id: String,
     fingerprint: String,
     acknowledgement: StoredAck,
+    retain_until_epoch_seconds: u64,
 }
 
 impl StoredCommand {
-    pub fn matches(&self, command_id: &str, fingerprint: &str) -> Option<bool> {
-        (self.command_id == command_id).then(|| self.fingerprint == fingerprint)
-    }
-
     fn semantic_valid(&self) -> bool {
         self.command_id == self.acknowledgement.command_id
             && !self.command_id.is_empty()
             && Sha256Digest::try_from(self.fingerprint.clone()).is_ok()
             && self.acknowledgement.semantic_valid()
+            && self.retain_until_epoch_seconds > 0
     }
 }
 

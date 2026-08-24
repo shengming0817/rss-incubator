@@ -506,7 +506,54 @@ class ReferenceEnvironment:
             path = self.state / directory
             path.mkdir(exist_ok=True, mode=0o700)
             path.chmod(0o700)
+        self.ensure_broker_assertion_key()
         self.verify_resource_ownership()
+
+    def ensure_broker_assertion_key(self) -> None:
+        private_key = self.state / "mosquitto/assertion-private.pem"
+        public_der = self.state / "mosquitto/assertion-public.der"
+        public_text = self.state / "mosquitto/assertion-public.txt"
+        if not private_key.exists():
+            run(
+                [
+                    "openssl",
+                    "genpkey",
+                    "-algorithm",
+                    "ED25519",
+                    "-out",
+                    str(private_key),
+                ],
+                timeout=30,
+            )
+            private_key.chmod(0o600)
+        validation = run(
+            ["openssl", "pkey", "-in", str(private_key), "-check", "-noout"],
+            check=False,
+            timeout=15,
+        )
+        if validation.returncode != 0:
+            raise ReferenceEnvironmentError("broker assertion private key is invalid")
+        run(
+            [
+                "openssl",
+                "pkey",
+                "-in",
+                str(private_key),
+                "-pubout",
+                "-outform",
+                "DER",
+                "-out",
+                str(public_der),
+            ],
+            timeout=15,
+        )
+        encoded = public_der.read_bytes()
+        public_der.unlink(missing_ok=True)
+        prefix = bytes.fromhex("302a300506032b6570032100")
+        if len(encoded) != len(prefix) + 32 or not encoded.startswith(prefix):
+            raise ReferenceEnvironmentError("broker assertion public key is invalid")
+        public_key = base64.urlsafe_b64encode(encoded[len(prefix) :]).rstrip(b"=").decode()
+        write_private_text(public_text, public_key + "\n")
 
     def require_state(self) -> None:
         if not self.state.exists():
@@ -2192,6 +2239,7 @@ SELECT json_build_object(
         publisher_auth: list[str],
         topic: str,
         message: str,
+        correlation: str | None = None,
     ) -> None:
         subscriber = subprocess.Popen(
             self.mqtt_command_line(
@@ -2216,8 +2264,7 @@ SELECT json_build_object(
         )
         try:
             time.sleep(0.5)
-            self.mqtt_command(
-                [
+            publish = [
                     "mosquitto_pub",
                     *common,
                     *publisher_auth,
@@ -2228,7 +2275,9 @@ SELECT json_build_object(
                     "-m",
                     message,
                 ]
-            )
+            if correlation is not None:
+                publish.extend(["-D", "publish", "correlation-data", correlation])
+            self.mqtt_command(publish)
             stdout, stderr = subscriber.communicate(timeout=12)
         except Exception:
             subscriber.terminate()
@@ -2354,7 +2403,29 @@ SELECT json_build_object(
                 publisher_auth=service_auth,
                 topic=topic,
                 message=f"downlink-{index}",
+                correlation=f"reference-downlink-{index}",
             )
+        retained = self.mqtt_command(
+            [
+                "mosquitto_pub",
+                *common,
+                *service_auth,
+                "-q",
+                "1",
+                "-r",
+                "-D",
+                "publish",
+                "correlation-data",
+                "retained-command",
+                "-t",
+                downlink,
+                "-m",
+                "forbidden",
+            ],
+            check=False,
+        )
+        if not self.mqtt_was_denied(retained):
+            raise ReferenceEnvironmentError("Mosquitto accepted a retained device command")
         self.mqtt_expect_tls_rejection(
             ["mosquitto_pub", *common, "-q", "1", "-t", uplink, "-m", "forbidden"],
             provider_reason="peer did not return a certificate",
@@ -2467,6 +2538,9 @@ SELECT json_build_object(
                 "RSS_AGENT_DEVICE_KEY_PATH": str(self.state / "pki/device.key"),
                 "RSS_AGENT_SERVICE_CERT_PATH": str(self.state / "pki/service.crt"),
                 "RSS_AGENT_SERVICE_KEY_PATH": str(self.state / "pki/service.key"),
+                "RSS_AGENT_BROKER_ASSERTION_PUBLIC_KEY": (
+                    self.state / "mosquitto/assertion-public.txt"
+                ).read_text(encoding="utf-8").strip(),
                 # Candidate proofs build committed snapshots with identical package identities.
                 # Keep the live broker test isolated from those intentionally parallel artifacts.
                 "CARGO_TARGET_DIR": str(ROOT / "target/reference-agent-t2"),
@@ -2554,6 +2628,9 @@ SELECT json_build_object(
             "vaultRoles": vault_roles,
             "mqttAcl": hashlib.sha256(
                 (self.state / "mosquitto/acl").read_bytes()
+            ).hexdigest(),
+            "mqttAssertionPublicKey": hashlib.sha256(
+                (self.state / "mosquitto/assertion-public.txt").read_bytes()
             ).hexdigest(),
         }
 
@@ -2794,11 +2871,13 @@ SELECT json_build_object(
             "vault-tls/vault-ca.pem",
             "vault-tls/vault-cert.pem",
             "vault-tls/vault-key.pem",
+            "mosquitto/assertion-private.pem",
+            "mosquitto/assertion-public.txt",
         }
         material = {}
-        for directory_name in ("pki", "vault-tls"):
+        for directory_name in ("pki", "vault-tls", "mosquitto"):
             for path in sorted((self.state / directory_name).iterdir()):
-                if path.suffix in {".key", ".crt", ".pem"}:
+                if path.suffix in {".key", ".crt", ".pem"} or path.name == "assertion-public.txt":
                     material[f"{directory_name}/{path.name}"] = hashlib.sha256(
                         path.read_bytes()
                     ).hexdigest()

@@ -35,6 +35,8 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
             ROOT / "deploy/vault/deviceidentity-sign.hcl",
             ROOT / "deploy/vault/roles.json",
             ROOT / "deploy/mosquitto/mosquitto.conf",
+            ROOT / "deploy/mosquitto/Dockerfile",
+            ROOT / "deploy/mosquitto/plugin.c",
             ROOT / "deploy/postgres/bootstrap.sql",
             ROOT / "deploy/postgres/pg_hba.conf",
         }
@@ -76,13 +78,18 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
         expected_images = {
             "keycloak": "quay.io/keycloak/keycloak:26.7.0@sha256:0f198be292568439d700cdbfb893e69a6009bb43a94a06a945b1d3d506c76b13",
             "vault": "hashicorp/vault:2.0.3@sha256:a296a888b118615dc01d5f1a6846e6d4a7277946caaed5b447008fff5fe06b54",
-            "mosquitto": "eclipse-mosquitto:2.0.22-openssl@sha256:212f89e1eaeb2c322d6441b64396e3346026674db8fa9c27beac293405c32b3c",
+            "mosquitto": "rss-incubator-mosquitto-command-assertion:2.0.22",
             "postgres": "postgres:18.4-bookworm@sha256:882236b897e39051d2368c5ccc6cda944904723506b2dfc97f2a8f5bc9afa382",
         }
         self.assertEqual(expected_images, {name: service["image"] for name, service in model["services"].items()})
-        for service in model["services"].values():
-            self.assertNotIn("build", service)
-            self.assertNotIn("rss", service["image"].lower())
+        for name, service in model["services"].items():
+            if name == "mosquitto":
+                self.assertEqual(
+                    str(ROOT / "deploy/mosquitto"), service["build"]["context"]
+                )
+            else:
+                self.assertNotIn("build", service)
+                self.assertNotIn("rss", service["image"].lower())
             self.assertIn("healthcheck", service)
             self.assertEqual("0" * 32, service["labels"]["rss.reference.owner"])
             for port in service.get("ports", []):
@@ -221,7 +228,14 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
         self.assertIn("allow_anonymous false", mosquitto)
         self.assertIn("require_certificate true", mosquitto)
         self.assertIn("use_identity_as_username true", mosquitto)
+        self.assertIn("plugin /usr/lib/rss_mqtt_command_assertion.so", mosquitto)
+        self.assertIn("plugin_opt_signing_key", mosquitto)
         self.assertNotIn("listener 1883", mosquitto)
+        plugin = (ROOT / "deploy/mosquitto/plugin.c").read_text(encoding="utf-8")
+        self.assertIn("message->retain", plugin)
+        self.assertIn("AUTHN_SIGNATURE_KEY", plugin)
+        self.assertIn("SERVICE_USERNAME", plugin)
+        self.assertIn("exact_correlation_data", plugin)
 
         policy = (ROOT / "deploy/vault/deviceidentity-sign.hcl").read_text(encoding="utf-8")
         self.assertIn('path "{{mount}}/sign/mqtt-device"', policy)

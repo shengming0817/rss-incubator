@@ -9,7 +9,7 @@ on:
     inputs:
       rssRunId:
         description: Exact successful RSS candidate-bundle workflow run ID.
-        required: true
+        required: false
         type: string
 
 permissions:
@@ -22,6 +22,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  RUST_VERSION: 1.96.0
+  RSS_CANDIDATE_RUN_ID: 32664247065
 
 jobs:
   ci:
@@ -37,8 +39,8 @@ jobs:
       - name: Install pinned Rust toolchain
         run: |
           set -euo pipefail
-          rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
-          rustup default 1.96.0
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
+          rustup default "$RUST_VERSION"
           rustc --version --verbose
           cargo --version --verbose
 
@@ -82,8 +84,8 @@ jobs:
       - name: Install pinned Rust toolchain
         run: |
           set -euo pipefail
-          rustup toolchain install 1.96.0 --profile minimal
-          rustup default 1.96.0
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
           rustc --version --verbose
           cargo --version --verbose
 
@@ -109,7 +111,6 @@ jobs:
 
   candidate-proof:
     name: candidate-proof
-    if: ${{ github.event_name == 'workflow_dispatch' }}
     needs: ci
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -122,14 +123,19 @@ jobs:
       - name: Install pinned Rust toolchain
         run: |
           set -euo pipefail
-          rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
-          rustup default 1.96.0
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy --component llvm-tools-preview
+          rustup default "$RUST_VERSION"
+
+      - name: Install pinned coverage driver
+        uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a
+        with:
+          tool: cargo-llvm-cov@0.8.7
 
       - name: Resolve immutable RSS candidate artifact
         id: artifact
         env:
           GH_TOKEN: ${{ secrets.RSS_ARTIFACTS_READ_TOKEN }}
-          RSS_RUN_ID: ${{ inputs.rssRunId }}
+          RSS_RUN_ID: ${{ inputs.rssRunId || env.RSS_CANDIDATE_RUN_ID }}
         run: |
           set -euo pipefail
           [[ "$RSS_RUN_ID" =~ ^[1-9][0-9]*$ ]]
@@ -166,7 +172,7 @@ jobs:
           name: ${{ steps.artifact.outputs.name }}
           path: ${{ runner.temp }}/rss-candidate-bundle
           repository: shengming0817/rss
-          run-id: ${{ inputs.rssRunId }}
+          run-id: ${{ inputs.rssRunId || env.RSS_CANDIDATE_RUN_ID }}
           github-token: ${{ secrets.RSS_ARTIFACTS_READ_TOKEN }}
 
       - name: Prove locked offline candidate consumption
@@ -177,7 +183,8 @@ jobs:
           set -euo pipefail
           proof_log="$RUNNER_TEMP/candidate-proof.log"
           python3 scripts/candidate-proof.py \
-            --bundle "$RUNNER_TEMP/rss-candidate-bundle" | tee "$proof_log"
+            --bundle "$RUNNER_TEMP/rss-candidate-bundle" \
+            --coverage | tee "$proof_log"
           summary="$(tail -n 1 "$proof_log")"
           jq -e --arg revision "$RSS_EXPECTED_REVISION" \
             '.schemaVersion == 1 and
@@ -199,7 +206,7 @@ jobs:
           {
             echo '## rss-incubator candidate first-green'
             echo
-            echo "- RSS producer run: https://github.com/shengming0817/rss/actions/runs/${{ inputs.rssRunId }}/attempts/${{ steps.artifact.outputs.attempt }}"
+            echo "- RSS producer run: https://github.com/shengming0817/rss/actions/runs/${{ inputs.rssRunId || env.RSS_CANDIDATE_RUN_ID }}/attempts/${{ steps.artifact.outputs.attempt }}"
             echo "- Incubator candidate run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
             echo "- RSS revision: \`$(jq -r '.rssRevision' <<< "$RSS_PROOF_SUMMARY")\`"
             echo "- Incubator revision: \`$(jq -r '.incubatorRevision' <<< "$RSS_PROOF_SUMMARY")\`"
@@ -208,6 +215,7 @@ jobs:
             echo "- Candidate lock SHA-256: \`$(jq -r '.candidateLockSha256' <<< "$RSS_PROOF_SUMMARY")\`"
             echo '- Registry-only resolution: verified'
             echo '- Candidate matrix: `cargo check`, `cargo test`, `cargo test --doc`, and `cargo clippy` passed with `--locked --offline`'
+            echo '- Affected line coverage: at least 80% for the reference agent app and core'
             echo '- Release Surface packages:'
             jq -r '.rssRevision as $revision | .packages[] | "  - `\(.name)@\(.version)` — checksum `\(.checksum)` — archive VCS `\($revision)`"' <<< "$RSS_PROOF_SUMMARY"
             echo '- Consumed RSS packages:'

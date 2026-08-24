@@ -1,5 +1,5 @@
 use std::fs;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::path::Path;
 
 use rcgen::{
@@ -24,19 +24,29 @@ const POLICY: &str = "sha256:222222222222222222222222222222222222222222222222222
 fn accepted_command_is_durable_and_report_waits_for_ack_and_new_session() {
     let fixture = Fixture::new();
     let (mut agent, command) = fixture.agent_and_command();
+    let ack = accept_and_confirm_ack(&fixture, &mut agent, &command);
+    drop(agent);
+    reconnect_confirm_report_and_replay(&fixture, &command, &ack);
+}
+
+fn accept_and_confirm_ack(
+    fixture: &Fixture,
+    agent: &mut ReferenceDeviceAgent,
+    command: &DeviceCommand,
+) -> OutboundFact {
     let command_topic = TopicSet::new(&fixture.initial_identity)
         .command()
         .to_owned();
 
     assert_eq!(
         agent
-            .apply_command(&command_topic, &command, NOW)
+            .apply_command(&command_topic, command, NOW)
             .expect("apply"),
         ApplyOutcome::Accepted
     );
     assert!(agent.rotation_in_flight());
     let settlement_token = agent
-        .pending_settlement_token(&command)
+        .pending_settlement_token(command)
         .expect("settlement token")
         .to_owned();
     agent
@@ -62,7 +72,14 @@ fn accepted_command_is_durable_and_report_waits_for_ack_and_new_session() {
         2
     );
 
-    drop(agent);
+    ack
+}
+
+fn reconnect_confirm_report_and_replay(
+    fixture: &Fixture,
+    command: &DeviceCommand,
+    expected_ack: &OutboundFact,
+) {
     let mut reopened = fixture.open_agent();
     assert!(reopened.next_outbound().is_none());
     reopened
@@ -82,11 +99,12 @@ fn accepted_command_is_durable_and_report_waits_for_ack_and_new_session() {
         .to_owned();
     assert_eq!(
         reopened
-            .apply_command(&current_topic, &command, NOW)
+            .apply_command(&current_topic, command, NOW)
             .expect("duplicate"),
         ApplyOutcome::Duplicate
     );
-    assert_eq!(reopened.next_outbound().expect("replayed ACK"), ack);
+    let replayed = reopened.next_outbound().expect("replayed ACK");
+    assert_eq!(&replayed, expected_ack);
 }
 
 #[test]
@@ -219,6 +237,88 @@ fn conflicting_replay_redelivery_reuses_one_durable_rejection() {
         .confirm_outbound(rejection.event_id())
         .expect("rejection PUBACK");
     assert!(agent.next_outbound().is_none());
+}
+
+#[test]
+fn terminal_command_journal_survives_newer_commands_and_restart() {
+    let fixture = Fixture::new();
+    let mut agent = fixture.open_agent();
+    let topic = fixture.command_topic();
+    let first = fixture.command(
+        "expired-command-first",
+        &fixture.artifact_id,
+        &fixture.artifact_digest,
+        NOW,
+        2,
+        2,
+    );
+    let second = fixture.command(
+        "expired-command-second",
+        &fixture.artifact_id,
+        &fixture.artifact_digest,
+        NOW,
+        2,
+        2,
+    );
+
+    for command in [&first, &second] {
+        assert_eq!(
+            agent.apply_command(&topic, command, NOW).expect("reject"),
+            ApplyOutcome::Rejected(CommandRejection::PolicyRejected)
+        );
+        let acknowledgement = agent.next_outbound().expect("ACK");
+        agent
+            .confirm_outbound(acknowledgement.event_id())
+            .expect("ACK PUBACK");
+    }
+    drop(agent);
+
+    let mut reopened = fixture.open_agent();
+    assert_eq!(
+        reopened
+            .apply_command(&topic, &first, NOW)
+            .expect("historic duplicate"),
+        ApplyOutcome::Duplicate
+    );
+}
+
+#[test]
+fn state_root_has_one_live_process_owner() {
+    let fixture = Fixture::new();
+    let owner = fixture.open_agent();
+    assert!(matches!(
+        ReferenceDeviceAgent::open(fixture.config(), NOW),
+        Err(AgentError::Store(StoreError::AlreadyOpen))
+    ));
+    drop(owner);
+    drop(fixture.open_agent());
+}
+
+#[test]
+fn malformed_delivery_is_durably_terminal_before_puback() {
+    let fixture = Fixture::new();
+    let mut agent = fixture.open_agent();
+    let topic = fixture.command_topic();
+
+    assert_eq!(
+        agent
+            .reject_malformed_delivery(&topic, "poison-command", b"{", NOW)
+            .expect("durable poison disposition"),
+        ApplyOutcome::Rejected(CommandRejection::MalformedCommand)
+    );
+    let acknowledgement = agent.next_outbound().expect("malformed ACK");
+    agent
+        .confirm_outbound(acknowledgement.event_id())
+        .expect("ACK PUBACK");
+    drop(agent);
+
+    let mut reopened = fixture.open_agent();
+    assert_eq!(
+        reopened
+            .reject_malformed_delivery(&topic, "poison-command", b"{", NOW)
+            .expect("durable duplicate"),
+        ApplyOutcome::Duplicate
+    );
 }
 
 #[test]
@@ -402,7 +502,7 @@ fn durable_outbox_applies_backpressure_at_the_fixed_limit() {
     let fixture = Fixture::new();
     let mut agent = fixture.open_agent();
     let topic = fixture.command_topic();
-    for index in 0..128 {
+    for index in 0..127 {
         let command = fixture.command(
             &format!("missing-command-{index:03}"),
             &format!("missing-artifact-{index:03}"),
@@ -418,6 +518,21 @@ fn durable_outbox_applies_backpressure_at_the_fixed_limit() {
             ApplyOutcome::Rejected(CommandRejection::ArtifactUnavailable)
         );
     }
+    assert!(!agent.command_intake_open(NOW));
+    let final_command = fixture.command(
+        "missing-command-final",
+        "missing-artifact-final",
+        &fixture.artifact_digest,
+        NOW + 600,
+        2,
+        2,
+    );
+    assert_eq!(
+        agent
+            .apply_command(&topic, &final_command, NOW)
+            .expect("final one-slot rejection"),
+        ApplyOutcome::Rejected(CommandRejection::ArtifactUnavailable)
+    );
     let overflow = fixture.command(
         "missing-command-overflow",
         "missing-artifact-overflow",
@@ -693,27 +808,30 @@ fn catalog_rejects_wrong_identity_expired_untrusted_and_mismatched_key_material(
         let material = fixture.root.path().join("catalog/material");
         match case {
             "identity" => {
-                let wrong = DeviceIdentity::new(
+                let wrong = DeviceIdentity::try_new(
                     fixture.initial_identity.tenant(),
                     Uuid::parse_str("00000000-0000-0000-0000-000000000999").expect("wrong device"),
                     CredentialGeneration::try_from(2).expect("generation"),
-                );
+                )
+                .expect("identity");
                 issue_credentials(&material, &wrong);
             }
             "expired" => {
-                let next = DeviceIdentity::new(
+                let next = DeviceIdentity::try_new(
                     fixture.initial_identity.tenant(),
                     fixture.device,
                     CredentialGeneration::try_from(2).expect("generation"),
-                );
+                )
+                .expect("identity");
                 issue_expired_credentials(&material, &next);
             }
             "untrusted" => {
-                let next = DeviceIdentity::new(
+                let next = DeviceIdentity::try_new(
                     fixture.initial_identity.tenant(),
                     fixture.device,
                     CredentialGeneration::try_from(2).expect("generation"),
-                );
+                )
+                .expect("identity");
                 let replacement =
                     issue_credentials(&fixture.root.path().join("untrusted-material"), &next);
                 fs::copy(
@@ -867,16 +985,18 @@ impl Fixture {
         let root = tempfile::tempdir().expect("tempdir");
         let tenant = Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("tenant");
         let device = Uuid::parse_str("00000000-0000-0000-0000-000000000101").expect("device");
-        let initial_identity = DeviceIdentity::new(
+        let initial_identity = DeviceIdentity::try_new(
             tenant,
             device,
             CredentialGeneration::try_from(1).expect("generation"),
-        );
-        let next_identity = DeviceIdentity::new(
+        )
+        .expect("identity");
+        let next_identity = DeviceIdentity::try_new(
             tenant,
             device,
             CredentialGeneration::try_from(2).expect("generation"),
-        );
+        )
+        .expect("identity");
         let initial_files = issue_credentials(&root.path().join("initial"), &initial_identity);
         let next_files = issue_credentials(&root.path().join("catalog/material"), &next_identity);
         let artifact_digest = compute_artifact_digest(&next_files)
@@ -929,6 +1049,7 @@ impl Fixture {
                 CredentialRevision::try_from(1).expect("revision"),
             ),
             self.initial_files.clone(),
+            NonZeroU32::new(300).expect("retention"),
         )
     }
 

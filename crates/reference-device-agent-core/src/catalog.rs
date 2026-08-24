@@ -78,7 +78,9 @@ impl ArtifactCatalog {
         }
         let generation = CredentialGeneration::try_from(entry.credential_generation)
             .map_err(|_| CatalogError::Malformed)?;
-        let target_identity = DeviceIdentity::new(identity.tenant(), identity.device(), generation);
+        let target_identity =
+            DeviceIdentity::try_new(identity.tenant(), identity.device(), generation)
+                .map_err(|_| CatalogError::BindingMismatch)?;
         let credential = validate_credential_bytes(
             ca,
             certificate,

@@ -1,17 +1,19 @@
 use std::num::{NonZeroU32, NonZeroUsize};
 
 use reference_device_agent_core::{
-    CredentialGeneration, DeviceIdentity, MqttConnectionConfig, TopicSet, ValueError,
+    BrokerAssertionVerifier, CredentialGeneration, DeviceIdentity, MqttConnectionConfig, TopicSet,
+    ValueError,
 };
 use uuid::Uuid;
 
 #[test]
 fn exact_topics_bind_tenant_device_and_credential_generation() {
-    let identity = DeviceIdentity::new(
+    let identity = DeviceIdentity::try_new(
         Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("tenant"),
         Uuid::parse_str("00000000-0000-0000-0000-000000000101").expect("device"),
         CredentialGeneration::try_from(7).expect("generation"),
-    );
+    )
+    .expect("identity");
     let topics = TopicSet::new(&identity);
 
     assert_eq!(
@@ -48,15 +50,20 @@ fn mqtt_coordinates_reject_invalid_host_port_and_client_id() {
     let expiry = NonZeroU32::new(60).expect("expiry");
     let capacity = NonZeroUsize::new(1).expect("capacity");
     assert_eq!(
-        MqttConnectionConfig::new("", 8883, "client", expiry, capacity),
+        MqttConnectionConfig::new("", 8883, "client", expiry, capacity, verifier()),
         Err(ValueError::InvalidHost)
     );
     assert_eq!(
-        MqttConnectionConfig::new("localhost", 0, "client", expiry, capacity),
+        MqttConnectionConfig::new("localhost", 0, "client", expiry, capacity, verifier()),
         Err(ValueError::InvalidPort)
     );
     assert_eq!(
-        MqttConnectionConfig::new("localhost", 8883, "", expiry, capacity),
+        MqttConnectionConfig::new("localhost", 8883, "", expiry, capacity, verifier()),
         Err(ValueError::InvalidClientId)
     );
+}
+
+fn verifier() -> BrokerAssertionVerifier {
+    BrokerAssertionVerifier::from_base64("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc")
+        .expect("verifier")
 }

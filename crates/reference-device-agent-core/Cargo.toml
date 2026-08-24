@@ -6,6 +6,8 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+base64 = "0.22"
+ring = "0.17"
 rotation-model = { path = "../rotation-model" }
 rumqttc = "=0.25.1"
 rustls = "0.23"

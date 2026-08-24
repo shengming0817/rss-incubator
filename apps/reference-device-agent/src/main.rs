@@ -6,9 +6,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use config::RuntimeConfig;
 use reference_device_agent_core::{
-    AgentError, ApplyOutcome, MqttError, MqttEvent, MqttSession, ReferenceDeviceAgent, TopicSet,
+    AgentError, ApplyOutcome, CommandDelivery, MqttError, MqttEvent, MqttSession,
+    RecoveryCommandScope, ReferenceDeviceAgent, TopicSet,
 };
-use wire::{OutboundKind, decode_command, encode_outbound};
+use tokio_util::sync::CancellationToken;
+use wire::{decode_command, encode_outbound};
+
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, thiserror::Error)]
 enum MainError {
@@ -42,163 +46,402 @@ async fn main() -> Result<(), MainError> {
     let runtime = RuntimeConfig::load(&config_path)?;
     let mut agent = ReferenceDeviceAgent::open(runtime.agent, now())?;
     let mut retry_delay = Duration::from_secs(1);
+    let shutdown = CancellationToken::new();
+    let signal_task = tokio::spawn(wait_for_shutdown(shutdown.clone()));
 
-    loop {
-        match run_session(&runtime.mqtt, &mut agent, &mut retry_delay).await {
-            Ok(()) => retry_delay = Duration::from_secs(1),
+    let result = loop {
+        match run_session(&runtime.mqtt, &mut agent, &mut retry_delay, &shutdown).await {
+            Ok(SessionCompletion::Reconnect) => retry_delay = Duration::from_secs(1),
+            Ok(SessionCompletion::Shutdown) => break Ok(()),
             Err(SessionError::Mqtt(error)) if error.is_retryable() => {
+                if shutdown.is_cancelled() {
+                    break Ok(());
+                }
                 eprintln!(
                     "reference-device-agent event=mqtt_transport_retry kind={} delay_milliseconds={} error={error}",
                     error.kind(),
                     retry_delay.as_millis()
                 );
-                tokio::time::sleep(retry_delay + retry_jitter()).await;
+                tokio::select! {
+                    () = tokio::time::sleep(retry_delay + retry_jitter()) => {}
+                    () = shutdown.cancelled() => break Ok(()),
+                }
                 retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(30));
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => break Err(error.into()),
         }
-    }
+    };
+    signal_task.abort();
+    let _ = signal_task.await;
+    result
 }
 
-// Keeping the event ordering in one loop makes broker acknowledgements and reconnect exits auditable.
-#[allow(clippy::too_many_lines)]
 async fn run_session(
     mqtt: &reference_device_agent_core::MqttConnectionConfig,
     agent: &mut ReferenceDeviceAgent,
     retry_delay: &mut Duration,
-) -> Result<(), SessionError> {
+    shutdown: &CancellationToken,
+) -> Result<SessionCompletion, SessionError> {
     let session_identity = agent.current_identity()?;
     let session_topics = TopicSet::new(&session_identity);
-    let recovery_topic = agent.pending_command_topic().map(str::to_owned);
-    let mut session = MqttSession::new(
+    let recovery_command = agent.pending_command_scope()?;
+    let session = MqttSession::new(
         mqtt,
         &agent.current_credentials(),
-        session_topics.clone(),
-        recovery_topic.clone(),
+        session_topics,
+        recovery_command.clone(),
     )?;
-    let mut publish_pending = None;
-    let mut subscribed = false;
-    let mut connected = false;
-    let mut connected_at = None;
-    let mut unsubscribe_pending = false;
-    let mut pending_command_ack = None;
-    let mut recovery_delivery_observed = false;
-    let mut reconnect_ready = false;
+    SessionDriver::new(agent, session, session_identity, recovery_command)
+        .run(retry_delay, shutdown)
+        .await
+}
 
-    loop {
-        if connected
-            && publish_pending.is_none()
-            && !reconnect_ready
-            && !unsubscribe_pending
-            && let Some(outbound) = agent.next_outbound()
-        {
-            let encoded = encode_outbound(&session_identity, outbound)?;
-            let topic = match encoded.kind {
-                OutboundKind::Acknowledgement => session_topics.command_acknowledged(),
-                OutboundKind::Report => session_topics.certificate_reported(),
+struct SessionDriver<'a> {
+    agent: &'a mut ReferenceDeviceAgent,
+    session: MqttSession,
+    session_identity: reference_device_agent_core::DeviceIdentity,
+    recovery_command: Option<RecoveryCommandScope>,
+    state: SessionState,
+}
+
+impl<'a> SessionDriver<'a> {
+    fn new(
+        agent: &'a mut ReferenceDeviceAgent,
+        session: MqttSession,
+        session_identity: reference_device_agent_core::DeviceIdentity,
+        recovery_command: Option<RecoveryCommandScope>,
+    ) -> Self {
+        Self {
+            agent,
+            session,
+            session_identity,
+            recovery_command,
+            state: SessionState::default(),
+        }
+    }
+
+    async fn run(
+        &mut self,
+        retry_delay: &mut Duration,
+        shutdown: &CancellationToken,
+    ) -> Result<SessionCompletion, SessionError> {
+        loop {
+            self.publish_next().await?;
+            if self.state.shutdown_is_quiescent(self.agent) {
+                self.session.disconnect().await?;
+                return Ok(SessionCompletion::Shutdown);
+            }
+            let event = match self.poll_next(shutdown).await? {
+                DriverPoll::Event(event) => event,
+                DriverPoll::ShutdownStarted => continue,
+                DriverPoll::ShutdownDeadline => return Ok(SessionCompletion::Shutdown),
             };
-            session
-                .publish(&encoded.event_id, topic, encoded.payload)
-                .await?;
-            publish_pending = Some(encoded.kind);
+            if self.state.connection_is_stable() {
+                *retry_delay = Duration::from_secs(1);
+            }
+            if self.handle_event(event).await? == DriverControl::Reconnect {
+                return Ok(SessionCompletion::Reconnect);
+            }
         }
+    }
 
-        let event = session.poll().await;
-        if connected_at.is_some_and(|connected_at: tokio::time::Instant| {
-            connected_at.elapsed() >= Duration::from_mins(1)
-        }) {
-            *retry_delay = Duration::from_secs(1);
+    async fn publish_next(&mut self) -> Result<(), SessionError> {
+        if self.state.can_publish()
+            && let Some(outbound) = self.agent.next_outbound()
+        {
+            let encoded = encode_outbound(&self.session_identity, outbound)?;
+            self.session.publish(encoded.into_mqtt()).await?;
+            self.state.publish = PublishState::Pending;
         }
-        match event? {
-            MqttEvent::Connected { session_present: _ } => {
-                connected = true;
-                connected_at = Some(tokio::time::Instant::now());
-                subscribed = false;
-                let reconnecting = agent.reconnect_revision()?;
-                if let Some(revision) = reconnecting {
-                    agent.mark_current_credential_connected(revision)?;
-                }
-                if let Some(topic) = recovery_topic.as_deref() {
-                    session.unsubscribe_topic(topic).await?;
-                    unsubscribe_pending = true;
-                } else if !agent.rotation_in_flight() {
-                    session.subscribe().await?;
-                }
+        Ok(())
+    }
+
+    async fn poll_next(
+        &mut self,
+        shutdown: &CancellationToken,
+    ) -> Result<DriverPoll, SessionError> {
+        if let Some(deadline) = self.state.shutdown_deadline {
+            return tokio::select! {
+                result = self.session.poll() => Ok(DriverPoll::Event(result?)),
+                () = tokio::time::sleep_until(deadline) => Ok(DriverPoll::ShutdownDeadline),
+            };
+        }
+        tokio::select! {
+            result = self.session.poll() => Ok(DriverPoll::Event(result?)),
+            () = shutdown.cancelled() => {
+                self.start_shutdown().await?;
+                Ok(DriverPoll::ShutdownStarted)
             }
-            MqttEvent::Subscribed => subscribed = true,
-            MqttEvent::Command(delivery) => {
-                if recovery_topic.as_deref() == Some(delivery.topic()) {
-                    recovery_delivery_observed = true;
-                }
-                let identity = agent.delivery_identity(delivery.topic(), delivery.command_id())?;
-                let command = decode_command(&identity, delivery.command_id(), delivery.payload())?;
-                let outcome = agent.apply_command(delivery.topic(), &command, now())?;
-                let settlement_token = agent.pending_settlement_token(&command).map(str::to_owned);
-                if outcome == ApplyOutcome::Accepted {
-                    session.unsubscribe_command().await?;
-                    unsubscribe_pending = true;
-                    pending_command_ack = Some((delivery, settlement_token));
-                } else {
-                    session
-                        .acknowledge_command(&delivery, settlement_token)
-                        .await?;
-                }
-            }
+        }
+    }
+
+    async fn start_shutdown(&mut self) -> Result<(), SessionError> {
+        self.state.shutdown_deadline = Some(tokio::time::Instant::now() + SHUTDOWN_DRAIN_TIMEOUT);
+        if self.state.can_unsubscribe() {
+            self.session.unsubscribe_command().await?;
+            self.state.subscription = SubscriptionState::Unsubscribing;
+        }
+        Ok(())
+    }
+
+    async fn handle_event(&mut self, event: MqttEvent) -> Result<DriverControl, SessionError> {
+        match event {
+            MqttEvent::Connected { session_present: _ } => self.on_connected().await?,
+            MqttEvent::Subscribed => self.state.subscription = SubscriptionState::Active,
+            MqttEvent::Command(delivery) => self.on_command(delivery).await?,
             MqttEvent::OutboundAcknowledged { event_id } => {
-                let kind = publish_pending.take().ok_or(AgentError::UnknownOutbound)?;
-                agent.confirm_outbound(&event_id)?;
-                if agent.reconnect_revision()?.is_some() {
-                    if !unsubscribe_pending && agent.pending_inbound_settled() {
-                        return Ok(());
-                    }
-                    reconnect_ready = true;
-                    if subscribed && !unsubscribe_pending {
-                        session.unsubscribe_command().await?;
-                        unsubscribe_pending = true;
-                    }
-                } else if matches!(kind, OutboundKind::Report) && !subscribed {
-                    session.subscribe().await?;
-                }
+                return self.on_outbound_acknowledged(&event_id).await;
             }
-            MqttEvent::Unsubscribed if pending_command_ack.is_some() => {
-                subscribed = false;
-                unsubscribe_pending = false;
-                let (delivery, settlement_token) =
-                    pending_command_ack.take().expect("checked pending ACK");
-                session
-                    .acknowledge_command(&delivery, settlement_token)
-                    .await?;
-            }
-            MqttEvent::Unsubscribed => {
-                subscribed = false;
-                unsubscribe_pending = false;
-                if recovery_topic.is_some()
-                    && !recovery_delivery_observed
-                    && !agent.pending_inbound_settled()
-                {
-                    agent.mark_pending_inbound_absent()?;
-                }
-                match unsubscribe_completion(
-                    reconnect_ready,
-                    agent.pending_inbound_settled(),
-                    agent.rotation_in_flight(),
-                ) {
-                    UnsubscribeCompletion::Exit => return Ok(()),
-                    UnsubscribeCompletion::Subscribe => session.subscribe().await?,
-                    UnsubscribeCompletion::Wait => {}
-                }
-            }
+            MqttEvent::Unsubscribed => return self.on_unsubscribed().await,
             MqttEvent::InboundAcknowledged { settlement_token } => {
-                if let Some(settlement_token) = settlement_token {
-                    agent.mark_pending_inbound_settled(&settlement_token)?;
-                    if reconnect_ready && !unsubscribe_pending {
-                        return Ok(());
-                    }
-                }
+                return self.on_inbound_acknowledged(settlement_token.as_deref());
             }
             MqttEvent::TransportProgress => {}
         }
+        Ok(DriverControl::Continue)
     }
+
+    async fn on_connected(&mut self) -> Result<(), SessionError> {
+        self.state.connection = ConnectionState::Connected {
+            at: tokio::time::Instant::now(),
+        };
+        self.state.subscription = SubscriptionState::Inactive;
+        if let Some(revision) = self.agent.reconnect_revision()? {
+            self.agent.mark_current_credential_connected(revision)?;
+        }
+        if self.recovery_command.is_some() {
+            self.session.unsubscribe_recovery().await?;
+            self.state.subscription = SubscriptionState::Unsubscribing;
+        } else if self.state.shutdown_deadline.is_none()
+            && !self.agent.rotation_in_flight()
+            && self.agent.command_intake_open(now())
+        {
+            self.session.subscribe().await?;
+        }
+        Ok(())
+    }
+
+    async fn on_command(&mut self, delivery: Box<CommandDelivery>) -> Result<(), SessionError> {
+        if self
+            .recovery_command
+            .as_ref()
+            .is_some_and(|scope| scope.topic() == delivery.topic())
+        {
+            self.state.recovery_observation = RecoveryObservation::Observed;
+        }
+        let outcome = match decode_command(
+            delivery.identity(),
+            delivery.command_id(),
+            delivery.payload(),
+        ) {
+            Ok(command) => self
+                .agent
+                .apply_command(delivery.topic(), &command, now())?,
+            Err(_) => self.agent.reject_malformed_delivery(
+                delivery.topic(),
+                delivery.command_id(),
+                delivery.payload(),
+                now(),
+            )?,
+        };
+        let settlement_token = self
+            .agent
+            .pending_delivery_settlement_token(delivery.topic(), delivery.command_id())
+            .map(str::to_owned);
+        if should_hold_command_ack(
+            outcome == ApplyOutcome::Accepted,
+            self.agent.command_intake_open(now()),
+            self.state.shutdown_deadline.is_some(),
+        ) {
+            self.session.unsubscribe_command().await?;
+            self.state.subscription = SubscriptionState::Unsubscribing;
+            self.state.pending_command_ack = Some((delivery, settlement_token));
+        } else {
+            self.session
+                .acknowledge_command(delivery, settlement_token)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn on_outbound_acknowledged(
+        &mut self,
+        event_id: &str,
+    ) -> Result<DriverControl, SessionError> {
+        if self.state.publish != PublishState::Pending {
+            return Err(AgentError::UnknownOutbound.into());
+        }
+        self.state.publish = PublishState::Idle;
+        self.agent.confirm_outbound(event_id)?;
+        if self.agent.reconnect_revision()?.is_some() {
+            if !self.state.unsubscribe_pending() && self.agent.pending_inbound_settled() {
+                return Ok(DriverControl::Reconnect);
+            }
+            self.state.reconnect = ReconnectState::Ready;
+            if self.state.can_unsubscribe() {
+                self.session.unsubscribe_command().await?;
+                self.state.subscription = SubscriptionState::Unsubscribing;
+            }
+        } else if self.state.can_subscribe() && self.agent.command_intake_open(now()) {
+            self.session.subscribe().await?;
+        }
+        Ok(DriverControl::Continue)
+    }
+
+    async fn on_unsubscribed(&mut self) -> Result<DriverControl, SessionError> {
+        self.state.subscription = SubscriptionState::Inactive;
+        if let Some((delivery, settlement_token)) = self.state.pending_command_ack.take() {
+            self.session
+                .acknowledge_command(delivery, settlement_token)
+                .await?;
+            return Ok(DriverControl::Continue);
+        }
+        if self.recovery_command.is_some()
+            && self.state.recovery_observation == RecoveryObservation::NotObserved
+            && !self.agent.pending_inbound_settled()
+        {
+            self.agent.mark_pending_inbound_absent()?;
+        }
+        match unsubscribe_completion(
+            self.state.reconnect == ReconnectState::Ready,
+            self.agent.pending_inbound_settled(),
+            self.agent.rotation_in_flight(),
+        ) {
+            UnsubscribeCompletion::Exit => Ok(DriverControl::Reconnect),
+            UnsubscribeCompletion::Subscribe
+                if self.state.can_subscribe() && self.agent.command_intake_open(now()) =>
+            {
+                self.session.subscribe().await?;
+                Ok(DriverControl::Continue)
+            }
+            UnsubscribeCompletion::Subscribe | UnsubscribeCompletion::Wait => {
+                Ok(DriverControl::Continue)
+            }
+        }
+    }
+
+    fn on_inbound_acknowledged(
+        &mut self,
+        settlement_token: Option<&str>,
+    ) -> Result<DriverControl, SessionError> {
+        if let Some(settlement_token) = settlement_token {
+            self.agent.mark_pending_inbound_settled(settlement_token)?;
+            if self.state.reconnect == ReconnectState::Ready && !self.state.unsubscribe_pending() {
+                return Ok(DriverControl::Reconnect);
+            }
+        }
+        Ok(DriverControl::Continue)
+    }
+}
+
+#[derive(Default)]
+struct SessionState {
+    publish: PublishState,
+    subscription: SubscriptionState,
+    connection: ConnectionState,
+    pending_command_ack: Option<(Box<CommandDelivery>, Option<String>)>,
+    recovery_observation: RecoveryObservation,
+    reconnect: ReconnectState,
+    shutdown_deadline: Option<tokio::time::Instant>,
+}
+
+impl SessionState {
+    fn can_publish(&self) -> bool {
+        matches!(self.connection, ConnectionState::Connected { .. })
+            && self.publish == PublishState::Idle
+            && self.reconnect == ReconnectState::Dormant
+            && !self.unsubscribe_pending()
+    }
+
+    fn can_unsubscribe(&self) -> bool {
+        matches!(self.connection, ConnectionState::Connected { .. })
+            && self.subscription == SubscriptionState::Active
+    }
+
+    fn can_subscribe(&self) -> bool {
+        self.subscription == SubscriptionState::Inactive && self.shutdown_deadline.is_none()
+    }
+
+    fn connection_is_stable(&self) -> bool {
+        matches!(self.connection, ConnectionState::Connected { at }
+            if at.elapsed() >= Duration::from_mins(1))
+    }
+
+    fn shutdown_is_quiescent(&self, agent: &ReferenceDeviceAgent) -> bool {
+        self.transport_is_quiescent() && agent.next_outbound().is_none()
+    }
+
+    fn transport_is_quiescent(&self) -> bool {
+        self.shutdown_deadline.is_some()
+            && matches!(self.connection, ConnectionState::Connected { .. })
+            && self.publish == PublishState::Idle
+            && self.pending_command_ack.is_none()
+            && !self.unsubscribe_pending()
+    }
+
+    fn unsubscribe_pending(&self) -> bool {
+        self.subscription == SubscriptionState::Unsubscribing
+    }
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum PublishState {
+    #[default]
+    Idle,
+    Pending,
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum SubscriptionState {
+    #[default]
+    Inactive,
+    Active,
+    Unsubscribing,
+}
+
+#[derive(Clone, Copy, Default)]
+enum ConnectionState {
+    #[default]
+    Connecting,
+    Connected {
+        at: tokio::time::Instant,
+    },
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum RecoveryObservation {
+    #[default]
+    NotObserved,
+    Observed,
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum ReconnectState {
+    #[default]
+    Dormant,
+    Ready,
+}
+
+enum DriverPoll {
+    Event(MqttEvent),
+    ShutdownStarted,
+    ShutdownDeadline,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DriverControl {
+    Continue,
+    Reconnect,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionCompletion {
+    Reconnect,
+    Shutdown,
+}
+
+const fn should_hold_command_ack(accepted: bool, intake_open: bool, shutting_down: bool) -> bool {
+    accepted || !intake_open || shutting_down
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -237,6 +480,28 @@ fn now() -> u64 {
         .as_secs()
 }
 
+async fn wait_for_shutdown(shutdown: CancellationToken) {
+    #[cfg(unix)]
+    {
+        let Ok(mut terminate) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        else {
+            let _ = tokio::signal::ctrl_c().await;
+            shutdown.cancel();
+            return;
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+    shutdown.cancel();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,5 +532,48 @@ mod tests {
             unsubscribe_completion(true, true, true),
             UnsubscribeCompletion::Exit
         );
+    }
+
+    #[test]
+    fn command_ack_is_held_behind_admission_and_shutdown_barriers() {
+        assert!(!should_hold_command_ack(false, true, false));
+        assert!(should_hold_command_ack(true, true, false));
+        assert!(should_hold_command_ack(false, false, false));
+        assert!(should_hold_command_ack(false, true, true));
+    }
+
+    #[test]
+    fn shutdown_waits_for_every_transport_fact() {
+        assert!(quiescent_state().transport_is_quiescent());
+        for state in [
+            SessionState {
+                shutdown_deadline: None,
+                ..quiescent_state()
+            },
+            SessionState {
+                connection: ConnectionState::Connecting,
+                ..quiescent_state()
+            },
+            SessionState {
+                publish: PublishState::Pending,
+                ..quiescent_state()
+            },
+            SessionState {
+                subscription: SubscriptionState::Unsubscribing,
+                ..quiescent_state()
+            },
+        ] {
+            assert!(!state.transport_is_quiescent());
+        }
+    }
+
+    fn quiescent_state() -> SessionState {
+        SessionState {
+            shutdown_deadline: Some(tokio::time::Instant::now()),
+            connection: ConnectionState::Connected {
+                at: tokio::time::Instant::now(),
+            },
+            ..SessionState::default()
+        }
     }
 }

@@ -108,6 +108,33 @@ def write_bundle(root: Path, names=("rss-diag-context", "rss-trace-context", "rs
 
 
 class CandidateBundleTests(unittest.TestCase):
+    def test_release_binary_is_preserved_once_at_an_absolute_destination(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source-agent"
+            source.write_bytes(b"candidate-binary")
+            destination = root / "reference-device-agent"
+            candidate_proof.preserve_release_binary(source, destination)
+            self.assertEqual(b"candidate-binary", destination.read_bytes())
+            self.assertTrue(destination.stat().st_mode & 0o100)
+            with self.assertRaises(candidate_proof.ProofError):
+                candidate_proof.preserve_release_binary(source, destination)
+            with self.assertRaises(candidate_proof.ProofError):
+                candidate_proof.preserve_release_binary(source, Path("relative-agent"))
+
+    def test_candidate_cli_exposes_closed_coverage_and_binary_controls(self):
+        parsed = candidate_proof.parse_args(
+            [
+                "--bundle",
+                "/candidate",
+                "--coverage",
+                "--binary-output",
+                "/output/reference-device-agent",
+            ]
+        )
+        self.assertTrue(parsed.coverage)
+        self.assertEqual(Path("/output/reference-device-agent"), parsed.binary_output)
+
     def test_conformance_candidate_is_mandatory(self):
         package = candidate_proof.CandidatePackage(
             "rss-diag-context", "0.1.0", "aa" * 32, Path("unused")
@@ -192,10 +219,12 @@ class CandidateBundleTests(unittest.TestCase):
             "-exec rustfmt --edition 2024 --check {} +",
             ci_job,
         )
-        self.assertIn("if: ${{ github.event_name == 'workflow_dispatch' }}", candidate_job)
+        self.assertNotIn("if: ${{ github.event_name == 'workflow_dispatch' }}", candidate_job)
         self.assertIn("needs: ci", candidate_job)
         self.assertEqual(workflow.count("python3 scripts/candidate-proof.py"), 1)
         self.assertIn("python3 scripts/candidate-proof.py", candidate_job)
+        self.assertIn("--coverage", candidate_job)
+        self.assertEqual(workflow.count("RUST_VERSION: 1.96.0"), 1)
 
     def test_reference_agent_local_client_exception_is_exact(self):
         repository = REPOSITORY
@@ -257,6 +286,52 @@ class CandidateBundleTests(unittest.TestCase):
                         kind,
                     )
                 )
+
+    def test_reference_agent_rejects_every_extra_or_weakened_rss_edge(self):
+        repository = Path("/snapshot")
+        manifest_path = repository / candidate_proof.REFERENCE_DEVICE_AGENT_MANIFEST
+        package = {
+            "name": candidate_proof.REFERENCE_DEVICE_AGENT,
+            "manifest_path": str(manifest_path),
+        }
+        contract = {
+            "name": candidate_proof.DEVICE_SECURITY_CONTRACT,
+            "req": "=0.1.0",
+            "source": "registry+manifest",
+            "kind": None,
+            "rename": None,
+            "optional": False,
+            "uses_default_features": True,
+            "features": [],
+            "target": None,
+        }
+        local = {
+            "name": candidate_proof.DEVICE_SECURITY_CLIENT,
+            "req": "*",
+            "source": None,
+            "kind": None,
+            "rename": None,
+            "optional": False,
+            "uses_default_features": True,
+            "features": [],
+            "target": None,
+        }
+        valid = [(package, local), (package, contract)]
+        candidate_proof.validate_reference_device_agent_metadata(valid)
+
+        mutations = [
+            [*valid, (package, dict(contract, name="rss-extra"))],
+            [(package, local)],
+            [(package, local), (package, dict(contract, rename="contracts"))],
+            [(package, local), (package, dict(contract, target="cfg(unix)"))],
+            [(package, local), (package, dict(contract, kind="dev"))],
+            [(package, local), (package, dict(contract, optional=True))],
+        ]
+        for dependencies in mutations:
+            with self.subTest(dependencies=dependencies), self.assertRaises(
+                candidate_proof.ProofError
+            ):
+                candidate_proof.validate_reference_device_agent_metadata(dependencies)
 
     def test_candidate_workspace_activation_is_exact_and_snapshot_local(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -6,6 +6,8 @@ use uuid::Uuid;
 
 use rotation_model::{FenceEpoch, Generation};
 
+use crate::BrokerAssertionVerifier;
+
 const COMMAND_CONTRACT: &str = "identity.commands.apply-device-certificate";
 const ACK_CONTRACT: &str = "identity.device-command-acked";
 const REPORT_CONTRACT: &str = "identity.device-certificate-reported";
@@ -27,6 +29,10 @@ pub enum ValueError {
     InvalidCommandId,
     #[error("SHA-256 digest is invalid")]
     InvalidDigest,
+    #[error("tenant identity must not be nil")]
+    NilTenant,
+    #[error("device identity must not be nil")]
+    NilDevice,
 }
 
 /// Monotonic generation embedded in the authenticated MQTT credential scope.
@@ -57,17 +63,27 @@ pub struct DeviceIdentity {
 }
 
 impl DeviceIdentity {
-    #[must_use]
-    pub const fn new(
+    /// Constructs one non-empty security identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either UUID is nil.
+    pub const fn try_new(
         tenant: Uuid,
         device: Uuid,
         credential_generation: CredentialGeneration,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ValueError> {
+        if tenant.is_nil() {
+            return Err(ValueError::NilTenant);
+        }
+        if device.is_nil() {
+            return Err(ValueError::NilDevice);
+        }
+        Ok(Self {
             tenant,
             device,
             credential_generation,
-        }
+        })
     }
 
     #[must_use]
@@ -111,6 +127,7 @@ impl fmt::Debug for DeviceIdentity {
 /// Canonical, exact topic set for one authenticated device session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TopicSet {
+    identity: DeviceIdentity,
     command: String,
     command_acknowledged: String,
     certificate_reported: String,
@@ -126,6 +143,7 @@ impl TopicSet {
             identity.credential_generation.get()
         );
         Self {
+            identity: identity.clone(),
             command: format!("{prefix}downlink/{COMMAND_CONTRACT}"),
             command_acknowledged: format!("{prefix}uplink/{ACK_CONTRACT}"),
             certificate_reported: format!("{prefix}uplink/{REPORT_CONTRACT}"),
@@ -150,6 +168,42 @@ impl TopicSet {
     #[must_use]
     pub fn accepts_command(&self, topic: &str) -> bool {
         topic == self.command
+    }
+
+    pub(crate) const fn identity(&self) -> &DeviceIdentity {
+        &self.identity
+    }
+}
+
+/// Exact durable command scope retained while an old MQTT delivery is unsettled.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryCommandScope {
+    identity: DeviceIdentity,
+    topic: String,
+    command_id: String,
+}
+
+impl RecoveryCommandScope {
+    pub(crate) fn new(identity: DeviceIdentity, topic: String, command_id: String) -> Self {
+        Self {
+            identity,
+            topic,
+            command_id,
+        }
+    }
+
+    pub(crate) const fn identity(&self) -> &DeviceIdentity {
+        &self.identity
+    }
+
+    #[must_use]
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+
+    #[must_use]
+    pub fn command_id(&self) -> &str {
+        &self.command_id
     }
 }
 
@@ -468,6 +522,7 @@ pub struct MqttConnectionConfig {
     client_id: String,
     session_expiry_seconds: NonZeroU32,
     request_capacity: NonZeroUsize,
+    assertion_verifier: BrokerAssertionVerifier,
 }
 
 impl MqttConnectionConfig {
@@ -482,6 +537,7 @@ impl MqttConnectionConfig {
         client_id: impl Into<String>,
         session_expiry_seconds: NonZeroU32,
         request_capacity: NonZeroUsize,
+        assertion_verifier: BrokerAssertionVerifier,
     ) -> Result<Self, ValueError> {
         let host = host.into();
         let client_id = client_id.into();
@@ -500,6 +556,7 @@ impl MqttConnectionConfig {
             client_id,
             session_expiry_seconds,
             request_capacity,
+            assertion_verifier,
         })
     }
 
@@ -526,5 +583,25 @@ impl MqttConnectionConfig {
     #[must_use]
     pub const fn request_capacity(&self) -> NonZeroUsize {
         self.request_capacity
+    }
+
+    pub(crate) const fn assertion_verifier(&self) -> &BrokerAssertionVerifier {
+        &self.assertion_verifier
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn security_identity_rejects_nil_coordinates() {
+        let generation = CredentialGeneration::try_from(1).expect("generation");
+        let tenant = Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("tenant");
+        let device = Uuid::parse_str("00000000-0000-0000-0000-000000000101").expect("device");
+
+        assert!(DeviceIdentity::try_new(Uuid::nil(), device, generation).is_err());
+        assert!(DeviceIdentity::try_new(tenant, Uuid::nil(), generation).is_err());
+        assert!(DeviceIdentity::try_new(tenant, device, generation).is_ok());
     }
 }

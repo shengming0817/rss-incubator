@@ -38,6 +38,9 @@ DEVICE_SECURITY_CLIENT = "rss-device-security-client"
 DEVICE_SECURITY_CONTRACT = "rss-device-security-contracts"
 DEVICE_SECURITY_CLIENT_MANIFEST = Path("crates/rss-device-security-client/Cargo.toml")
 REFERENCE_DEVICE_AGENT = "reference-device-agent"
+UNAFFECTED_COVERAGE_PATHS = (
+    r"(^|/)(crates/(rotation-model|rss-device-security-client)|tests/fixtures)/"
+)
 REFERENCE_DEVICE_AGENT_MANIFEST = Path("apps/reference-device-agent/Cargo.toml")
 REFERENCE_DEVICE_AGENT_CLIENT_PATH = "../../crates/rss-device-security-client"
 
@@ -552,16 +555,75 @@ def validate_reference_device_agent_dependencies(repository: Path, dependencies)
             "reference-device-agent local client edge must target the canonical manifest exactly"
         )
     expected_manifest = manifest_path.resolve()
-    contract_edges = [
-        dependency
+    reference_edges = [
+        (package, candidate_dependency)
         for package, dependency in dependencies
         if Path(package["manifest_path"]).resolve() == expected_manifest
-        and dependency["name"] == DEVICE_SECURITY_CONTRACT
+        for candidate_dependency in (dependency,)
     ]
-    if len(contract_edges) != 1 or contract_edges[0]["kind"] is not None:
-        raise ProofError(
-            "reference-device-agent must directly consume the exact public contracts once"
+    reference_package = {"name": REFERENCE_DEVICE_AGENT, "manifest_path": str(manifest_path)}
+    reference_edges.append(
+        (
+            reference_package,
+            {
+                "name": DEVICE_SECURITY_CLIENT,
+                "req": "*",
+                "source": None,
+                "kind": None,
+                "rename": None,
+                "optional": False,
+                "uses_default_features": True,
+                "features": [],
+                "target": None,
+            },
         )
+    )
+    validate_reference_device_agent_metadata(reference_edges)
+
+
+def validate_reference_device_agent_metadata(dependencies):
+    reference_edges = [
+        (package, dependency)
+        for package, dependency in dependencies
+        if package.get("name") == REFERENCE_DEVICE_AGENT
+    ]
+    if len(reference_edges) != 2:
+        raise ProofError("reference-device-agent direct RSS dependency exact-set differs")
+    actual = {}
+    for package, dependency in reference_edges:
+        manifest_path = Path(package.get("manifest_path", ""))
+        if manifest_path.name != "Cargo.toml" or manifest_path.parent.name != REFERENCE_DEVICE_AGENT:
+            raise ProofError("reference-device-agent package identity differs")
+        name = canonical_package_name(dependency.get("name", ""))
+        if name in actual:
+            raise ProofError("reference-device-agent RSS dependency is duplicated")
+        actual[name] = dependency
+    expected = {
+        DEVICE_SECURITY_CLIENT: {
+            "name": DEVICE_SECURITY_CLIENT,
+            "req": "*",
+            "source": None,
+            "kind": None,
+            "rename": None,
+            "optional": False,
+            "uses_default_features": True,
+            "features": [],
+            "target": None,
+        },
+        DEVICE_SECURITY_CONTRACT: {
+            "name": DEVICE_SECURITY_CONTRACT,
+            "req": "=0.1.0",
+            "source": "registry+manifest",
+            "kind": None,
+            "rename": None,
+            "optional": False,
+            "uses_default_features": True,
+            "features": [],
+            "target": None,
+        },
+    }
+    if actual != expected:
+        raise ProofError("reference-device-agent direct RSS dependency semantics differ")
 
 
 def validate_manifest_dependency_sources(metadata, bundle_names: set[str]):
@@ -986,7 +1048,41 @@ def validate_resolution(repository: Path, bundle: CandidateBundle, metadata, exp
     return sorted(consumed)
 
 
-def execute(repository: Path, bundle_root: Path):
+def preserve_release_binary(source: Path, destination: Path):
+    if not destination.is_absolute():
+        raise ProofError("--binary-output must be an absolute path")
+    parent = destination.parent
+    if not parent.is_dir() or parent.is_symlink():
+        raise ProofError("--binary-output parent must be a real directory")
+    if destination.exists() or destination.is_symlink():
+        raise ProofError("--binary-output must not already exist")
+    if not source.is_file() or source.is_symlink():
+        raise ProofError("candidate release binary is missing or unsafe")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(source.read_bytes())
+            output.flush()
+            os.fsync(output.fileno())
+        temporary.chmod(0o755)
+        os.link(temporary, destination)
+    except FileExistsError as error:
+        raise ProofError("--binary-output was created concurrently") from error
+    except OSError as error:
+        raise ProofError("cannot preserve candidate release binary") from error
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def execute(
+    repository: Path,
+    bundle_root: Path,
+    binary_output: Path | None = None,
+    coverage: bool = False,
+):
     bundle = validate_bundle(bundle_root)
     candidate = require_conformance_candidate(bundle)
     with tempfile.TemporaryDirectory(prefix="rss-incubator-candidate-") as directory:
@@ -1068,6 +1164,46 @@ def execute(repository: Path, bundle_root: Path):
             env,
             "candidate workspace doctest",
         )
+        if coverage:
+            run_visible(
+                [
+                    "cargo",
+                    "llvm-cov",
+                    "--package",
+                    "reference-device-agent-core",
+                    "--package",
+                    REFERENCE_DEVICE_AGENT,
+                    "--all-targets",
+                    "--locked",
+                    "--offline",
+                    "--ignore-filename-regex",
+                    UNAFFECTED_COVERAGE_PATHS,
+                    "--fail-under-lines",
+                    "80",
+                ],
+                snapshot,
+                env,
+                "affected package coverage",
+            )
+        if binary_output is not None:
+            run_visible(
+                [
+                    "cargo",
+                    "build",
+                    "--package",
+                    REFERENCE_DEVICE_AGENT,
+                    "--release",
+                    "--locked",
+                    "--offline",
+                ],
+                snapshot,
+                env,
+                "candidate release build",
+            )
+            preserve_release_binary(
+                Path(env["CARGO_TARGET_DIR"]) / "release" / REFERENCE_DEVICE_AGENT,
+                binary_output,
+            )
         lock_sha = hashlib.sha256((snapshot / "Cargo.lock").read_bytes()).hexdigest()
         incubator_revision = run_capture(
             ["/usr/bin/git", "rev-parse", "HEAD"],
@@ -1091,6 +1227,8 @@ def execute(repository: Path, bundle_root: Path):
 def parse_args(argv):
     parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("--bundle", required=True, type=Path)
+    parser.add_argument("--binary-output", type=Path)
+    parser.add_argument("--coverage", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -1114,7 +1252,12 @@ def main(argv=None):
     error = None
     summary = None
     try:
-        summary = execute(repository, bundle_root)
+        summary = execute(
+            repository,
+            bundle_root,
+            binary_output=args.binary_output,
+            coverage=args.coverage,
+        )
     except Exception as caught:  # preserve cleanup/status evidence before reporting
         error = caught
     for signum, handler in previous_handlers.items():

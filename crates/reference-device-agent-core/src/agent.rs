@@ -1,11 +1,13 @@
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use rotation_model::{CredentialRevision, InstalledCredentialPosition};
 use sha2::{Digest as _, Sha256};
 
+use crate::RecoveryCommandScope;
 use crate::catalog::{CatalogError, ResolvedArtifact};
 use crate::material::{CredentialError, validate_credential};
-use crate::state::{StateStore, StateV1, next_revision};
+use crate::state::{AcceptedCommand, RejectedCommand, StateStore, StateV1, next_revision};
 use crate::{
     ApplyOutcome, ArtifactCatalog, CommandRejection, CredentialFiles, DeviceCommand,
     DeviceIdentity, OutboundFact, StoreError, TopicSet, compute_artifact_digest,
@@ -19,6 +21,7 @@ pub struct AgentConfig {
     catalog: ArtifactCatalog,
     initial_position: InstalledCredentialPosition,
     initial_credentials: CredentialFiles,
+    command_retention_seconds: NonZeroU32,
 }
 
 impl AgentConfig {
@@ -29,6 +32,7 @@ impl AgentConfig {
         catalog: ArtifactCatalog,
         initial_position: InstalledCredentialPosition,
         initial_credentials: CredentialFiles,
+        command_retention_seconds: NonZeroU32,
     ) -> Self {
         Self {
             identity,
@@ -36,6 +40,7 @@ impl AgentConfig {
             catalog,
             initial_position,
             initial_credentials,
+            command_retention_seconds,
         }
     }
 }
@@ -63,6 +68,7 @@ pub struct ReferenceDeviceAgent {
     store: StateStore,
     state: StateV1,
     catalog: ArtifactCatalog,
+    command_retention_seconds: NonZeroU32,
 }
 
 impl std::fmt::Debug for ReferenceDeviceAgent {
@@ -110,6 +116,7 @@ impl ReferenceDeviceAgent {
             store,
             state,
             catalog: config.catalog,
+            command_retention_seconds: config.command_retention_seconds,
         })
     }
 
@@ -126,16 +133,16 @@ impl ReferenceDeviceAgent {
     ) -> Result<ApplyOutcome, AgentError> {
         let observed_at = i64::try_from(now_epoch_seconds).unwrap_or(i64::MAX);
         let fingerprint = command_fingerprint(command);
-        if let Some(same_payload) = self
-            .state
-            .last_command()
-            .and_then(|last| last.matches(command.command_id().expose(), &fingerprint))
-        {
+        if let Some(same_payload) = self.state.command_match(
+            command.command_id().expose(),
+            &fingerprint,
+            now_epoch_seconds,
+        ) {
             if same_payload {
                 if !self.state.has_command_ack(command.command_id().expose()) {
                     let mut candidate = self.state.clone();
                     candidate.reserve_outbox(1)?;
-                    candidate.replay_last()?;
+                    candidate.replay_command(command.command_id().expose(), &fingerprint)?;
                     self.persist_candidate(candidate)?;
                 }
                 return Ok(ApplyOutcome::Duplicate);
@@ -220,6 +227,54 @@ impl ReferenceDeviceAgent {
         self.commit(command, fingerprint, &artifact, observed_at)
     }
 
+    /// Durably classifies one broker-authenticated but undecodable command before PUBACK.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the delivery scope is invalid or its terminal ACK cannot be persisted.
+    pub fn reject_malformed_delivery(
+        &mut self,
+        topic: &str,
+        command_id: &str,
+        payload: &[u8],
+        now_epoch_seconds: u64,
+    ) -> Result<ApplyOutcome, AgentError> {
+        if !TopicSet::new(&self.current_identity()?).accepts_command(topic)
+            && self.pending_command_topic() != Some(topic)
+        {
+            return Err(AgentError::UnexpectedDelivery);
+        }
+        let fingerprint = malformed_fingerprint(topic, command_id, payload);
+        if let Some(same_payload) =
+            self.state
+                .command_match(command_id, &fingerprint, now_epoch_seconds)
+        {
+            if same_payload {
+                if !self.state.has_command_ack(command_id) {
+                    let mut candidate = self.state.clone();
+                    candidate.reserve_outbox(1)?;
+                    candidate.replay_command(command_id, &fingerprint)?;
+                    self.persist_candidate(candidate)?;
+                }
+                return Ok(ApplyOutcome::Duplicate);
+            }
+            let mut candidate = self.state.clone();
+            if !candidate.has_conflicting_replay(command_id, &fingerprint) {
+                candidate.reserve_outbox(1)?;
+                candidate.reject_conflicting_replay(
+                    command_id.to_owned(),
+                    &fingerprint,
+                    self.state.current_generation(),
+                    self.state.current_fence(),
+                    i64::try_from(now_epoch_seconds).unwrap_or(i64::MAX),
+                );
+                self.persist_candidate(candidate)?;
+            }
+            return Ok(ApplyOutcome::Rejected(CommandRejection::MalformedCommand));
+        }
+        self.persist_raw_rejection(command_id, fingerprint, now_epoch_seconds)
+    }
+
     #[must_use]
     pub fn next_outbound(&self) -> Option<OutboundFact> {
         self.state.next_outbound()
@@ -258,6 +313,34 @@ impl ReferenceDeviceAgent {
         self.state.rotation_in_flight()
     }
 
+    /// Whether a newly delivered command can reserve the worst-case durable state transition.
+    #[must_use]
+    pub fn command_intake_open(&self, now_epoch_seconds: u64) -> bool {
+        self.state.reserve_outbox(2).is_ok()
+            && self.state.command_journal_has_capacity(now_epoch_seconds)
+    }
+
+    /// Returns the exact old command scope that may be redelivered during recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the persisted identity is invalid.
+    pub fn pending_command_scope(&self) -> Result<Option<RecoveryCommandScope>, AgentError> {
+        let Some((topic, command_id, generation, _, _)) = self.state.pending_inbound() else {
+            return Ok(None);
+        };
+        let current = self.current_identity()?;
+        let generation = crate::CredentialGeneration::try_from(generation)
+            .map_err(|_| AgentError::Store(StoreError::InvalidState))?;
+        let identity = DeviceIdentity::try_new(current.tenant(), current.device(), generation)
+            .map_err(|_| AgentError::Store(StoreError::InvalidState))?;
+        Ok(Some(RecoveryCommandScope::new(
+            identity,
+            topic.to_owned(),
+            command_id.to_owned(),
+        )))
+    }
+
     #[must_use]
     pub fn pending_command_topic(&self) -> Option<&str> {
         self.state
@@ -284,6 +367,16 @@ impl ReferenceDeviceAgent {
         let fingerprint = command_fingerprint(command);
         self.state
             .pending_settlement_token(command.command_id().expose(), &fingerprint)
+    }
+
+    /// Returns the settlement token for the exact durable recovery delivery.
+    #[must_use]
+    pub fn pending_delivery_settlement_token(&self, topic: &str, command_id: &str) -> Option<&str> {
+        self.state
+            .pending_inbound()
+            .and_then(|(pending_topic, pending_command, _, token, _)| {
+                (pending_topic == topic && pending_command == command_id).then_some(token)
+            })
     }
 
     /// Persists the exact outgoing PUBACK fact for the pending old delivery.
@@ -329,11 +422,8 @@ impl ReferenceDeviceAgent {
         }
         let generation = crate::CredentialGeneration::try_from(generation)
             .map_err(|_| AgentError::Store(StoreError::InvalidState))?;
-        Ok(DeviceIdentity::new(
-            current.tenant(),
-            current.device(),
-            generation,
-        ))
+        DeviceIdentity::try_new(current.tenant(), current.device(), generation)
+            .map_err(|_| AgentError::Store(StoreError::InvalidState))
     }
 
     /// Records that the committed credential revision established its MQTT session.
@@ -375,21 +465,24 @@ impl ReferenceDeviceAgent {
         observed_at: i64,
     ) -> Result<ApplyOutcome, AgentError> {
         let mut candidate = self.state.clone();
+        candidate.expire_command_journal(u64::try_from(observed_at).unwrap_or(u64::MAX));
         candidate.reserve_outbox(2)?;
+        candidate.reserve_command_journal()?;
         let revision = next_revision(&candidate)?;
         self.store
             .install_revision(revision, &artifact.credential)?;
-        candidate.accept(
-            command.command_id().expose(),
+        candidate.accept(AcceptedCommand {
+            command_id: command.command_id().expose().to_owned(),
             fingerprint,
-            command.desired_generation().get(),
-            command.fence_epoch().get(),
-            artifact.credential_generation.get(),
-            revision.get(),
-            artifact.digest.expose().to_owned(),
-            artifact.credential.expires_at,
+            generation: command.desired_generation().get(),
+            fence: command.fence_epoch().get(),
+            credential_generation: artifact.credential_generation.get(),
+            revision: revision.get(),
+            artifact_digest: artifact.digest.expose().to_owned(),
+            expires_at: artifact.credential.expires_at,
             observed_at,
-        );
+            retain_until_epoch_seconds: self.retention_deadline(observed_at),
+        })?;
         self.persist_candidate(candidate)?;
         Ok(ApplyOutcome::Accepted)
     }
@@ -402,15 +495,18 @@ impl ReferenceDeviceAgent {
         observed_at: i64,
     ) -> Result<ApplyOutcome, AgentError> {
         let mut candidate = self.state.clone();
+        candidate.expire_command_journal(u64::try_from(observed_at).unwrap_or(u64::MAX));
         candidate.reserve_outbox(1)?;
-        candidate.reject(
-            command.command_id().expose(),
+        candidate.reserve_command_journal()?;
+        candidate.reject(RejectedCommand {
+            command_id: command.command_id().expose().to_owned(),
             fingerprint,
-            command.desired_generation().get(),
-            command.fence_epoch().get(),
+            generation: command.desired_generation().get(),
+            fence: command.fence_epoch().get(),
             rejection,
             observed_at,
-        );
+            retain_until_epoch_seconds: self.retention_deadline(observed_at),
+        });
         self.persist_candidate(candidate)?;
         Ok(ApplyOutcome::Rejected(rejection))
     }
@@ -428,6 +524,36 @@ impl ReferenceDeviceAgent {
             return Err(AgentError::UnexpectedDelivery);
         }
         self.persist_candidate(candidate)
+    }
+
+    fn persist_raw_rejection(
+        &mut self,
+        command_id: &str,
+        fingerprint: String,
+        now_epoch_seconds: u64,
+    ) -> Result<ApplyOutcome, AgentError> {
+        let observed_at = i64::try_from(now_epoch_seconds).unwrap_or(i64::MAX);
+        let mut candidate = self.state.clone();
+        candidate.expire_command_journal(now_epoch_seconds);
+        candidate.reserve_outbox(1)?;
+        candidate.reserve_command_journal()?;
+        candidate.reject(RejectedCommand {
+            command_id: command_id.to_owned(),
+            fingerprint,
+            generation: self.state.current_generation(),
+            fence: self.state.current_fence(),
+            rejection: CommandRejection::MalformedCommand,
+            observed_at,
+            retain_until_epoch_seconds: self.retention_deadline(observed_at),
+        });
+        self.persist_candidate(candidate)?;
+        Ok(ApplyOutcome::Rejected(CommandRejection::MalformedCommand))
+    }
+
+    fn retention_deadline(&self, observed_at: i64) -> u64 {
+        u64::try_from(observed_at)
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::from(self.command_retention_seconds.get()))
     }
 }
 
@@ -453,6 +579,17 @@ fn command_fingerprint(command: &DeviceCommand) -> String {
     ] {
         hasher.update(value.to_be_bytes());
     }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn malformed_fingerprint(topic: &str, command_id: &str, payload: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"rss.reference-device-agent.malformed-command.v1\0");
+    hasher.update(topic.as_bytes());
+    hasher.update([0]);
+    hasher.update(command_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(Sha256::digest(payload));
     format!("sha256:{:x}", hasher.finalize())
 }
 

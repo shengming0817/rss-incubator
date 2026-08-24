@@ -1,8 +1,8 @@
 use std::num::NonZeroU64;
 
 use reference_device_agent_core::{
-    AckFact, ArtifactId, CommandId, CommandRejection, DeviceCommand, DeviceIdentity, OutboundFact,
-    ReportFact, Sha256Digest,
+    AckFact, ArtifactId, CommandId, CommandRejection, DeviceCommand, DeviceIdentity, MqttOutbound,
+    MqttOutboundKind, OutboundFact, ReportFact, Sha256Digest,
 };
 use rotation_model::{
     CommandRef, DeviceRef, FenceEpoch, Generation, RotationCoordinates, RotationId, TenantRef,
@@ -64,14 +64,14 @@ pub(crate) fn decode_command(
 
 pub(crate) struct EncodedOutbound {
     pub event_id: String,
-    pub kind: OutboundKind,
+    pub kind: MqttOutboundKind,
     pub payload: Vec<u8>,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum OutboundKind {
-    Acknowledgement,
-    Report,
+impl EncodedOutbound {
+    pub(crate) fn into_mqtt(self) -> MqttOutbound {
+        MqttOutbound::new(self.kind, self.event_id, self.payload)
+    }
 }
 
 pub(crate) fn encode_outbound(
@@ -81,12 +81,12 @@ pub(crate) fn encode_outbound(
     match outbound {
         OutboundFact::CommandAcknowledged { event_id, payload } => Ok(EncodedOutbound {
             event_id,
-            kind: OutboundKind::Acknowledgement,
+            kind: MqttOutboundKind::CommandAcknowledged,
             payload: encode_ack(identity, payload)?,
         }),
         OutboundFact::CertificateReported { event_id, payload } => Ok(EncodedOutbound {
             event_id,
-            kind: OutboundKind::Report,
+            kind: MqttOutboundKind::CertificateReported,
             payload: encode_report(identity, payload)?,
         }),
     }
@@ -184,11 +184,12 @@ mod tests {
     use uuid::Uuid;
 
     fn identity() -> DeviceIdentity {
-        DeviceIdentity::new(
+        DeviceIdentity::try_new(
             Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("tenant"),
             Uuid::parse_str("00000000-0000-0000-0000-000000000101").expect("device"),
             CredentialGeneration::try_from(7).expect("generation"),
         )
+        .expect("identity")
     }
 
     #[test]
@@ -376,6 +377,9 @@ mod tests {
             })
         );
         assert_eq!(encoded.event_id, "report-event");
-        assert!(matches!(encoded.kind, OutboundKind::Report));
+        assert!(matches!(
+            encoded.kind,
+            MqttOutboundKind::CertificateReported
+        ));
     }
 }
