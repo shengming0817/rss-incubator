@@ -42,7 +42,8 @@ The future `rss-device-security-contracts` candidate has one six-contract public
 
 1. `identity.device-certificate-policy-put`
 2. `identity.device-certificate-status-get`
-3. `identity.apply-device-certificate`
+3. `identity.apply-device-certificate` (routed only as the MQTT topic segment
+   `identity.commands.apply-device-certificate`)
 4. `identity.device-command-acked`
 5. `identity.device-certificate-reported`
 6. `identity.device-ingress-receipted`
@@ -66,8 +67,7 @@ machine, reconcile behavior, transport DTO, secret material, or provider API.
 
 ## Implementation handoff
 
-The sequence below is the single implementation path. #2119 and #2121 are implemented here; later
-items remain separate owners:
+The sequence below is the single implementation path. Implemented items remain separate owners:
 
 1. **Azure PBI #2119** created `crates/rss-device-security-client` and maps only the exact registry
    contract candidate into product facts.
@@ -76,8 +76,13 @@ items remain separate owners:
 3. **Azure PBI #2121** implements `apps/rotation-control` through the public client with OIDC
    Authorization Code + PKCE, without local authentication/authorization decisions, token
    persistence, automatic mutation retry, generic audit history, or Resource Fact authoring.
-4. **Azure PBI #2122** implements `apps/reference-device-agent` with authenticated transport and
-   device-local durability, without becoming an MDM/fleet agent.
+4. **Azure PBI #2122** implements `apps/reference-device-agent` with mandatory mTLS MQTT v5,
+   persistent/manual-QoS-1 settlement, a strict local artifact catalog, immutable credential
+   revisions, and atomic device-local state. The private state retains the single old-topic delivery
+   awaiting broker settlement so a crash can acknowledge only that exact redelivery with the new
+   committed credential; it never restores the old revision or reopens the old subscription. It
+   consumes the canonical DTOs through one thin wire
+   adapter and does not become an MDM/fleet agent.
 5. **Azure PBI #2123** implements the canonical external T2 journey and focused failures. It does
    not register a T3 selector or production acceptance carrier.
 
@@ -107,6 +112,12 @@ It may consume only stable RSS Release Surface artifacts.
 | ACK, report, receipt event IDs, command IDs, and ingress-envelope IDs become interchangeable | Required fields with distinct opaque Rust types | Rust type-system Hard |
 | Acceptance or accepted application outcome loses authorization lineage, or rejection acquires it | Required acceptance field plus `ReceiptLineage` in a closed outcome enum | Rust private-field/constructor/enum Hard |
 | Rotation model imports RSS, source/workspace, transport, or provider coupling | Package-scoped negative dependency policy over every Cargo dependency table | CI policy Hard for declared forbidden edges |
+| Desired generation, fence epoch, credential revision, and MQTT credential generation become interchangeable | Private non-zero newtypes and `InstalledCredentialPosition`; no generic numeric conversion | Rust type-system Hard |
+| A second wire model, alternate topic, or generic protocol provider appears | Candidate app imports the exact canonical contracts and its binary-private session driver exclusively owns concrete MQTT transport | Cargo/private API Hard plus wire golden tests |
+| Plaintext, clean session, automatic ACK, or QoS downgrade appears | `MqttConnectionConfig` has no mode switches; the concrete session hard-codes mTLS, persistent session, manual ACK, and QoS 1 | Construction/API Hard |
+| Corrupt/legacy state is migrated or reset, or an orphan revision becomes current | Strict private `StateV1`, synced immutable revisions, atomic manifest rename, and fail-closed restart tests | Persistence/test Hard |
+| ACK, broker PUBACK, reconnect, report, and application receipt collapse into readiness | Durable blocked/ready outbox states, exact old-delivery settlement recovery, and explicit broker-confirm/reconnect transitions; no receipt or `Ready` API | State-machine Hard |
+| Outbox pressure drops or overwrites protocol facts | Fixed 128-entry durable outbox with reservation before state mutation | State-machine Hard |
 | Source coupling enters candidate consumption | Independent repository, committed root lock, existing candidate proof | Physical/Cargo Hard plus proof Medium |
 | Product scope, owner, public-waist choice, and T3 prohibition drift | Accepted upstream ADR plus review of this scope document | Policy/review fact; not represented as machine enforcement |
 

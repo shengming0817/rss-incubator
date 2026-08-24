@@ -108,6 +108,33 @@ def write_bundle(root: Path, names=("rss-diag-context", "rss-trace-context", "rs
 
 
 class CandidateBundleTests(unittest.TestCase):
+    def test_release_binary_is_preserved_once_at_an_absolute_destination(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source-agent"
+            source.write_bytes(b"candidate-binary")
+            destination = root / "reference-device-agent"
+            candidate_proof.preserve_release_binary(source, destination)
+            self.assertEqual(b"candidate-binary", destination.read_bytes())
+            self.assertTrue(destination.stat().st_mode & 0o100)
+            with self.assertRaises(candidate_proof.ProofError):
+                candidate_proof.preserve_release_binary(source, destination)
+            with self.assertRaises(candidate_proof.ProofError):
+                candidate_proof.preserve_release_binary(source, Path("relative-agent"))
+
+    def test_candidate_cli_exposes_closed_coverage_and_binary_controls(self):
+        parsed = candidate_proof.parse_args(
+            [
+                "--bundle",
+                "/candidate",
+                "--coverage",
+                "--binary-output",
+                "/output/reference-device-agent",
+            ]
+        )
+        self.assertTrue(parsed.coverage)
+        self.assertEqual(Path("/output/reference-device-agent"), parsed.binary_output)
+
     def test_conformance_candidate_is_mandatory(self):
         package = candidate_proof.CandidatePackage(
             "rss-diag-context", "0.1.0", "aa" * 32, Path("unused")
@@ -167,18 +194,20 @@ class CandidateBundleTests(unittest.TestCase):
         excluded_members = set(manifest["workspace"]["exclude"])
         repository_members = {
             str(path.parent.relative_to(REPOSITORY))
-            for path in (REPOSITORY / "crates").glob("*/Cargo.toml")
+            for root in (REPOSITORY / "apps", REPOSITORY / "crates")
+            for path in root.glob("*/Cargo.toml")
         }
 
         self.assertEqual(
             excluded_members,
             {
+                "apps/reference-device-agent",
                 "apps/rotation-control",
                 "crates/platform-authoring-smoke",
                 "crates/rss-device-security-client",
             },
         )
-        self.assertTrue(excluded_members - {"apps/rotation-control"} < repository_members)
+        self.assertTrue(excluded_members < repository_members)
         for command in (
             "cargo check --workspace --all-targets --locked",
             "cargo test --workspace --all-targets --locked",
@@ -197,6 +226,115 @@ class CandidateBundleTests(unittest.TestCase):
         self.assertIn(".incubatorRevision == $incubator_revision", candidate_job)
         self.assertEqual(workflow.count("python3 scripts/candidate-proof.py"), 1)
         self.assertIn("python3 scripts/candidate-proof.py", candidate_job)
+        self.assertIn("--coverage", candidate_job)
+        self.assertEqual(workflow.count("RUST_VERSION: 1.96.0"), 1)
+
+    def test_reference_agent_local_client_exception_is_exact(self):
+        repository = REPOSITORY
+        manifest = repository / candidate_proof.REFERENCE_DEVICE_AGENT_MANIFEST
+        valid = {
+            "path": candidate_proof.REFERENCE_DEVICE_AGENT_CLIENT_PATH,
+        }
+        self.assertTrue(
+            candidate_proof.allowed_local_device_client_dependency(
+                repository,
+                manifest,
+                candidate_proof.DEVICE_SECURITY_CLIENT,
+                candidate_proof.DEVICE_SECURITY_CLIENT,
+                valid,
+                None,
+                None,
+            )
+        )
+        for alias, declared, specification, target, kind in (
+            ("client", candidate_proof.DEVICE_SECURITY_CLIENT, valid, None, None),
+            (
+                candidate_proof.DEVICE_SECURITY_CLIENT,
+                "rss-device-security-client-decoy",
+                valid,
+                None,
+                None,
+            ),
+            (
+                candidate_proof.DEVICE_SECURITY_CLIENT,
+                candidate_proof.DEVICE_SECURITY_CLIENT,
+                {"path": "../../crates/rss-device-security-client-decoy"},
+                None,
+                None,
+            ),
+            (
+                candidate_proof.DEVICE_SECURITY_CLIENT,
+                candidate_proof.DEVICE_SECURITY_CLIENT,
+                valid,
+                "cfg(unix)",
+                None,
+            ),
+            (
+                candidate_proof.DEVICE_SECURITY_CLIENT,
+                candidate_proof.DEVICE_SECURITY_CLIENT,
+                valid,
+                None,
+                "dev",
+            ),
+        ):
+            with self.subTest(alias=alias, declared=declared, specification=specification):
+                self.assertFalse(
+                    candidate_proof.allowed_local_device_client_dependency(
+                        repository,
+                        manifest,
+                        alias,
+                        declared,
+                        specification,
+                        target,
+                        kind,
+                    )
+                )
+
+    def test_reference_agent_rejects_every_extra_or_weakened_rss_edge(self):
+        repository = Path("/snapshot")
+        manifest_path = repository / candidate_proof.REFERENCE_DEVICE_AGENT_MANIFEST
+        package = {
+            "name": candidate_proof.REFERENCE_DEVICE_AGENT,
+            "manifest_path": str(manifest_path),
+        }
+        contract = {
+            "name": candidate_proof.DEVICE_SECURITY_CONTRACT,
+            "req": "=0.1.0",
+            "source": "registry+manifest",
+            "kind": None,
+            "rename": None,
+            "optional": False,
+            "uses_default_features": True,
+            "features": [],
+            "target": None,
+        }
+        local = {
+            "name": candidate_proof.DEVICE_SECURITY_CLIENT,
+            "req": "*",
+            "source": None,
+            "kind": None,
+            "rename": None,
+            "optional": False,
+            "uses_default_features": True,
+            "features": [],
+            "target": None,
+        }
+        valid = [(package, local), (package, contract)]
+        candidate_proof.validate_reference_device_agent_metadata(valid)
+
+        mutations = [
+            [*valid, (package, dict(contract, name="rss-extra"))],
+            [(package, local)],
+            [(package, local), (package, dict(contract, rename="contracts"))],
+            [(package, local), (package, dict(contract, target="cfg(unix)"))],
+            [(package, local), (package, dict(contract, kind="dev"))],
+            [(package, local), (package, dict(contract, optional=True))],
+        ]
+        for dependencies in mutations:
+            with self.subTest(dependencies=dependencies), self.assertRaises(
+                candidate_proof.ProofError
+            ):
+                candidate_proof.validate_reference_device_agent_metadata(dependencies)
 
     def test_candidate_workspace_activation_is_exact_and_snapshot_local(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -235,6 +373,42 @@ class CandidateBundleTests(unittest.TestCase):
                 "workspace candidate exclusions must be a non-empty sorted unique array",
             ):
                 candidate_proof.activate_candidate_workspace_members(repository)
+
+    def test_candidate_workspace_activation_adds_excluded_non_glob_member(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            regular = repository / "crates/regular/Cargo.toml"
+            regular.parent.mkdir(parents=True)
+            regular.write_text(
+                '[package]\nname = "regular"\nversion = "0.0.0"\n',
+                encoding="utf-8",
+            )
+            candidate = repository / "apps/reference-device-agent/Cargo.toml"
+            candidate.parent.mkdir(parents=True)
+            candidate.write_text(
+                '[package]\nname = "reference-device-agent"\nversion = "0.0.0"\n',
+                encoding="utf-8",
+            )
+            root_manifest = repository / "Cargo.toml"
+            root_manifest.write_text(
+                '[workspace]\nmembers = ["crates/*"]\n'
+                'exclude = [\n    "apps/reference-device-agent",\n]\n',
+                encoding="utf-8",
+            )
+
+            candidate_proof.activate_candidate_workspace_members(repository)
+
+            workspace = tomllib.loads(root_manifest.read_text(encoding="utf-8"))[
+                "workspace"
+            ]
+            self.assertEqual(
+                workspace["members"],
+                ["crates/*", "apps/reference-device-agent"],
+            )
+            self.assertIn(
+                candidate,
+                candidate_proof.workspace_member_manifests(repository),
+            )
 
     def test_valid_bundle_is_generic_and_sorted(self):
         with tempfile.TemporaryDirectory() as directory:

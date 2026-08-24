@@ -35,6 +35,8 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
             ROOT / "deploy/vault/deviceidentity-sign.hcl",
             ROOT / "deploy/vault/roles.json",
             ROOT / "deploy/mosquitto/mosquitto.conf",
+            ROOT / "deploy/mosquitto/Dockerfile",
+            ROOT / "deploy/mosquitto/plugin.c",
             ROOT / "deploy/postgres/bootstrap.sql",
             ROOT / "deploy/postgres/pg_hba.conf",
         }
@@ -76,13 +78,18 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
         expected_images = {
             "keycloak": "quay.io/keycloak/keycloak:26.7.0@sha256:0f198be292568439d700cdbfb893e69a6009bb43a94a06a945b1d3d506c76b13",
             "vault": "hashicorp/vault:2.0.3@sha256:a296a888b118615dc01d5f1a6846e6d4a7277946caaed5b447008fff5fe06b54",
-            "mosquitto": "eclipse-mosquitto:2.0.22-openssl@sha256:212f89e1eaeb2c322d6441b64396e3346026674db8fa9c27beac293405c32b3c",
+            "mosquitto": "rss-incubator-mosquitto-command-assertion:2.0.22",
             "postgres": "postgres:18.4-bookworm@sha256:882236b897e39051d2368c5ccc6cda944904723506b2dfc97f2a8f5bc9afa382",
         }
         self.assertEqual(expected_images, {name: service["image"] for name, service in model["services"].items()})
-        for service in model["services"].values():
-            self.assertNotIn("build", service)
-            self.assertNotIn("rss", service["image"].lower())
+        for name, service in model["services"].items():
+            if name == "mosquitto":
+                self.assertEqual(
+                    str(ROOT / "deploy/mosquitto"), service["build"]["context"]
+                )
+            else:
+                self.assertNotIn("build", service)
+                self.assertNotIn("rss", service["image"].lower())
             self.assertIn("healthcheck", service)
             self.assertEqual("0" * 32, service["labels"]["rss.reference.owner"])
             for port in service.get("ports", []):
@@ -209,10 +216,7 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
             set(fixture["mqtt"]["uplinkContracts"]),
         )
         self.assertEqual(
-            {
-                "identity.apply-device-certificate",
-                "identity.device-ingress-receipted",
-            },
+            {"identity.commands.apply-device-certificate"},
             set(fixture["mqtt"]["downlinkContracts"]),
         )
         self.assertNotIn("#", json.dumps(fixture))
@@ -224,7 +228,15 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
         self.assertIn("allow_anonymous false", mosquitto)
         self.assertIn("require_certificate true", mosquitto)
         self.assertIn("use_identity_as_username true", mosquitto)
+        self.assertIn("plugin /usr/lib/rss_mqtt_command_assertion.so", mosquitto)
+        self.assertIn("plugin_opt_signing_key", mosquitto)
         self.assertNotIn("listener 1883", mosquitto)
+        plugin = (ROOT / "deploy/mosquitto/plugin.c").read_text(encoding="utf-8")
+        self.assertIn("message->retain", plugin)
+        self.assertIn("AUTHN_SIGNATURE_KEY", plugin)
+        self.assertIn("SERVICE_USERNAME", plugin)
+        self.assertIn("exact_correlation_data", plugin)
+        self.assertIn("canonical_command_id", plugin)
 
         policy = (ROOT / "deploy/vault/deviceidentity-sign.hcl").read_text(encoding="utf-8")
         self.assertIn('path "{{mount}}/sign/mqtt-device"', policy)
@@ -371,6 +383,62 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
         self.assertTrue(module.ReferenceEnvironment.mqtt_was_denied(denied))
         self.assertFalse(module.ReferenceEnvironment.mqtt_was_denied(accepted))
         self.assertFalse(module.ReferenceEnvironment.mqtt_was_denied(infrastructure_failure))
+
+    def test_bootstrap_rebuilds_the_local_mosquitto_image_before_start(self):
+        module = load_reference_environment()
+        environment = object.__new__(module.ReferenceEnvironment)
+        calls = []
+        environment.check_dependencies = lambda: None
+        environment.require_state = lambda: None
+        environment.bootstrap_vault = lambda: None
+        environment.bootstrap_postgres = lambda: None
+        environment.bootstrap_keycloak = lambda: None
+        environment.generate_mosquitto_acl = lambda: None
+        environment.compose = lambda *args, **kwargs: calls.append((args, kwargs))
+
+        environment.bootstrap()
+
+        mosquitto_up = [
+            (args, kwargs)
+            for args, kwargs in calls
+            if args[0] == "up" and args[-1] == "mosquitto"
+        ]
+        self.assertEqual(2, len(mosquitto_up))
+        self.assertIn("--build", mosquitto_up[0][0])
+        self.assertNotIn("--build", mosquitto_up[1][0])
+        self.assertEqual(300, mosquitto_up[0][1]["timeout"])
+
+    def test_mqtt_round_trip_waits_for_a_durable_subscription_without_sleeping(self):
+        module = load_reference_environment()
+        environment = object.__new__(module.ReferenceEnvironment)
+        calls = []
+
+        def mqtt_command(arguments, *, check=True):
+            calls.append(arguments)
+            output = "proof\n" if len(calls) == 3 else ""
+            return subprocess.CompletedProcess(arguments, 0, stdout=output, stderr="")
+
+        environment.mqtt_command = mqtt_command
+        with mock.patch.object(module.time, "sleep") as sleep:
+            environment.mqtt_round_trip(
+                common=["--common"],
+                subscriber_auth=["--subscriber"],
+                publisher_auth=["--publisher"],
+                topic="rss/v1/proof",
+                message="proof",
+                correlation="command-1",
+            )
+
+        sleep.assert_not_called()
+        self.assertEqual(3, len(calls))
+        self.assertIn("-E", calls[0])
+        self.assertEqual("60", calls[0][calls[0].index("-x") + 1])
+        self.assertIn("correlation-data", calls[1])
+        self.assertEqual("0", calls[2][calls[2].index("-x") + 1])
+        self.assertEqual(
+            calls[0][calls[0].index("-i") + 1],
+            calls[2][calls[2].index("-i") + 1],
+        )
 
     def test_missing_state_reports_the_reachable_up_instruction(self):
         module = load_reference_environment()

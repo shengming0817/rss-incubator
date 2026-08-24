@@ -506,7 +506,54 @@ class ReferenceEnvironment:
             path = self.state / directory
             path.mkdir(exist_ok=True, mode=0o700)
             path.chmod(0o700)
+        self.ensure_broker_assertion_key()
         self.verify_resource_ownership()
+
+    def ensure_broker_assertion_key(self) -> None:
+        private_key = self.state / "mosquitto/assertion-private.pem"
+        public_der = self.state / "mosquitto/assertion-public.der"
+        public_text = self.state / "mosquitto/assertion-public.txt"
+        if not private_key.exists():
+            run(
+                [
+                    "openssl",
+                    "genpkey",
+                    "-algorithm",
+                    "ED25519",
+                    "-out",
+                    str(private_key),
+                ],
+                timeout=30,
+            )
+            private_key.chmod(0o600)
+        validation = run(
+            ["openssl", "pkey", "-in", str(private_key), "-check", "-noout"],
+            check=False,
+            timeout=15,
+        )
+        if validation.returncode != 0:
+            raise ReferenceEnvironmentError("broker assertion private key is invalid")
+        run(
+            [
+                "openssl",
+                "pkey",
+                "-in",
+                str(private_key),
+                "-pubout",
+                "-outform",
+                "DER",
+                "-out",
+                str(public_der),
+            ],
+            timeout=15,
+        )
+        encoded = public_der.read_bytes()
+        public_der.unlink(missing_ok=True)
+        prefix = bytes.fromhex("302a300506032b6570032100")
+        if len(encoded) != len(prefix) + 32 or not encoded.startswith(prefix):
+            raise ReferenceEnvironmentError("broker assertion public key is invalid")
+        public_key = base64.urlsafe_b64encode(encoded[len(prefix) :]).rstrip(b"=").decode()
+        write_private_text(public_text, public_key + "\n")
 
     def require_state(self) -> None:
         if not self.state.exists():
@@ -1604,7 +1651,16 @@ class ReferenceEnvironment:
         self.compose("up", "--detach", "--wait", "--wait-timeout", "180", "keycloak", timeout=210)
         self.bootstrap_keycloak()
         self.generate_mosquitto_acl()
-        self.compose("up", "--detach", "--wait", "--wait-timeout", "120", "mosquitto", timeout=150)
+        self.compose(
+            "up",
+            "--detach",
+            "--wait",
+            "--wait-timeout",
+            "120",
+            "--build",
+            "mosquitto",
+            timeout=300,
+        )
         self.compose("kill", "--signal", "HUP", "mosquitto", timeout=30)
         self.compose("up", "--detach", "--wait", "--wait-timeout", "120", "mosquitto", timeout=150)
 
@@ -2192,13 +2248,50 @@ SELECT json_build_object(
         publisher_auth: list[str],
         topic: str,
         message: str,
+        correlation: str | None = None,
     ) -> None:
-        subscriber = subprocess.Popen(
-            self.mqtt_command_line(
-                [
+        client_id = f"reference-round-trip-{secrets.token_hex(8)}"
+        self.mqtt_command(
+            [
                 "mosquitto_sub",
                 *common,
                 *subscriber_auth,
+                "-c",
+                "-x",
+                "60",
+                "-i",
+                client_id,
+                "-q",
+                "1",
+                "-E",
+                "-t",
+                topic,
+            ]
+        )
+        publish = [
+            "mosquitto_pub",
+            *common,
+            *publisher_auth,
+            "-q",
+            "1",
+            "-t",
+            topic,
+            "-m",
+            message,
+        ]
+        if correlation is not None:
+            publish.extend(["-D", "publish", "correlation-data", correlation])
+        self.mqtt_command(publish)
+        delivery = self.mqtt_command(
+            [
+                "mosquitto_sub",
+                *common,
+                *subscriber_auth,
+                "-c",
+                "-x",
+                "0",
+                "-i",
+                client_id,
                 "-q",
                 "1",
                 "-C",
@@ -2207,36 +2300,11 @@ SELECT json_build_object(
                 "10",
                 "-t",
                 topic,
-                ]
-            ),
-            cwd=ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+            ]
         )
-        try:
-            time.sleep(0.5)
-            self.mqtt_command(
-                [
-                    "mosquitto_pub",
-                    *common,
-                    *publisher_auth,
-                    "-q",
-                    "1",
-                    "-t",
-                    topic,
-                    "-m",
-                    message,
-                ]
-            )
-            stdout, stderr = subscriber.communicate(timeout=12)
-        except Exception:
-            subscriber.terminate()
-            subscriber.communicate(timeout=5)
-            raise
-        if subscriber.returncode != 0 or stdout.strip() != message:
+        if delivery.stdout.strip() != message:
             raise ReferenceEnvironmentError(
-                f"MQTT authorized round trip failed: {self.redact(stderr.strip())}"
+                f"MQTT authorized round trip failed: {self.redact(delivery.stderr.strip())}"
             )
 
     def mqtt_expect_no_delivery(
@@ -2354,7 +2422,52 @@ SELECT json_build_object(
                 publisher_auth=service_auth,
                 topic=topic,
                 message=f"downlink-{index}",
+                correlation=f"reference-downlink-{index}",
             )
+        retained = self.mqtt_command(
+            [
+                "mosquitto_pub",
+                *common,
+                *service_auth,
+                "-q",
+                "1",
+                "-r",
+                "-D",
+                "publish",
+                "correlation-data",
+                "retained-command",
+                "-t",
+                downlink,
+                "-m",
+                "forbidden",
+            ],
+            check=False,
+        )
+        if not self.mqtt_was_denied(retained):
+            raise ReferenceEnvironmentError("Mosquitto accepted a retained device command")
+        for invalid_command_id in ("x" * 257, "contains\ncontrol"):
+            invalid_correlation = self.mqtt_command(
+                [
+                    "mosquitto_pub",
+                    *common,
+                    *service_auth,
+                    "-q",
+                    "1",
+                    "-D",
+                    "publish",
+                    "correlation-data",
+                    invalid_command_id,
+                    "-t",
+                    downlink,
+                    "-m",
+                    "forbidden",
+                ],
+                check=False,
+            )
+            if not self.mqtt_was_denied(invalid_correlation):
+                raise ReferenceEnvironmentError(
+                    "Mosquitto accepted a non-canonical command correlation"
+                )
         self.mqtt_expect_tls_rejection(
             ["mosquitto_pub", *common, "-q", "1", "-t", uplink, "-m", "forbidden"],
             provider_reason="peer did not return a certificate",
@@ -2443,6 +2556,54 @@ SELECT json_build_object(
             self.mqtt_expect_no_delivery(common=common, identity=device_auth, topic=topic)
         for topic in downlinks:
             self.mqtt_expect_no_delivery(common=common, identity=service_auth, topic=topic)
+        self.verify_reference_agent_mqtt_session()
+
+    def verify_reference_agent_mqtt_session(self) -> None:
+        mapping = self.compose("port", "mosquitto", "8883", timeout=15).stdout.strip()
+        try:
+            port = mapping.rsplit(":", 1)[1]
+        except IndexError as error:
+            raise ReferenceEnvironmentError(
+                f"cannot resolve Mosquitto loopback port: {mapping}"
+            ) from error
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "RSS_AGENT_MQTT_HOST": "localhost",
+                "RSS_AGENT_MQTT_PORT": port,
+                "RSS_AGENT_TENANT_ID": str(self.fixture["tenantId"]),
+                "RSS_AGENT_DEVICE_ID": str(self.fixture["deviceId"]),
+                "RSS_AGENT_CREDENTIAL_GENERATION": str(self.fixture["generation"]),
+                "RSS_AGENT_RUN_ID": secrets.token_hex(12),
+                "RSS_AGENT_CA_PATH": str(self.state / "pki/ca.pem"),
+                "RSS_AGENT_DEVICE_CERT_PATH": str(self.state / "pki/device.crt"),
+                "RSS_AGENT_DEVICE_KEY_PATH": str(self.state / "pki/device.key"),
+                "RSS_AGENT_SERVICE_CERT_PATH": str(self.state / "pki/service.crt"),
+                "RSS_AGENT_SERVICE_KEY_PATH": str(self.state / "pki/service.key"),
+                "RSS_AGENT_BROKER_ASSERTION_PUBLIC_KEY": (
+                    self.state / "mosquitto/assertion-public.txt"
+                ).read_text(encoding="utf-8").strip(),
+                # Candidate proofs build committed snapshots with identical package identities.
+                # Keep the live broker test isolated from those intentionally parallel artifacts.
+                "CARGO_TARGET_DIR": str(ROOT / "target/reference-agent-t2"),
+            }
+        )
+        run(
+            [
+                "cargo",
+                "test",
+                "-p",
+                "reference-device-agent-core",
+                "--test",
+                "mqtt_mtls",
+                "--locked",
+                "--",
+                "--ignored",
+                "--test-threads=1",
+            ],
+            env=environment,
+            timeout=120,
+        )
 
     def verify(self) -> None:
         self.require_state()
@@ -2509,6 +2670,9 @@ SELECT json_build_object(
             "vaultRoles": vault_roles,
             "mqttAcl": hashlib.sha256(
                 (self.state / "mosquitto/acl").read_bytes()
+            ).hexdigest(),
+            "mqttAssertionPublicKey": hashlib.sha256(
+                (self.state / "mosquitto/assertion-public.txt").read_bytes()
             ).hexdigest(),
         }
 
@@ -2749,11 +2913,13 @@ SELECT json_build_object(
             "vault-tls/vault-ca.pem",
             "vault-tls/vault-cert.pem",
             "vault-tls/vault-key.pem",
+            "mosquitto/assertion-private.pem",
+            "mosquitto/assertion-public.txt",
         }
         material = {}
-        for directory_name in ("pki", "vault-tls"):
+        for directory_name in ("pki", "vault-tls", "mosquitto"):
             for path in sorted((self.state / directory_name).iterdir()):
-                if path.suffix in {".key", ".crt", ".pem"}:
+                if path.suffix in {".key", ".crt", ".pem"} or path.name == "assertion-public.txt":
                     material[f"{directory_name}/{path.name}"] = hashlib.sha256(
                         path.read_bytes()
                     ).hexdigest()

@@ -2,6 +2,7 @@
 resolver = "3"
 members = ["apps/rotation-*", "crates/*"]
 exclude = [
+    "apps/reference-device-agent",
     "apps/rotation-control",
     "crates/platform-authoring-smoke",
     "crates/rss-device-security-client",
@@ -16,4 +17,5 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = "deny"
+cognitive_complexity = "deny"
 pedantic = "deny"

@@ -14,6 +14,8 @@ pub enum RotationModelError {
     ZeroGeneration,
     /// A fence epoch must be greater than zero.
     ZeroFenceEpoch,
+    /// A device-local credential revision must be greater than zero.
+    ZeroCredentialRevision,
     /// A policy duration or collection violates the closed product constraints.
     InvalidPolicy,
 }
@@ -27,6 +29,9 @@ impl fmt::Display for RotationModelError {
             }
             Self::ZeroGeneration => formatter.write_str("generation must be greater than zero"),
             Self::ZeroFenceEpoch => formatter.write_str("fence epoch must be greater than zero"),
+            Self::ZeroCredentialRevision => {
+                formatter.write_str("credential revision must be greater than zero")
+            }
             Self::InvalidPolicy => {
                 formatter.write_str("rotation policy violates product constraints")
             }
@@ -304,6 +309,72 @@ impl TryFrom<u64> for FenceEpoch {
         NonZeroU64::new(value)
             .map(Self)
             .ok_or(RotationModelError::ZeroFenceEpoch)
+    }
+}
+
+/// Positive device-local credential revision.
+///
+/// This is deliberately distinct from desired generation and MQTT credential generation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CredentialRevision(NonZeroU64);
+
+impl CredentialRevision {
+    /// Returns the positive local revision value.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl TryFrom<u64> for CredentialRevision {
+    type Error = RotationModelError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        NonZeroU64::new(value)
+            .map(Self)
+            .ok_or(RotationModelError::ZeroCredentialRevision)
+    }
+}
+
+/// The three monotonic coordinates committed with an installed credential.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InstalledCredentialPosition {
+    desired_generation: Generation,
+    fence_epoch: FenceEpoch,
+    credential_revision: CredentialRevision,
+}
+
+impl InstalledCredentialPosition {
+    /// Creates a committed device-local credential position.
+    #[must_use]
+    pub const fn new(
+        desired_generation: Generation,
+        fence_epoch: FenceEpoch,
+        credential_revision: CredentialRevision,
+    ) -> Self {
+        Self {
+            desired_generation,
+            fence_epoch,
+            credential_revision,
+        }
+    }
+
+    /// Returns the authoritative desired generation observed by this device.
+    #[must_use]
+    pub const fn desired_generation(self) -> Generation {
+        self.desired_generation
+    }
+
+    /// Returns the committed fence epoch.
+    #[must_use]
+    pub const fn fence_epoch(self) -> FenceEpoch {
+        self.fence_epoch
+    }
+
+    /// Returns the independent local credential revision.
+    #[must_use]
+    pub const fn credential_revision(self) -> CredentialRevision {
+        self.credential_revision
     }
 }
 

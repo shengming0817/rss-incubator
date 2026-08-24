@@ -1,0 +1,29 @@
+[package]
+name = "reference-device-agent-core"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+base64 = "0.22"
+ring = "0.17"
+rotation-model = { path = "../rotation-model" }
+rustls = "0.23"
+rustls-pemfile = "2"
+rustix = { version = "1", features = ["fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+uuid = { version = "1", features = ["serde"] }
+x509-parser = "0.18"
+
+[dev-dependencies]
+rcgen = "0.14"
+rumqttc = "=0.25.1"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true
