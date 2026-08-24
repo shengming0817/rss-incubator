@@ -8,7 +8,7 @@ publish = false
 [dependencies]
 rotation-model = { path = "../../crates/rotation-model" }
 rss-device-security-client = { path = "../../crates/rss-device-security-client" }
-rss-device-security-contracts = "=0.1.0"
+rss-device-security-contracts = { version = "=0.1.0", registry = "rss-candidate" }
 
 [dev-dependencies]
 uuid = "1"

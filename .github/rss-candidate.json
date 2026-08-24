@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
-  "runId": 32691046210,
+  "runId": 32702195713,
   "runAttempt": 1,
-  "rssRevision": "a9055051032d5c8f146e76aaef79ced4b7b1739b",
-  "artifactName": "rss-candidate-bundle-a9055051032d5c8f146e76aaef79ced4b7b1739b-32691046210-1",
-  "artifactDigest": "sha256:3e9294067107be7c6e8dc2265c5b77a800ae23ef5cbd64d55d598460e8992360"
+  "rssRevision": "995da112a4d3cd4701180b3b9d96d7aeb9845efa",
+  "artifactName": "rss-candidate-bundle-995da112a4d3cd4701180b3b9d96d7aeb9845efa-32702195713-1",
+  "artifactDigest": "sha256:e5cc6400dad6f227c877949553e7857188d4d1f57cf0d92dd655a2ffd0bb79ba"
 }

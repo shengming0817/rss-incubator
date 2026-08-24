@@ -5,19 +5,10 @@ device identity over MQTT v5 with mandatory mTLS, QoS 1, a persistent session, a
 PUBACK. It is deliberately not a generic SDK, fleet agent, enrollment client, CA client, artifact
 downloader, inventory system, or control plane.
 
-Build and preserve both device-security consumer executables only through the isolated candidate
-proof. The output directory must be absolute, its parent must already exist, and the directory must
-not exist:
-
-```sh
-python3 scripts/candidate-proof.py \
-  --bundle /absolute/path/to/rss-candidate-bundle \
-  --binary-output-directory /absolute/path/to/device-security-consumers
-```
-
-The proof writes `reference-device-agent`, `rotation-control`, and
-`consumer-manifest.json` only after the locked/offline candidate matrix passes. The agent
-executable then accepts exactly one absolute configuration path:
+The canonical candidate-consumption job builds `reference-device-agent` and `rotation-control`
+from the committed root lock after the complete workspace matrix passes locked and offline. Their
+runner-temporary SHA-256 identities are recorded in the schema-v2 first-green receipt and are not
+uploaded as a second artifact. The agent executable accepts exactly one absolute configuration path:
 
 ```sh
 reference-device-agent /absolute/path/to/config.json

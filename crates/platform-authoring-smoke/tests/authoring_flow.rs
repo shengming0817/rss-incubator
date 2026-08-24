@@ -6,6 +6,7 @@ use platform_authoring_smoke::{
     CreateWidget, CreateWidgetHandler, CreateWidgetRequest, CreateWidgetResponse,
 };
 use rss_contract::ContractDescriptor;
+use rss_contract::{DataClass, PageCursorError, SafeErrorCategory, SafeErrorCode, TimepointError};
 use rss_platform::{
     AdmissionPermit, AdmissionState, ApplicationBuilder, ApplicationModule, ApplicationName,
     ConditionStatus, Contract, DispatchError, DispatchOutcome, Dispatcher, HandlerFailureClass,
@@ -15,6 +16,10 @@ use rss_request_context::{
     Cancellation, CancellationFuture, CancellationObserver, CancellationReason, Deadline,
     FieldMaskView, ObligationsView, PrincipalKind, PrincipalRef, RequestContextView, RequestId,
     RowScope, TenantId,
+};
+
+use platform_authoring_smoke::{
+    FoundationInputError, accept_foundation_record, project_provider_failure,
 };
 
 struct TestHost(AtomicU8);
@@ -218,6 +223,84 @@ async fn handler_failure_and_descriptor_upgrade_mismatch_fail_closed() {
             .await,
         Err(DispatchError::DescriptorMismatch)
     );
+}
+
+#[test]
+fn foundation_values_are_consumed_through_the_public_contract() {
+    let earlier = accept_foundation_record(1_725_000_000, "AQ", DataClass::Public, true)
+        .expect("canonical public record");
+    let later = accept_foundation_record(1_725_000_001, "Ag", DataClass::Public, true)
+        .expect("canonical later record");
+
+    assert!(earlier.recorded_at() < later.recorded_at());
+    assert_eq!(earlier.recorded_at().unix_seconds(), 1_725_000_000);
+    assert_eq!(earlier.next_cursor().as_str(), "AQ");
+    assert_eq!(earlier.data_class(), DataClass::Public);
+    assert_eq!(
+        [
+            DataClass::Public,
+            DataClass::Internal,
+            DataClass::Pii,
+            DataClass::Secret,
+        ]
+        .map(DataClass::as_str),
+        ["public", "internal", "pii", "secret"]
+    );
+    assert!(!format!("{:?}", earlier.next_cursor()).contains("AQ"));
+}
+
+#[test]
+fn foundation_inputs_fail_closed_at_the_product_boundary() {
+    assert_eq!(
+        accept_foundation_record(-1, "AQ", DataClass::Public, true),
+        Err(FoundationInputError::Timepoint(TimepointError::BeforeEpoch))
+    );
+    assert_eq!(
+        accept_foundation_record(1, "AQ==", DataClass::Public, true),
+        Err(FoundationInputError::Cursor(PageCursorError::Malformed))
+    );
+    assert_eq!(
+        accept_foundation_record(1, &"A".repeat(4097), DataClass::Public, true),
+        Err(FoundationInputError::Cursor(PageCursorError::TooLong))
+    );
+    assert_eq!(
+        accept_foundation_record(1, "AQ", DataClass::Public, false),
+        Err(FoundationInputError::Cursor(PageCursorError::Stale))
+    );
+
+    for class in [DataClass::Internal, DataClass::Pii, DataClass::Secret] {
+        let Err(FoundationInputError::UnsafeData(error)) =
+            accept_foundation_record(1, "AQ", class, true)
+        else {
+            panic!("non-public data must be rejected");
+        };
+        assert_eq!(error.code(), SafeErrorCode::Forbidden);
+        assert_eq!(error.category(), SafeErrorCategory::Authorization);
+        assert_eq!(error.message(), "access denied");
+    }
+}
+
+#[test]
+fn provider_failures_project_to_a_closed_safe_error() {
+    #[derive(Debug)]
+    struct ProviderFailure(&'static str);
+
+    impl std::fmt::Display for ProviderFailure {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for ProviderFailure {}
+
+    let hostile = ProviderFailure("password=hunter2 provider payload");
+    let projected = project_provider_failure(&hostile);
+    assert_eq!(projected.code(), SafeErrorCode::Internal);
+    assert_eq!(projected.category(), SafeErrorCategory::Internal);
+    assert_eq!(projected.message(), "internal error");
+    assert!(std::error::Error::source(&projected).is_none());
+    assert!(!format!("{projected:?}").contains(hostile.0));
+    assert!(!projected.to_string().contains(hostile.0));
 }
 
 #[tokio::test]

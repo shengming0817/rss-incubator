@@ -1,12 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["apps/rotation-*", "crates/*"]
-exclude = [
+members = [
     "apps/reference-device-agent",
-    "apps/rotation-control",
-    "crates/platform-authoring-smoke",
-    "crates/rss-device-security-client",
-    "journeys/secure-device-rotation",
+    "apps/rotation-*",
+    "crates/*",
+    "fixtures/rss-conformance-consumer",
+    "journeys/*",
 ]
 
 [workspace.package]
