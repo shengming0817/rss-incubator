@@ -61,7 +61,7 @@ fn policy_decode_is_typed_and_closed_for_all_status_classes() {
         }
         other @ PolicyResponse::Rejected(_) => panic!("unexpected {other:?}"),
     }
-    let validation = br#"{"error":{"code":"ERR_CORE_VALIDATION","details":[],"message":"validation failed","requestId":"request-400","retryable":false}}"#;
+    let validation = br#"{"error":{"code":"ERR_CORE_VALIDATION","details":[{"field":"policy","reason":"invalidPolicy"}],"message":"validation failed","requestId":"request-400","retryable":false}}"#;
     let not_found = br#"{"error":{"code":"ERR_CORE_NOT_FOUND","details":[],"message":"not found","requestId":"request-404","retryable":false}}"#;
     let conflict = br#"{"error":{"code":"ERR_CORE_VERSION_CONFLICT","details":[],"message":"version conflict","requestId":"request-409","retryable":true}}"#;
     for (status, body, kind) in [

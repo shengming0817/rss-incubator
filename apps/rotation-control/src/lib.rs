@@ -1754,7 +1754,7 @@ mod tests {
         for (status, body, exit) in [
             (
                 400,
-                json!({"error":{"code":"ERR_CORE_VALIDATION","details":[],"message":"validation failed","requestId":"r400","retryable":false}}),
+                json!({"error":{"code":"ERR_CORE_VALIDATION","details":[{"field":"policy","reason":"invalidPolicy"}],"message":"validation failed","requestId":"r400","retryable":false}}),
                 4,
             ),
             (401, json!({"provider":"bait"}), 3),
