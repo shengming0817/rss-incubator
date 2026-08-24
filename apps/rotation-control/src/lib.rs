@@ -2,6 +2,7 @@
 
 use std::{
     fs,
+    future::Future,
     io::{self, Read},
     net::IpAddr,
     path::PathBuf,
@@ -33,7 +34,7 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
-    time::timeout,
+    time::{Instant, timeout, timeout_at},
 };
 use url::Url;
 use uuid::Uuid;
@@ -661,12 +662,16 @@ async fn authenticate_with_limit(
     verifier: &dyn IdTokenVerifierPort,
     limit: Duration,
 ) -> Result<TokenSet, AppError> {
-    timeout(
-        limit,
-        authenticate_inner(auth, http, browser, clock, callback, verifier),
+    authenticate_inner(
+        auth,
+        http,
+        browser,
+        clock,
+        callback,
+        verifier,
+        Instant::now() + limit,
     )
     .await
-    .map_err(|_| AppError::auth("login_timeout").at(ErrorStage::Callback))?
 }
 
 async fn authenticate_inner(
@@ -676,6 +681,7 @@ async fn authenticate_inner(
     clock: &dyn ClockPort,
     callback: &dyn CallbackPort,
     verifier: &dyn IdTokenVerifierPort,
+    deadline: Instant,
 ) -> Result<TokenSet, AppError> {
     secure_remote_url(&auth.issuer, false)?;
     secure_remote_url(&auth.redirect_uri, true)?;
@@ -690,11 +696,15 @@ async fn authenticate_inner(
     {
         return Err(AppError::input("redirect_not_loopback"));
     }
-    let discovery: Discovery = fetch_json(
-        http,
-        discovery_url(&auth.issuer)?,
-        LOGIN_TIMEOUT,
+    let discovery: Discovery = within_login_deadline(
+        deadline,
         ErrorStage::Discovery,
+        fetch_json(
+            http,
+            discovery_url(&auth.issuer)?,
+            LOGIN_TIMEOUT,
+            ErrorStage::Discovery,
+        ),
     )
     .await?;
     if discovery.issuer != auth.issuer.as_str() {
@@ -723,12 +733,16 @@ async fn authenticate_inner(
         .append_pair("nonce", &nonce)
         .append_pair("code_challenge", challenge.as_str())
         .append_pair("code_challenge_method", "S256");
-    let code = callback
-        .authorize(&auth.redirect_uri, &state, &authorize, browser)
-        .await
-        .map_err(|error| error.at(ErrorStage::Callback))?;
-    let response = http
-        .post_form(
+    let code = within_login_deadline(
+        deadline,
+        ErrorStage::Callback,
+        callback.authorize(&auth.redirect_uri, &state, &authorize, browser),
+    )
+    .await?;
+    let response = within_login_deadline(
+        deadline,
+        ErrorStage::TokenExchange,
+        http.post_form(
             token_endpoint,
             vec![
                 ("grant_type".to_owned(), "authorization_code".to_owned()),
@@ -741,17 +755,32 @@ async fn authenticate_inner(
                 ),
             ],
             LOGIN_TIMEOUT,
-        )
-        .await
-        .map_err(|error| error.at(ErrorStage::TokenExchange))?;
+        ),
+    )
+    .await?;
     classify_token_response(response.status)?;
     let token: TokenWire = serde_json::from_slice(&response.body)
         .map_err(|_| AppError::untrusted("malformed_json").at(ErrorStage::TokenExchange))?;
-    let jwks = fetch_jwks(http, jwks_uri).await?;
+    let jwks =
+        within_login_deadline(deadline, ErrorStage::Jwks, fetch_jwks(http, jwks_uri)).await?;
     verifier.verify(&token.id_token, &jwks, auth, &nonce, clock.unix_seconds()?)?;
     Ok(TokenSet {
         access_token: token.access_token,
     })
+}
+
+async fn within_login_deadline<T, F>(
+    deadline: Instant,
+    stage: ErrorStage,
+    future: F,
+) -> Result<T, AppError>
+where
+    F: Future<Output = Result<T, AppError>>,
+{
+    timeout_at(deadline, future)
+        .await
+        .map_err(|_| AppError::auth("login_timeout").at(stage))?
+        .map_err(|error| error.at(stage))
 }
 
 fn classify_token_response(status: u16) -> Result<(), AppError> {
@@ -805,23 +834,27 @@ enum CallbackOutcome {
 }
 
 async fn read_callback_headers(socket: &mut tokio::net::TcpStream) -> Result<Vec<u8>, AppError> {
-    let mut request = Vec::new();
-    while request.len() < MAX_CALLBACK_BYTES {
-        let remaining = MAX_CALLBACK_BYTES - request.len();
-        let mut chunk = vec![0_u8; remaining.min(1024)];
-        let count = timeout(CALLBACK_CONNECTION_TIMEOUT, socket.read(&mut chunk))
-            .await
-            .map_err(|_| AppError::auth("callback_connection_timeout").at(ErrorStage::Callback))?
-            .map_err(|_| AppError::auth("callback_failed").at(ErrorStage::Callback))?;
-        if count == 0 {
-            break;
+    timeout_at(Instant::now() + CALLBACK_CONNECTION_TIMEOUT, async {
+        let mut request = Vec::new();
+        while request.len() < MAX_CALLBACK_BYTES {
+            let remaining = MAX_CALLBACK_BYTES - request.len();
+            let mut chunk = vec![0_u8; remaining.min(1024)];
+            let count = socket
+                .read(&mut chunk)
+                .await
+                .map_err(|_| AppError::auth("callback_failed").at(ErrorStage::Callback))?;
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..count]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                return Ok(request);
+            }
         }
-        request.extend_from_slice(&chunk[..count]);
-        if request.windows(4).any(|window| window == b"\r\n\r\n") {
-            return Ok(request);
-        }
-    }
-    Err(AppError::auth(CALLBACK_INVALID).at(ErrorStage::Callback))
+        Err(AppError::auth(CALLBACK_INVALID).at(ErrorStage::Callback))
+    })
+    .await
+    .map_err(|_| AppError::auth("callback_connection_timeout").at(ErrorStage::Callback))?
 }
 
 fn parse_callback_request(
@@ -1615,6 +1648,33 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn callback_connection_budget_does_not_refresh_after_each_fragment() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let read = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            read_callback_headers(&mut socket).await
+        });
+        let mut socket = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect");
+        socket.write_all(b"G").await.expect("first fragment");
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        socket.write_all(b"E").await.expect("second fragment");
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let _ = socket
+            .write_all(b"T /callback HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await;
+        assert_eq!(
+            read.await
+                .expect("read task")
+                .expect_err("one connection budget")
+                .code,
+            "callback_connection_timeout"
+        );
+    }
+
     #[test]
     fn remote_plaintext_is_forbidden_but_loopback_callback_is_allowed() {
         assert!(
@@ -1789,6 +1849,30 @@ mod tests {
         .await
         .expect_err("single budget");
         assert_eq!(error.code, "login_timeout");
+    }
+
+    #[tokio::test]
+    async fn login_timeout_reports_the_active_stage() {
+        let http = DelayedHttp {
+            inner: FakeHttp::new(vec![Ok(reply(
+                200,
+                &json!({"issuer":"https://issuer.example/","authorization_endpoint":"https://issuer.example/authorize","token_endpoint":"https://issuer.example/token","jwks_uri":"https://issuer.example/jwks"}),
+            ))]),
+            delay: Duration::from_millis(50),
+        };
+        let error = authenticate_with_limit(
+            &auth(),
+            &http,
+            &FakeBrowser,
+            &FakeClock,
+            &FakeCallback,
+            &FakeVerifier,
+            Duration::from_millis(20),
+        )
+        .await
+        .expect_err("discovery timeout");
+        assert_eq!(error.code, "login_timeout");
+        assert_eq!(error.stage.as_str(), "discovery");
     }
 
     #[tokio::test]
