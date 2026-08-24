@@ -16,6 +16,8 @@ pub enum RotationModelError {
     ZeroFenceEpoch,
     /// A device-local credential revision must be greater than zero.
     ZeroCredentialRevision,
+    /// A policy duration or collection violates the closed product constraints.
+    InvalidPolicy,
 }
 
 impl fmt::Display for RotationModelError {
@@ -29,6 +31,9 @@ impl fmt::Display for RotationModelError {
             Self::ZeroFenceEpoch => formatter.write_str("fence epoch must be greater than zero"),
             Self::ZeroCredentialRevision => {
                 formatter.write_str("credential revision must be greater than zero")
+            }
+            Self::InvalidPolicy => {
+                formatter.write_str("rotation policy violates product constraints")
             }
         }
     }
@@ -80,6 +85,16 @@ opaque_reference!(
     RotationId,
     "rotation_id",
     "Product-owned correlation ID for one rotation request."
+);
+opaque_reference!(
+    RequestId,
+    "request_id",
+    "Opaque request correlation returned by the public API."
+);
+opaque_reference!(
+    CorrelationId,
+    "correlation_id",
+    "Opaque correlation identifier for one CLI operation."
 );
 opaque_reference!(
     TenantRef,
@@ -135,6 +150,122 @@ fn validate_reference(value: &str, kind: &'static str) -> Result<(), RotationMod
         return Err(RotationModelError::ControlCharacter { kind });
     }
     Ok(())
+}
+
+/// Closed certificate key usage vocabulary accepted by the rotation product.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum KeyUsage {
+    ClientAuth,
+    ServerAuth,
+}
+
+impl KeyUsage {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientAuth => "clientAuth",
+            Self::ServerAuth => "serverAuth",
+        }
+    }
+}
+
+/// Validated, transport-neutral certificate rotation policy.
+#[derive(Clone, Eq, PartialEq)]
+pub struct RotationPolicy {
+    key_usages: Vec<KeyUsage>,
+    renew_before_seconds: u64,
+    sans: Vec<String>,
+    validity_seconds: u64,
+}
+
+impl fmt::Debug for RotationPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RotationPolicy")
+            .field("key_usages", &self.key_usages)
+            .field("renew_before_seconds", &self.renew_before_seconds)
+            .field("sans", &format_args!("[REDACTED; {}]", self.sans.len()))
+            .field("validity_seconds", &self.validity_seconds)
+            .finish()
+    }
+}
+
+impl RotationPolicy {
+    /// Creates a policy only when it obeys the public contract's closed constraints.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RotationModelError::InvalidPolicy`] when a duration, usage, or SAN violates the
+    /// closed product constraints.
+    pub fn try_new(
+        key_usages: Vec<KeyUsage>,
+        renew_before_seconds: u64,
+        sans: Vec<String>,
+        validity_seconds: u64,
+    ) -> Result<Self, RotationModelError> {
+        let unique_usages = key_usages.iter().collect::<std::collections::BTreeSet<_>>();
+        let unique_sans = sans.iter().collect::<std::collections::BTreeSet<_>>();
+        if key_usages.is_empty()
+            || unique_usages.len() != key_usages.len()
+            || !(300..=31_536_000).contains(&validity_seconds)
+            || !(60..validity_seconds).contains(&renew_before_seconds)
+            || sans.len() > 32
+            || unique_sans.len() != sans.len()
+            || sans.iter().any(|san| {
+                san.is_empty() || san.chars().count() > 253 || san.chars().any(char::is_control)
+            })
+        {
+            return Err(RotationModelError::InvalidPolicy);
+        }
+        Ok(Self {
+            key_usages,
+            renew_before_seconds,
+            sans,
+            validity_seconds,
+        })
+    }
+
+    #[must_use]
+    pub fn key_usages(&self) -> &[KeyUsage] {
+        &self.key_usages
+    }
+    #[must_use]
+    pub const fn renew_before_seconds(&self) -> u64 {
+        self.renew_before_seconds
+    }
+    #[must_use]
+    pub fn sans(&self) -> &[String] {
+        &self.sans
+    }
+    #[must_use]
+    pub const fn validity_seconds(&self) -> u64 {
+        self.validity_seconds
+    }
+}
+
+/// Correlation emitted for one control operation; it does not grant authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationCorrelation {
+    request_id: RequestId,
+    correlation_id: CorrelationId,
+}
+
+impl OperationCorrelation {
+    #[must_use]
+    pub const fn new(request_id: RequestId, correlation_id: CorrelationId) -> Self {
+        Self {
+            request_id,
+            correlation_id,
+        }
+    }
+    #[must_use]
+    pub const fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+    #[must_use]
+    pub const fn correlation_id(&self) -> &CorrelationId {
+        &self.correlation_id
+    }
 }
 
 /// Positive generation observed at the public product boundary.

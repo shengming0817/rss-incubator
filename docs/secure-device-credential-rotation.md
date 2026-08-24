@@ -73,8 +73,9 @@ The sequence below is the single implementation path. Implemented items remain s
    contract candidate into product facts.
 2. **Azure PBI #2120** creates the disposable Keycloak, Vault, Mosquitto, and PostgreSQL reference
    environment without production secrets or mutable RSS image tags.
-3. **Azure PBI #2121** implements `apps/rotation-control` through the public client, without local
-   authentication or authorization decisions.
+3. **Azure PBI #2121** implements `apps/rotation-control` through the public client with OIDC
+   Authorization Code + PKCE, without local authentication/authorization decisions, token
+   persistence, automatic mutation retry, generic audit history, or Resource Fact authoring.
 4. **Azure PBI #2122** implements `apps/reference-device-agent` with mandatory mTLS MQTT v5,
    persistent/manual-QoS-1 settlement, a strict local artifact catalog, immutable credential
    revisions, and atomic device-local state. The private state retains the single old-topic delivery
@@ -84,6 +85,13 @@ The sequence below is the single implementation path. Implemented items remain s
    adapter and does not become an MDM/fleet agent.
 5. **Azure PBI #2123** implements the canonical external T2 journey and focused failures. It does
    not register a T3 selector or production acceptance carrier.
+
+#2121 and the #2117 service mounting/image work may proceed in parallel: this change proves the
+real PKCE/HTTP CLI against mock contracts, while #2123 owns privileged disposable Resource Fact
+seeding and the live external T2 journey. The CLI consumes only #2115 authorization results. Its
+closed 403 diagnostic never guesses whether a fact was missing, stale, or denied. `audit` validates
+only the request ID, authorization receipt, and generation from one prior schema-v1 `rotate` result;
+it does not query or claim durable server audit history.
 
 ## Release, rollback, and incubation exit
 

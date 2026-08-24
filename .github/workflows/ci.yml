@@ -23,7 +23,6 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUST_VERSION: 1.96.0
-  RSS_CANDIDATE_RUN_ID: 32664247065
 
 jobs:
   ci:
@@ -118,6 +117,7 @@ jobs:
       - name: Checkout incubator revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
       - name: Install pinned Rust toolchain
@@ -135,9 +135,17 @@ jobs:
         id: artifact
         env:
           GH_TOKEN: ${{ secrets.RSS_ARTIFACTS_READ_TOKEN }}
-          RSS_RUN_ID: ${{ inputs.rssRunId || env.RSS_CANDIDATE_RUN_ID }}
+          RSS_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.rssRunId || '' }}
         run: |
           set -euo pipefail
+          if [[ -z "$RSS_RUN_ID" ]]; then
+            runs="$(gh api --method GET \
+              repos/shengming0817/rss/actions/workflows/candidate-bundle.yml/runs \
+              -f branch=develop -f event=workflow_dispatch -f status=success -f per_page=1)"
+            RSS_RUN_ID="$(jq -er \
+              '.workflow_runs | if length == 1 then .[0].id else error("no successful candidate producer") end' \
+              <<< "$runs")"
+          fi
           [[ "$RSS_RUN_ID" =~ ^[1-9][0-9]*$ ]]
           run_json="$(gh api "repos/shengming0817/rss/actions/runs/$RSS_RUN_ID")"
           jq -e '
@@ -164,6 +172,7 @@ jobs:
             echo "revision=$revision"
             echo "attempt=$attempt"
             echo "digest=$digest"
+            echo "run-id=$RSS_RUN_ID"
           } >> "$GITHUB_OUTPUT"
 
       - name: Download exact RSS candidate artifact
@@ -172,12 +181,13 @@ jobs:
           name: ${{ steps.artifact.outputs.name }}
           path: ${{ runner.temp }}/rss-candidate-bundle
           repository: shengming0817/rss
-          run-id: ${{ inputs.rssRunId || env.RSS_CANDIDATE_RUN_ID }}
+          run-id: ${{ steps.artifact.outputs.run-id }}
           github-token: ${{ secrets.RSS_ARTIFACTS_READ_TOKEN }}
 
       - name: Prove locked offline candidate consumption
         id: proof
         env:
+          INCUBATOR_EXPECTED_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
           RSS_EXPECTED_REVISION: ${{ steps.artifact.outputs.revision }}
         run: |
           set -euo pipefail
@@ -187,8 +197,10 @@ jobs:
             --coverage | tee "$proof_log"
           summary="$(tail -n 1 "$proof_log")"
           jq -e --arg revision "$RSS_EXPECTED_REVISION" \
+            --arg incubator_revision "$INCUBATOR_EXPECTED_REVISION" \
             '.schemaVersion == 1 and
              .rssRevision == $revision and
+             .incubatorRevision == $incubator_revision and
              ([.packages[].name] | sort) == (.consumedPackages | sort)' \
             <<< "$summary" >/dev/null
           {
@@ -206,7 +218,7 @@ jobs:
           {
             echo '## rss-incubator candidate first-green'
             echo
-            echo "- RSS producer run: https://github.com/shengming0817/rss/actions/runs/${{ inputs.rssRunId || env.RSS_CANDIDATE_RUN_ID }}/attempts/${{ steps.artifact.outputs.attempt }}"
+            echo "- RSS producer run: https://github.com/shengming0817/rss/actions/runs/${{ steps.artifact.outputs.run-id }}/attempts/${{ steps.artifact.outputs.attempt }}"
             echo "- Incubator candidate run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
             echo "- RSS revision: \`$(jq -r '.rssRevision' <<< "$RSS_PROOF_SUMMARY")\`"
             echo "- Incubator revision: \`$(jq -r '.incubatorRevision' <<< "$RSS_PROOF_SUMMARY")\`"

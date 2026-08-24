@@ -19,7 +19,9 @@ authorization, retry, readiness, or device-state behavior.
 
 The [Secure Device Credential Rotation](docs/secure-device-credential-rotation.md) product is an
 accepted incubation scope. Its `rotation-model` package contains transport-neutral product
-correlation and observation facts. The product-specific
+correlation and observation facts. Its non-publishable
+[`rotation-control`](apps/rotation-control/README.md) binary provides the PKCE/HTTP policy and
+status control surface. The product-specific
 [`reference-device-agent`](apps/reference-device-agent/README.md) implements the narrow mTLS MQTT
 device boundary; the public mapping client, control CLI, reference deployment, and external T2
 journey retain separate implementation owners.
@@ -121,7 +123,8 @@ released baseline; the candidate lock exists only for the proof lifetime.
 
 On a fresh runner, the proof starts from the committed baseline lock and preserves every existing
 non-RSS registry identity. Any newly required non-RSS identity must be proven reachable from an RSS
-candidate package in Cargo's resolved dependency graph; unrelated lock additions fail closed. A
+candidate package or an excluded candidate member atomically activated for this proof in Cargo's
+resolved dependency graph; unrelated lock additions fail closed. A
 stable logical candidate source is mapped to the already-validated local registry, so temporary
 filesystem paths never enter the candidate lock. The candidate metadata/build/test/lint matrix is
 explicitly locked and offline; the real checkout and committed baseline lock remain unchanged.

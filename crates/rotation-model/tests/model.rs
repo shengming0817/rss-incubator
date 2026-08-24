@@ -11,6 +11,33 @@ use rotation_model::{
 };
 
 #[test]
+fn rotation_policy_is_closed_validated_and_redacted() {
+    use rotation_model::{KeyUsage, RotationPolicy};
+    let policy = RotationPolicy::try_new(
+        vec![KeyUsage::ClientAuth, KeyUsage::ServerAuth],
+        600,
+        vec!["secret.device.example".to_owned()],
+        3600,
+    )
+    .expect("valid policy");
+    assert_eq!(policy.key_usages().len(), 2);
+    assert_eq!(policy.sans().len(), 1);
+    let debug = format!("{policy:?}");
+    assert!(debug.contains("REDACTED"));
+    assert!(!debug.contains("secret.device.example"));
+    assert!(RotationPolicy::try_new(vec![], 600, vec![], 3600).is_err());
+    assert!(
+        RotationPolicy::try_new(
+            vec![KeyUsage::ClientAuth, KeyUsage::ClientAuth],
+            600,
+            vec![],
+            3600
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn opaque_references_reject_blank_and_control_characters() {
     assert_eq!(
         RotationId::try_from("   "),
