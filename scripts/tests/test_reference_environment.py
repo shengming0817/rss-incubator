@@ -408,6 +408,38 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
         self.assertNotIn("--build", mosquitto_up[1][0])
         self.assertEqual(300, mosquitto_up[0][1]["timeout"])
 
+    def test_mqtt_round_trip_waits_for_a_durable_subscription_without_sleeping(self):
+        module = load_reference_environment()
+        environment = object.__new__(module.ReferenceEnvironment)
+        calls = []
+
+        def mqtt_command(arguments, *, check=True):
+            calls.append(arguments)
+            output = "proof\n" if len(calls) == 3 else ""
+            return subprocess.CompletedProcess(arguments, 0, stdout=output, stderr="")
+
+        environment.mqtt_command = mqtt_command
+        with mock.patch.object(module.time, "sleep") as sleep:
+            environment.mqtt_round_trip(
+                common=["--common"],
+                subscriber_auth=["--subscriber"],
+                publisher_auth=["--publisher"],
+                topic="rss/v1/proof",
+                message="proof",
+                correlation="command-1",
+            )
+
+        sleep.assert_not_called()
+        self.assertEqual(3, len(calls))
+        self.assertIn("-E", calls[0])
+        self.assertEqual("60", calls[0][calls[0].index("-x") + 1])
+        self.assertIn("correlation-data", calls[1])
+        self.assertEqual("0", calls[2][calls[2].index("-x") + 1])
+        self.assertEqual(
+            calls[0][calls[0].index("-i") + 1],
+            calls[2][calls[2].index("-i") + 1],
+        )
+
     def test_missing_state_reports_the_reachable_up_instruction(self):
         module = load_reference_environment()
         with tempfile.TemporaryDirectory() as directory:

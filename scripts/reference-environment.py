@@ -2250,12 +2250,48 @@ SELECT json_build_object(
         message: str,
         correlation: str | None = None,
     ) -> None:
-        subscriber = subprocess.Popen(
-            self.mqtt_command_line(
-                [
+        client_id = f"reference-round-trip-{secrets.token_hex(8)}"
+        self.mqtt_command(
+            [
                 "mosquitto_sub",
                 *common,
                 *subscriber_auth,
+                "-c",
+                "-x",
+                "60",
+                "-i",
+                client_id,
+                "-q",
+                "1",
+                "-E",
+                "-t",
+                topic,
+            ]
+        )
+        publish = [
+            "mosquitto_pub",
+            *common,
+            *publisher_auth,
+            "-q",
+            "1",
+            "-t",
+            topic,
+            "-m",
+            message,
+        ]
+        if correlation is not None:
+            publish.extend(["-D", "publish", "correlation-data", correlation])
+        self.mqtt_command(publish)
+        delivery = self.mqtt_command(
+            [
+                "mosquitto_sub",
+                *common,
+                *subscriber_auth,
+                "-c",
+                "-x",
+                "0",
+                "-i",
+                client_id,
                 "-q",
                 "1",
                 "-C",
@@ -2264,37 +2300,11 @@ SELECT json_build_object(
                 "10",
                 "-t",
                 topic,
-                ]
-            ),
-            cwd=ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+            ]
         )
-        try:
-            time.sleep(0.5)
-            publish = [
-                    "mosquitto_pub",
-                    *common,
-                    *publisher_auth,
-                    "-q",
-                    "1",
-                    "-t",
-                    topic,
-                    "-m",
-                    message,
-                ]
-            if correlation is not None:
-                publish.extend(["-D", "publish", "correlation-data", correlation])
-            self.mqtt_command(publish)
-            stdout, stderr = subscriber.communicate(timeout=12)
-        except Exception:
-            subscriber.terminate()
-            subscriber.communicate(timeout=5)
-            raise
-        if subscriber.returncode != 0 or stdout.strip() != message:
+        if delivery.stdout.strip() != message:
             raise ReferenceEnvironmentError(
-                f"MQTT authorized round trip failed: {self.redact(stderr.strip())}"
+                f"MQTT authorized round trip failed: {self.redact(delivery.stderr.strip())}"
             )
 
     def mqtt_expect_no_delivery(
