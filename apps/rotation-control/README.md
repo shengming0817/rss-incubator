@@ -30,7 +30,8 @@ response-body diagnostic. Every failure includes a closed `stage` value without 
 Exit codes are stable: `0` success, `2` CLI/input, `3` authentication/authorization, `4` typed
 validation/not-found/conflict, `5` transport/upstream, and `6` malformed or untrusted response.
 
-Resource Security Facts are not seeded or diagnosed by this CLI. #2123 owns privileged disposable
-fixture seeding and the live external T2 journey; a 403 remains the single public `forbidden`
-diagnostic and does not reveal whether a fact was missing, stale, or denied. #2117 owns service
-mounting/image delivery and does not block this CLI's mock-contract proof.
+Resource Security Facts are not seeded or diagnosed by this CLI. #2123 owns only a public-contract
+external T2 fixture; a 403 remains the single public `forbidden` diagnostic and does not reveal
+whether a fact was missing, stale, or denied. Privileged seeding and real RSS runtime behavior are
+outside that T2. #2117 owns service mounting/image delivery and does not block this CLI's
+mock-contract proof.

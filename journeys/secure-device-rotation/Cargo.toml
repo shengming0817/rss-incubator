@@ -1,0 +1,17 @@
+[package]
+name = "secure-device-rotation-t2-journey"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+rotation-model = { path = "../../crates/rotation-model" }
+rss-device-security-client = { path = "../../crates/rss-device-security-client" }
+rss-device-security-contracts = "=0.1.0"
+
+[dev-dependencies]
+uuid = "1"
+
+[lints]
+workspace = true

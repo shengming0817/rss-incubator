@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import io
 import json
@@ -38,11 +40,19 @@ DEVICE_SECURITY_CLIENT = "rss-device-security-client"
 DEVICE_SECURITY_CONTRACT = "rss-device-security-contracts"
 DEVICE_SECURITY_CLIENT_MANIFEST = Path("crates/rss-device-security-client/Cargo.toml")
 REFERENCE_DEVICE_AGENT = "reference-device-agent"
+ROTATION_CONTROL = "rotation-control"
+T2_JOURNEY = "secure-device-rotation-t2-journey"
+CONSUMER_BINARIES = (REFERENCE_DEVICE_AGENT, ROTATION_CONTROL)
 UNAFFECTED_COVERAGE_PATHS = (
     r"(^|/)(crates/(rotation-model|rss-device-security-client)|tests/fixtures)/"
 )
 REFERENCE_DEVICE_AGENT_MANIFEST = Path("apps/reference-device-agent/Cargo.toml")
 REFERENCE_DEVICE_AGENT_CLIENT_PATH = "../../crates/rss-device-security-client"
+T2_JOURNEY_MANIFEST = Path("journeys/secure-device-rotation/Cargo.toml")
+T2_JOURNEY_CLIENT_PATH = "../../crates/rss-device-security-client"
+AT_FDCWD = -100
+RENAME_NOREPLACE = 1
+RENAME_EXCL = 0x00000004
 
 
 class ProofError(RuntimeError):
@@ -543,14 +553,18 @@ def validate_device_security_dependency_policy(repository: Path, dependencies):
 def allowed_local_device_client_dependency(
     repository, manifest_path, alias, declared_name, specification, target, kind
 ):
-    expected_manifest = (repository / REFERENCE_DEVICE_AGENT_MANIFEST).resolve()
+    expected = {
+        (repository / REFERENCE_DEVICE_AGENT_MANIFEST).resolve():
+            REFERENCE_DEVICE_AGENT_CLIENT_PATH,
+        (repository / T2_JOURNEY_MANIFEST).resolve(): T2_JOURNEY_CLIENT_PATH,
+    }
     return (
-        manifest_path.resolve() == expected_manifest
+        manifest_path.resolve() in expected
         and alias == DEVICE_SECURITY_CLIENT
         and declared_name == DEVICE_SECURITY_CLIENT
         and target is None
         and kind is None
-        and specification == {"path": REFERENCE_DEVICE_AGENT_CLIENT_PATH}
+        and specification == {"path": expected[manifest_path.resolve()]}
     )
 
 
@@ -639,6 +653,25 @@ def validate_reference_device_agent_metadata(dependencies):
         raise ProofError("reference-device-agent direct RSS dependency semantics differ")
 
 
+def validate_t2_journey_dependencies(repository: Path):
+    manifest_path = repository / T2_JOURNEY_MANIFEST
+    try:
+        manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        raise ProofError("secure-device-rotation T2 journey manifest is invalid") from error
+    if manifest.get("package", {}).get("name") != T2_JOURNEY:
+        raise ProofError("secure-device-rotation T2 journey package identity differs")
+    dependencies = manifest.get("dependencies", {})
+    if dependencies.get(DEVICE_SECURITY_CLIENT) != {"path": T2_JOURNEY_CLIENT_PATH}:
+        raise ProofError(
+            "secure-device-rotation T2 journey client edge must target the canonical manifest"
+        )
+    if dependencies.get(DEVICE_SECURITY_CONTRACT) != "=0.1.0":
+        raise ProofError(
+            "secure-device-rotation T2 journey contract edge must be exact and registry-only"
+        )
+
+
 def validate_manifest_dependency_sources(metadata, bundle_names: set[str]):
     workspace_ids = set(metadata.get("workspace_members", []))
     found = set()
@@ -697,7 +730,11 @@ def direct_rss_dependencies(metadata, bundle_names: set[str]):
             canonical = canonical_package_name(name)
             source = dependency.get("source")
             if (
-                package.get("name") in {REFERENCE_DEVICE_AGENT, "rotation-control"}
+                package.get("name") in {
+                    REFERENCE_DEVICE_AGENT,
+                    ROTATION_CONTROL,
+                    T2_JOURNEY,
+                }
                 and canonical == DEVICE_SECURITY_CLIENT
                 and source is None
             ):
@@ -789,6 +826,9 @@ def command_env(temp_root: Path):
             "CARGO_TARGET_DIR": str(temp_root / "target"),
             "CARGO_TERM_COLOR": "always",
             "CARGO_INCREMENTAL": "0",
+            "CARGO_HTTP_MULTIPLEXING": "false",
+            "CARGO_HTTP_TIMEOUT": "30",
+            "CARGO_NET_RETRY": "3",
         }
     )
     return env
@@ -1078,39 +1118,139 @@ def validate_resolution(repository: Path, bundle: CandidateBundle, metadata, exp
     return sorted(consumed)
 
 
-def preserve_release_binary(source: Path, destination: Path):
+def require_lower_hex(value: str, length: int, field: str):
+    pattern = LOWER_HEX_40 if length == 40 else LOWER_HEX_64
+    if not isinstance(value, str) or not pattern.fullmatch(value):
+        raise ProofError(f"{field} must be lowercase hexadecimal")
+
+
+def publish_directory_noreplace(source: Path, destination: Path):
+    """Atomically publishes one directory without replacing any destination."""
+    library = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    if sys.platform == "darwin":
+        rename = library.renamex_np
+        rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        rename.restype = ctypes.c_int
+        result = rename(source_bytes, destination_bytes, RENAME_EXCL)
+    elif sys.platform.startswith("linux"):
+        try:
+            rename = library.renameat2
+        except AttributeError as error:
+            raise ProofError("atomic no-replace directory publication is unavailable") from error
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        result = rename(
+            AT_FDCWD,
+            source_bytes,
+            AT_FDCWD,
+            destination_bytes,
+            RENAME_NOREPLACE,
+        )
+    else:
+        raise ProofError("atomic no-replace directory publication is unsupported")
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise ProofError("--binary-output-directory was created concurrently")
+    raise OSError(error_number, os.strerror(error_number), destination)
+
+
+def preserve_release_binaries(
+    source_directory: Path,
+    destination: Path,
+    *,
+    rss_revision: str,
+    incubator_revision: str,
+    candidate_lock_sha256: str,
+    contract_version: str,
+    contract_checksum: str,
+):
     if not destination.is_absolute():
-        raise ProofError("--binary-output must be an absolute path")
+        raise ProofError("--binary-output-directory must be an absolute path")
     parent = destination.parent
     if not parent.is_dir() or parent.is_symlink():
-        raise ProofError("--binary-output parent must be a real directory")
+        raise ProofError("--binary-output-directory parent must be a real directory")
     if destination.exists() or destination.is_symlink():
-        raise ProofError("--binary-output must not already exist")
-    if not source.is_file() or source.is_symlink():
-        raise ProofError("candidate release binary is missing or unsafe")
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.", suffix=".tmp", dir=parent
-    )
-    temporary = Path(temporary_name)
+        raise ProofError("--binary-output-directory must not already exist")
+    require_lower_hex(rss_revision, 40, "RSS revision")
+    require_lower_hex(incubator_revision, 40, "incubator revision")
+    require_lower_hex(candidate_lock_sha256, 64, "candidate lock SHA-256")
+    require_lower_hex(contract_checksum, 64, "contract checksum")
+    if not SEMVER.fullmatch(contract_version):
+        raise ProofError("contract version must be SemVer")
+    sources = {name: source_directory / name for name in CONSUMER_BINARIES}
+    if any(not source.is_file() or source.is_symlink() for source in sources.values()):
+        raise ProofError("candidate release binary exact-set is missing or unsafe")
+
+    lock = parent / f".{destination.name}.lock"
     try:
-        with os.fdopen(descriptor, "wb") as output:
-            output.write(source.read_bytes())
+        lock_descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as error:
+        raise ProofError("--binary-output-directory is locked concurrently") from error
+    os.close(lock_descriptor)
+    staging = None
+    try:
+        staging = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=parent))
+        binaries = []
+        for name, source in sorted(sources.items()):
+            output_path = staging / name
+            with output_path.open("xb") as output:
+                output.write(source.read_bytes())
+                output.flush()
+                os.fsync(output.fileno())
+            output_path.chmod(0o755)
+            binaries.append(
+                {
+                    "name": name,
+                    "sha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
+                }
+            )
+        manifest = {
+            "schemaVersion": 1,
+            "rssRevision": rss_revision,
+            "incubatorRevision": incubator_revision,
+            "candidateLockSha256": candidate_lock_sha256,
+            "contract": {
+                "name": DEVICE_SECURITY_CONTRACT,
+                "version": contract_version,
+                "checksum": contract_checksum,
+            },
+            "binaries": binaries,
+        }
+        manifest_path = staging / "consumer-manifest.json"
+        with manifest_path.open("x", encoding="utf-8") as output:
+            json.dump(manifest, output, sort_keys=True, separators=(",", ":"))
+            output.write("\n")
             output.flush()
             os.fsync(output.fileno())
-        temporary.chmod(0o755)
-        os.link(temporary, destination)
-    except FileExistsError as error:
-        raise ProofError("--binary-output was created concurrently") from error
+        directory_descriptor = os.open(staging, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+        publish_directory_noreplace(staging, destination)
+        return manifest
     except OSError as error:
-        raise ProofError("cannot preserve candidate release binary") from error
+        raise ProofError("cannot preserve candidate release binaries") from error
     finally:
-        temporary.unlink(missing_ok=True)
+        if staging is not None and staging.exists():
+            shutil.rmtree(staging)
+        lock.unlink(missing_ok=True)
 
 
 def execute(
     repository: Path,
     bundle_root: Path,
-    binary_output: Path | None = None,
+    binary_output_directory: Path | None = None,
     coverage: bool = False,
 ):
     bundle = validate_bundle(bundle_root)
@@ -1131,6 +1271,8 @@ def execute(
         validate_device_security_dependency_policy(snapshot, dependencies)
         if (snapshot / REFERENCE_DEVICE_AGENT_MANIFEST).is_file():
             validate_reference_device_agent_dependencies(snapshot, dependencies)
+        if (snapshot / T2_JOURNEY_MANIFEST).is_file():
+            validate_t2_journey_dependencies(snapshot)
         config = snapshot / ".cargo/config.toml"
         config.parent.mkdir(parents=True, exist_ok=True)
         config.write_text(
@@ -1196,45 +1338,32 @@ def execute(
             "candidate workspace doctest",
         )
         if coverage:
-            run_visible(
-                [
-                    "cargo",
-                    "llvm-cov",
-                    "--package",
-                    "reference-device-agent-core",
-                    "--package",
-                    REFERENCE_DEVICE_AGENT,
-                    "--all-targets",
-                    "--locked",
-                    "--offline",
-                    "--ignore-filename-regex",
-                    UNAFFECTED_COVERAGE_PATHS,
-                    "--fail-under-lines",
-                    "80",
-                ],
-                snapshot,
-                env,
-                "affected package coverage",
-            )
-        if binary_output is not None:
-            run_visible(
-                [
-                    "cargo",
-                    "build",
-                    "--package",
-                    REFERENCE_DEVICE_AGENT,
-                    "--release",
-                    "--locked",
-                    "--offline",
-                ],
-                snapshot,
-                env,
-                "candidate release build",
-            )
-            preserve_release_binary(
-                Path(env["CARGO_TARGET_DIR"]) / "release" / REFERENCE_DEVICE_AGENT,
-                binary_output,
-            )
+            for packages, label in (
+                (("reference-device-agent-core", REFERENCE_DEVICE_AGENT), "agent coverage"),
+                ((T2_JOURNEY,), "external T2 journey coverage"),
+            ):
+                package_arguments = [
+                    argument
+                    for package in packages
+                    for argument in ("--package", package)
+                ]
+                run_visible(
+                    [
+                        "cargo",
+                        "llvm-cov",
+                        *package_arguments,
+                        "--all-targets",
+                        "--locked",
+                        "--offline",
+                        "--ignore-filename-regex",
+                        UNAFFECTED_COVERAGE_PATHS,
+                        "--fail-under-lines",
+                        "80",
+                    ],
+                    snapshot,
+                    env,
+                    label,
+                )
         lock_sha = hashlib.sha256((snapshot / "Cargo.lock").read_bytes()).hexdigest()
         incubator_revision = run_capture(
             ["/usr/bin/git", "rev-parse", "HEAD"],
@@ -1242,6 +1371,39 @@ def execute(
             os.environ.copy(),
             "read incubator revision",
         ).decode().strip()
+        consumer_manifest = None
+        if binary_output_directory is not None:
+            run_visible(
+                [
+                    "cargo",
+                    "build",
+                    *(item for package in CONSUMER_BINARIES for item in ("--package", package)),
+                    "--release",
+                    "--locked",
+                    "--offline",
+                ],
+                snapshot,
+                env,
+                "candidate consumer release build",
+            )
+            contracts = [
+                package for package in bundle.packages
+                if package.name == DEVICE_SECURITY_CONTRACT
+            ]
+            if len(contracts) != 1:
+                raise ProofError(
+                    "candidate bundle must contain exactly one device-security contract"
+                )
+            contract = contracts[0]
+            consumer_manifest = preserve_release_binaries(
+                Path(env["CARGO_TARGET_DIR"]) / "release",
+                binary_output_directory,
+                rss_revision=bundle.rss_revision,
+                incubator_revision=incubator_revision,
+                candidate_lock_sha256=lock_sha,
+                contract_version=contract.version,
+                contract_checksum=contract.checksum,
+            )
         return {
             "schemaVersion": 1,
             "rssRevision": bundle.rss_revision,
@@ -1252,13 +1414,16 @@ def execute(
             ],
             "consumedPackages": consumed,
             "candidateLockSha256": lock_sha,
+            "consumerBinaries": (
+                consumer_manifest["binaries"] if consumer_manifest is not None else []
+            ),
         }
 
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("--bundle", required=True, type=Path)
-    parser.add_argument("--binary-output", type=Path)
+    parser.add_argument("--binary-output-directory", type=Path)
     parser.add_argument("--coverage", action="store_true")
     return parser.parse_args(argv)
 
@@ -1286,7 +1451,7 @@ def main(argv=None):
         summary = execute(
             repository,
             bundle_root,
-            binary_output=args.binary_output,
+            binary_output_directory=args.binary_output_directory,
             coverage=args.coverage,
         )
     except Exception as caught:  # preserve cleanup/status evidence before reporting
