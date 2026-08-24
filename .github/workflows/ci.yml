@@ -199,7 +199,10 @@ jobs:
           echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
 
       - name: Fetch exact root lock
-        run: cargo fetch --locked
+        run: |
+          set -euo pipefail
+          cargo fetch --locked
+          echo 'CARGO_NET_OFFLINE=true' >> "$GITHUB_ENV"
 
       - name: Prove registry-only resolved graph
         id: graph
