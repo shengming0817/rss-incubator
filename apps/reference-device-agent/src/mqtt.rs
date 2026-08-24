@@ -10,14 +10,14 @@ use rumqttc::v5::mqttbytes::v5::{
 use rumqttc::v5::{AsyncClient, ClientError, ConnectionError, Event, EventLoop, MqttOptions};
 use rumqttc::{Outgoing, TlsConfiguration, Transport};
 
-use crate::assertion::BrokerPublishFrame;
-use crate::{
-    BrokerAssertionVerifier, CredentialFiles, DeviceIdentity, MqttConnectionConfig,
+use crate::wire::{EncodedOutbound, EncodedOutboundKind};
+use reference_device_agent_core::{
+    BrokerAssertionVerifier, CommandId, CredentialFiles, DeviceIdentity, MqttConnectionConfig,
     RecoveryCommandScope, TopicSet,
 };
 
 #[derive(thiserror::Error)]
-pub enum MqttError {
+pub(super) enum MqttError {
     #[error("MQTT credential files are unavailable")]
     CredentialUnavailable,
     #[error("MQTT request queue failed")]
@@ -45,7 +45,7 @@ impl std::fmt::Debug for MqttError {
 
 impl MqttError {
     #[must_use]
-    pub fn is_retryable(&self) -> bool {
+    pub(super) fn is_retryable(&self) -> bool {
         matches!(self, Self::Request(_))
             || matches!(
                 self,
@@ -69,7 +69,7 @@ impl MqttError {
     }
 
     #[must_use]
-    pub fn kind(&self) -> &'static str {
+    pub(super) fn kind(&self) -> &'static str {
         match self {
             Self::CredentialUnavailable => "credential_unavailable",
             Self::Request(_) => "request_queue",
@@ -87,7 +87,7 @@ impl MqttError {
 }
 
 /// Broker-asserted command delivery retaining the one-shot manual PUBACK capability.
-pub struct CommandDelivery {
+pub(super) struct CommandDelivery {
     publish: Publish,
     topic: String,
     command_id: String,
@@ -102,71 +102,30 @@ impl std::fmt::Debug for CommandDelivery {
 
 impl CommandDelivery {
     #[must_use]
-    pub fn topic(&self) -> &str {
+    pub(super) fn topic(&self) -> &str {
         &self.topic
     }
 
     #[must_use]
-    pub fn payload(&self) -> &[u8] {
+    pub(super) fn payload(&self) -> &[u8] {
         &self.publish.payload
     }
 
     #[must_use]
-    pub fn command_id(&self) -> &str {
+    pub(super) fn command_id(&self) -> &str {
         &self.command_id
     }
 
     #[must_use]
-    pub const fn identity(&self) -> &DeviceIdentity {
+    pub(super) const fn identity(&self) -> &DeviceIdentity {
         &self.identity
-    }
-}
-
-/// Closed outbound MQTT contract selector. Callers cannot supply raw topics.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MqttOutboundKind {
-    CommandAcknowledged,
-    CertificateReported,
-}
-
-/// One encoded durable fact ready for the exact canonical MQTT topic.
-pub struct MqttOutbound {
-    kind: MqttOutboundKind,
-    event_id: String,
-    payload: Vec<u8>,
-}
-
-impl MqttOutbound {
-    #[must_use]
-    pub fn new(kind: MqttOutboundKind, event_id: String, payload: Vec<u8>) -> Self {
-        Self {
-            kind,
-            event_id,
-            payload,
-        }
-    }
-
-    #[must_use]
-    pub const fn kind(&self) -> MqttOutboundKind {
-        self.kind
-    }
-}
-
-impl std::fmt::Debug for MqttOutbound {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("MqttOutbound")
-            .field("kind", &self.kind)
-            .field("event_id", &"<redacted>")
-            .field("payload", &"<redacted>")
-            .finish()
     }
 }
 
 /// Observable MQTT v5 transport events. Broker acknowledgements never become application facts.
 #[derive(Debug)]
-pub enum MqttEvent {
-    Connected { session_present: bool },
+pub(super) enum MqttEvent {
+    Connected,
     Subscribed,
     Unsubscribed,
     Command(Box<CommandDelivery>),
@@ -176,7 +135,7 @@ pub enum MqttEvent {
 }
 
 /// Concrete MQTT v5 client with mandatory mTLS, persistent session, `QoS` 1, and manual ACKs.
-pub struct MqttSession {
+pub(super) struct MqttSession {
     client: AsyncClient,
     event_loop: EventLoop,
     topics: TopicSet,
@@ -199,7 +158,7 @@ impl MqttSession {
     /// # Errors
     ///
     /// Returns an error when any mandatory credential file is unavailable.
-    pub fn new(
+    pub(super) fn new(
         config: &MqttConnectionConfig,
         credentials: &CredentialFiles,
         topics: TopicSet,
@@ -241,7 +200,7 @@ impl MqttSession {
     /// # Errors
     ///
     /// Returns an error when the request cannot be queued to the transport.
-    pub async fn subscribe(&self) -> Result<(), MqttError> {
+    pub(super) async fn subscribe(&self) -> Result<(), MqttError> {
         self.client
             .subscribe(self.topics.command(), QoS::AtLeastOnce)
             .await
@@ -253,7 +212,7 @@ impl MqttSession {
     /// # Errors
     ///
     /// Returns an error when the request cannot be queued to the transport.
-    pub async fn unsubscribe_command(&self) -> Result<(), MqttError> {
+    pub(super) async fn unsubscribe_command(&self) -> Result<(), MqttError> {
         self.client
             .unsubscribe(self.topics.command())
             .await
@@ -265,7 +224,7 @@ impl MqttSession {
     /// # Errors
     ///
     /// Returns an error when the request cannot be queued to the transport.
-    pub async fn unsubscribe_recovery(&self) -> Result<(), MqttError> {
+    pub(super) async fn unsubscribe_recovery(&self) -> Result<(), MqttError> {
         let recovery = self
             .recovery_command
             .as_ref()
@@ -281,22 +240,23 @@ impl MqttSession {
     /// # Errors
     ///
     /// Returns an error when the publish cannot be queued to the transport.
-    pub async fn publish(&mut self, outbound: MqttOutbound) -> Result<(), MqttError> {
-        let topic = match outbound.kind {
-            MqttOutboundKind::CommandAcknowledged => self.topics.command_acknowledged(),
-            MqttOutboundKind::CertificateReported => self.topics.certificate_reported(),
+    pub(super) async fn publish(&mut self, outbound: EncodedOutbound) -> Result<(), MqttError> {
+        let (kind, event_id, payload) = outbound.into_parts();
+        let topic = match kind {
+            EncodedOutboundKind::CommandAcknowledged => self.topics.command_acknowledged(),
+            EncodedOutboundKind::CertificateReported => self.topics.certificate_reported(),
         };
         let properties = PublishProperties {
-            correlation_data: Some(outbound.event_id.as_bytes().to_vec().into()),
+            correlation_data: Some(event_id.as_bytes().to_vec().into()),
             payload_format_indicator: Some(1),
             content_type: Some("application/json".to_owned()),
             ..PublishProperties::default()
         };
         self.client
-            .publish_with_properties(topic, QoS::AtLeastOnce, false, outbound.payload, properties)
+            .publish_with_properties(topic, QoS::AtLeastOnce, false, payload, properties)
             .await
             .map_err(|error| MqttError::Request(Box::new(error)))?;
-        self.awaiting_packet_id.push_back(outbound.event_id);
+        self.awaiting_packet_id.push_back(event_id);
         Ok(())
     }
 
@@ -305,7 +265,7 @@ impl MqttSession {
     /// # Errors
     ///
     /// Returns an error when the acknowledgement cannot be queued to the transport.
-    pub async fn acknowledge_command(
+    pub(super) async fn acknowledge_command(
         &mut self,
         delivery: Box<CommandDelivery>,
         settlement_token: Option<String>,
@@ -324,7 +284,7 @@ impl MqttSession {
     /// # Errors
     ///
     /// Returns an error when the disconnect cannot be queued.
-    pub async fn disconnect(&self) -> Result<(), MqttError> {
+    pub(super) async fn disconnect(&self) -> Result<(), MqttError> {
         self.client
             .disconnect()
             .await
@@ -336,16 +296,14 @@ impl MqttSession {
     /// # Errors
     ///
     /// Returns an error for transport failure, invalid command frames, or uncorrelated `PUBACK`s.
-    pub async fn poll(&mut self) -> Result<MqttEvent, MqttError> {
+    pub(super) async fn poll(&mut self) -> Result<MqttEvent, MqttError> {
         let event = self
             .event_loop
             .poll()
             .await
             .map_err(|error| MqttError::Connection(Box::new(error)))?;
         match event {
-            Event::Incoming(Packet::ConnAck(ack)) => Ok(MqttEvent::Connected {
-                session_present: ack.session_present,
-            }),
+            Event::Incoming(Packet::ConnAck(_)) => Ok(MqttEvent::Connected),
             Event::Incoming(Packet::SubAck(ack)) => {
                 validate_suback(&ack)?;
                 Ok(MqttEvent::Subscribed)
@@ -398,9 +356,7 @@ impl MqttSession {
         let command_id = std::str::from_utf8(correlation)
             .map_err(|_| MqttError::InvalidCommandFrame)?
             .to_owned();
-        if command_id.is_empty() {
-            return Err(MqttError::InvalidCommandFrame);
-        }
+        CommandId::try_from(command_id.as_str()).map_err(|_| MqttError::InvalidCommandFrame)?;
         let identity = if self.topics.accepts_command(&topic) {
             self.topics.identity()
         } else if self
@@ -419,16 +375,16 @@ impl MqttSession {
         let user_properties = properties
             .map(|properties| properties.user_properties.as_slice())
             .unwrap_or_default();
-        let frame = BrokerPublishFrame {
-            topic: &topic,
-            payload: &publish.payload,
-            correlation,
-            qos: 1,
-            retain: publish.retain,
-            properties: user_properties,
-        };
         self.assertion_verifier
-            .verify(identity, &frame)
+            .verify_command(
+                identity,
+                &topic,
+                &publish.payload,
+                correlation,
+                1,
+                publish.retain,
+                user_properties,
+            )
             .map_err(|_| MqttError::AssertionRejected)?;
         Ok(MqttEvent::Command(Box::new(CommandDelivery {
             publish,
@@ -474,7 +430,7 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    use crate::CredentialGeneration;
+    use reference_device_agent_core::{AckFact, CredentialGeneration, OutboundFact, ReportFact};
 
     #[test]
     fn broker_refusal_retry_policy_separates_capacity_from_authentication() {
@@ -547,7 +503,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closed_session_api_queues_only_canonical_operations() {
+    async fn private_transport_queues_only_wire_minted_operations() {
         let mut fixture = SessionFixture::new(None);
         fixture.session.subscribe().await.expect("subscribe");
         fixture
@@ -560,14 +516,38 @@ mod tests {
             Err(MqttError::InvalidCommandFrame)
         ));
 
-        for kind in [
-            MqttOutboundKind::CommandAcknowledged,
-            MqttOutboundKind::CertificateReported,
+        for outbound in [
+            OutboundFact::CommandAcknowledged {
+                event_id: "ack-event".to_owned(),
+                payload: AckFact {
+                    command_id: "command-1".to_owned(),
+                    desired_generation: 3,
+                    fence_epoch: 2,
+                    device_sequence: 1,
+                    observed_at: 1_800_000_000,
+                    rejection: None,
+                },
+            },
+            OutboundFact::CertificateReported {
+                event_id: "report-event".to_owned(),
+                payload: ReportFact {
+                    observed_generation: 3,
+                    fence_epoch: 2,
+                    device_sequence: 2,
+                    observed_at: 1_800_000_001,
+                    state_hash:
+                        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            .to_owned(),
+                    artifact_digest:
+                        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                            .to_owned(),
+                    expires_at: None,
+                },
+            },
         ] {
-            let outbound = MqttOutbound::new(kind, format!("event-{kind:?}"), b"{}".to_vec());
-            assert_eq!(outbound.kind(), kind);
-            assert!(!format!("{outbound:?}").contains("event-"));
-            fixture.session.publish(outbound).await.expect("publish");
+            let encoded = crate::wire::encode_outbound(&fixture.identity, outbound)
+                .expect("canonical outbound");
+            fixture.session.publish(encoded).await.expect("publish");
         }
 
         let delivery = fixture.signed_delivery(
@@ -673,6 +653,23 @@ mod tests {
     }
 
     #[test]
+    fn broker_asserted_command_id_must_still_be_canonical() {
+        let fixture = SessionFixture::new(None);
+        for command_id in ["contains\ncontrol".to_owned(), "x".repeat(257)] {
+            let publish = fixture.signed_publish(
+                fixture.topics.command().to_owned(),
+                &fixture.identity,
+                &command_id,
+                b"payload",
+            );
+            assert!(matches!(
+                fixture.session.command_delivery(publish),
+                Err(MqttError::InvalidCommandFrame)
+            ));
+        }
+    }
+
+    #[test]
     fn mqtt_errors_are_closed_redacted_and_classified() {
         for (error, kind) in [
             (MqttError::CredentialUnavailable, "credential_unavailable"),
@@ -748,6 +745,24 @@ mod tests {
             command_id: &str,
             payload: &[u8],
         ) -> Box<CommandDelivery> {
+            let publish = self.signed_publish(topic, identity, command_id, payload);
+            match self
+                .session
+                .command_delivery(publish)
+                .expect("signed command")
+            {
+                MqttEvent::Command(delivery) => delivery,
+                _ => panic!("command delivery event"),
+            }
+        }
+
+        fn signed_publish(
+            &self,
+            topic: String,
+            identity: &DeviceIdentity,
+            command_id: &str,
+            payload: &[u8],
+        ) -> Publish {
             let principal = identity.principal_urn();
             let signature = self.key.sign(&signed_bytes(
                 &principal,
@@ -770,14 +785,7 @@ mod tests {
             let mut publish =
                 Publish::new(topic, QoS::AtLeastOnce, payload.to_vec(), Some(properties));
             publish.pkid = 7;
-            match self
-                .session
-                .command_delivery(publish)
-                .expect("signed command")
-            {
-                MqttEvent::Command(delivery) => delivery,
-                _ => panic!("command delivery event"),
-            }
+            publish
         }
     }
 

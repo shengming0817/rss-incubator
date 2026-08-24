@@ -126,6 +126,62 @@ static bool has_reserved_property(const mosquitto_property *properties)
     return false;
 }
 
+static bool utf8_continuation(unsigned char value)
+{
+    return value >= 0x80U && value <= 0xBFU;
+}
+
+static bool canonical_command_id(const unsigned char *value, uint16_t length)
+{
+    if (value == NULL || length == 0U) {
+        return false;
+    }
+    size_t offset = 0U;
+    size_t characters = 0U;
+    while (offset < length) {
+        const unsigned char lead = value[offset];
+        uint32_t scalar = 0U;
+        size_t width = 0U;
+        if (lead <= 0x7FU) {
+            scalar = lead;
+            width = 1U;
+        } else if (lead >= 0xC2U && lead <= 0xDFU && offset + 1U < length &&
+                   utf8_continuation(value[offset + 1U])) {
+            scalar = ((uint32_t)(lead & 0x1FU) << 6U) |
+                     (uint32_t)(value[offset + 1U] & 0x3FU);
+            width = 2U;
+        } else if (lead >= 0xE0U && lead <= 0xEFU && offset + 2U < length &&
+                   utf8_continuation(value[offset + 1U]) &&
+                   utf8_continuation(value[offset + 2U]) &&
+                   !(lead == 0xE0U && value[offset + 1U] < 0xA0U) &&
+                   !(lead == 0xEDU && value[offset + 1U] > 0x9FU)) {
+            scalar = ((uint32_t)(lead & 0x0FU) << 12U) |
+                     ((uint32_t)(value[offset + 1U] & 0x3FU) << 6U) |
+                     (uint32_t)(value[offset + 2U] & 0x3FU);
+            width = 3U;
+        } else if (lead >= 0xF0U && lead <= 0xF4U && offset + 3U < length &&
+                   utf8_continuation(value[offset + 1U]) &&
+                   utf8_continuation(value[offset + 2U]) &&
+                   utf8_continuation(value[offset + 3U]) &&
+                   !(lead == 0xF0U && value[offset + 1U] < 0x90U) &&
+                   !(lead == 0xF4U && value[offset + 1U] > 0x8FU)) {
+            scalar = ((uint32_t)(lead & 0x07U) << 18U) |
+                     ((uint32_t)(value[offset + 1U] & 0x3FU) << 12U) |
+                     ((uint32_t)(value[offset + 2U] & 0x3FU) << 6U) |
+                     (uint32_t)(value[offset + 3U] & 0x3FU);
+            width = 4U;
+        } else {
+            return false;
+        }
+        if (scalar <= 0x1FU || (scalar >= 0x7FU && scalar <= 0x9FU) ||
+            ++characters > 256U) {
+            return false;
+        }
+        offset += width;
+    }
+    return true;
+}
+
 static bool exact_correlation_data(
     const mosquitto_property *properties,
     unsigned char **value,
@@ -141,7 +197,7 @@ static bool exact_correlation_data(
     return count == 1U &&
            mosquitto_property_read_binary(
                properties, MQTT_PROP_CORRELATION_DATA, (void **)value, length, false) != NULL &&
-           *length > 0U;
+           canonical_command_id(*value, *length);
 }
 
 static bool append_field(

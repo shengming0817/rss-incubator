@@ -51,6 +51,35 @@ impl BrokerAssertionVerifier {
         Ok(Self { public_key })
     }
 
+    /// Verifies the broker-minted assertion on one exact command transport frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless every signed coordinate and reserved property is canonical.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_command(
+        &self,
+        identity: &DeviceIdentity,
+        topic: &str,
+        payload: &[u8],
+        correlation: &[u8],
+        qos: u8,
+        retain: bool,
+        properties: &[(String, String)],
+    ) -> Result<(), BrokerAssertionError> {
+        self.verify(
+            identity,
+            &BrokerPublishFrame {
+                topic,
+                payload,
+                correlation,
+                qos,
+                retain,
+                properties,
+            },
+        )
+    }
+
     pub(crate) fn verify(
         &self,
         identity: &DeviceIdentity,

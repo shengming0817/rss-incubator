@@ -1651,7 +1651,16 @@ class ReferenceEnvironment:
         self.compose("up", "--detach", "--wait", "--wait-timeout", "180", "keycloak", timeout=210)
         self.bootstrap_keycloak()
         self.generate_mosquitto_acl()
-        self.compose("up", "--detach", "--wait", "--wait-timeout", "120", "mosquitto", timeout=150)
+        self.compose(
+            "up",
+            "--detach",
+            "--wait",
+            "--wait-timeout",
+            "120",
+            "--build",
+            "mosquitto",
+            timeout=300,
+        )
         self.compose("kill", "--signal", "HUP", "mosquitto", timeout=30)
         self.compose("up", "--detach", "--wait", "--wait-timeout", "120", "mosquitto", timeout=150)
 
@@ -2426,6 +2435,29 @@ SELECT json_build_object(
         )
         if not self.mqtt_was_denied(retained):
             raise ReferenceEnvironmentError("Mosquitto accepted a retained device command")
+        for invalid_command_id in ("x" * 257, "contains\ncontrol"):
+            invalid_correlation = self.mqtt_command(
+                [
+                    "mosquitto_pub",
+                    *common,
+                    *service_auth,
+                    "-q",
+                    "1",
+                    "-D",
+                    "publish",
+                    "correlation-data",
+                    invalid_command_id,
+                    "-t",
+                    downlink,
+                    "-m",
+                    "forbidden",
+                ],
+                check=False,
+            )
+            if not self.mqtt_was_denied(invalid_correlation):
+                raise ReferenceEnvironmentError(
+                    "Mosquitto accepted a non-canonical command correlation"
+                )
         self.mqtt_expect_tls_rejection(
             ["mosquitto_pub", *common, "-q", "1", "-t", uplink, "-m", "forbidden"],
             provider_reason="peer did not return a certificate",

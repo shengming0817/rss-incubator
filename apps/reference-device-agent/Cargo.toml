@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 reference-device-agent-core = { path = "../../crates/reference-device-agent-core" }
+rumqttc = "=0.25.1"
 rotation-model = { path = "../../crates/rotation-model" }
 rss-device-security-client = { path = "../../crates/rss-device-security-client" }
 rss-device-security-contracts = "=0.1.0"
@@ -18,6 +19,9 @@ tokio-util = { version = "0.7", features = ["rt"] }
 uuid = { version = "1", features = ["serde"] }
 
 [dev-dependencies]
+base64 = "0.22"
+ring = "0.17"
+sha2 = "0.10"
 tempfile = "3"
 
 [lints]

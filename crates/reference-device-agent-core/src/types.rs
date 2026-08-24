@@ -170,7 +170,8 @@ impl TopicSet {
         topic == self.command
     }
 
-    pub(crate) const fn identity(&self) -> &DeviceIdentity {
+    #[must_use]
+    pub const fn identity(&self) -> &DeviceIdentity {
         &self.identity
     }
 }
@@ -184,7 +185,8 @@ pub struct RecoveryCommandScope {
 }
 
 impl RecoveryCommandScope {
-    pub(crate) fn new(identity: DeviceIdentity, topic: String, command_id: String) -> Self {
+    #[must_use]
+    pub fn new(identity: DeviceIdentity, topic: String, command_id: String) -> Self {
         Self {
             identity,
             topic,
@@ -192,7 +194,8 @@ impl RecoveryCommandScope {
         }
     }
 
-    pub(crate) const fn identity(&self) -> &DeviceIdentity {
+    #[must_use]
+    pub const fn identity(&self) -> &DeviceIdentity {
         &self.identity
     }
 
@@ -585,7 +588,8 @@ impl MqttConnectionConfig {
         self.request_capacity
     }
 
-    pub(crate) const fn assertion_verifier(&self) -> &BrokerAssertionVerifier {
+    #[must_use]
+    pub const fn assertion_verifier(&self) -> &BrokerAssertionVerifier {
         &self.assertion_verifier
     }
 }

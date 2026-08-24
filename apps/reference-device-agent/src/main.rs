@@ -1,13 +1,14 @@
 mod config;
+mod mqtt;
 mod wire;
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use config::RuntimeConfig;
+use mqtt::{CommandDelivery, MqttError, MqttEvent, MqttSession};
 use reference_device_agent_core::{
-    AgentError, ApplyOutcome, CommandDelivery, MqttError, MqttEvent, MqttSession,
-    RecoveryCommandScope, ReferenceDeviceAgent, TopicSet,
+    AgentError, ApplyOutcome, RecoveryCommandScope, ReferenceDeviceAgent, TopicSet,
 };
 use tokio_util::sync::CancellationToken;
 use wire::{decode_command, encode_outbound};
@@ -150,7 +151,7 @@ impl<'a> SessionDriver<'a> {
             && let Some(outbound) = self.agent.next_outbound()
         {
             let encoded = encode_outbound(&self.session_identity, outbound)?;
-            self.session.publish(encoded.into_mqtt()).await?;
+            self.session.publish(encoded).await?;
             self.state.publish = PublishState::Pending;
         }
         Ok(())
@@ -186,7 +187,7 @@ impl<'a> SessionDriver<'a> {
 
     async fn handle_event(&mut self, event: MqttEvent) -> Result<DriverControl, SessionError> {
         match event {
-            MqttEvent::Connected { session_present: _ } => self.on_connected().await?,
+            MqttEvent::Connected => self.on_connected().await?,
             MqttEvent::Subscribed => self.state.subscription = SubscriptionState::Active,
             MqttEvent::Command(delivery) => self.on_command(delivery).await?,
             MqttEvent::OutboundAcknowledged { event_id } => {

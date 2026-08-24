@@ -236,6 +236,7 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
         self.assertIn("AUTHN_SIGNATURE_KEY", plugin)
         self.assertIn("SERVICE_USERNAME", plugin)
         self.assertIn("exact_correlation_data", plugin)
+        self.assertIn("canonical_command_id", plugin)
 
         policy = (ROOT / "deploy/vault/deviceidentity-sign.hcl").read_text(encoding="utf-8")
         self.assertIn('path "{{mount}}/sign/mqtt-device"', policy)
@@ -382,6 +383,30 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
         self.assertTrue(module.ReferenceEnvironment.mqtt_was_denied(denied))
         self.assertFalse(module.ReferenceEnvironment.mqtt_was_denied(accepted))
         self.assertFalse(module.ReferenceEnvironment.mqtt_was_denied(infrastructure_failure))
+
+    def test_bootstrap_rebuilds_the_local_mosquitto_image_before_start(self):
+        module = load_reference_environment()
+        environment = object.__new__(module.ReferenceEnvironment)
+        calls = []
+        environment.check_dependencies = lambda: None
+        environment.require_state = lambda: None
+        environment.bootstrap_vault = lambda: None
+        environment.bootstrap_postgres = lambda: None
+        environment.bootstrap_keycloak = lambda: None
+        environment.generate_mosquitto_acl = lambda: None
+        environment.compose = lambda *args, **kwargs: calls.append((args, kwargs))
+
+        environment.bootstrap()
+
+        mosquitto_up = [
+            (args, kwargs)
+            for args, kwargs in calls
+            if args[0] == "up" and args[-1] == "mosquitto"
+        ]
+        self.assertEqual(2, len(mosquitto_up))
+        self.assertIn("--build", mosquitto_up[0][0])
+        self.assertNotIn("--build", mosquitto_up[1][0])
+        self.assertEqual(300, mosquitto_up[0][1]["timeout"])
 
     def test_missing_state_reports_the_reachable_up_instruction(self):
         module = load_reference_environment()
