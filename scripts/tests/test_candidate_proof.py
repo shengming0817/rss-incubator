@@ -210,6 +210,51 @@ class CandidateBundleTests(unittest.TestCase):
             self.assertFalse(destination.exists())
             self.assertFalse((root / ".consumers.lock").exists())
 
+    def test_concurrent_destination_creation_is_never_replaced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sources = root / "sources"
+            sources.mkdir()
+            (sources / "reference-device-agent").write_bytes(b"candidate-agent")
+            (sources / "rotation-control").write_bytes(b"candidate-control")
+            destination = root / "consumers"
+            publish = candidate_proof.publish_directory_noreplace
+            destination_inodes = []
+
+            def create_destination_then_publish(staging, output):
+                output.mkdir()
+                destination_inodes.append(output.stat().st_ino)
+                publish(staging, output)
+
+            with mock.patch.object(
+                candidate_proof,
+                "publish_directory_noreplace",
+                side_effect=create_destination_then_publish,
+            ):
+                with self.assertRaisesRegex(
+                    candidate_proof.ProofError,
+                    "created concurrently",
+                ):
+                    candidate_proof.preserve_release_binaries(
+                        sources,
+                        destination,
+                        rss_revision=REVISION,
+                        incubator_revision="f" * 40,
+                        candidate_lock_sha256="a" * 64,
+                        contract_version="0.1.0",
+                        contract_checksum="b" * 64,
+                    )
+
+            self.assertEqual([], list(destination.iterdir()))
+            self.assertEqual(destination_inodes, [destination.stat().st_ino])
+            self.assertFalse((root / ".consumers.lock").exists())
+
+    def test_candidate_network_retry_budget_is_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = candidate_proof.command_env(Path(directory))
+        self.assertEqual("30", env["CARGO_HTTP_TIMEOUT"])
+        self.assertEqual("3", env["CARGO_NET_RETRY"])
+
     def test_conformance_candidate_is_mandatory(self):
         package = candidate_proof.CandidatePackage(
             "rss-diag-context", "0.1.0", "aa" * 32, Path("unused")
@@ -296,7 +341,7 @@ class CandidateBundleTests(unittest.TestCase):
         ):
             self.assertIn(command, ci_job)
         self.assertIn(
-            "find apps crates -type f -name '*.rs' "
+            "find apps crates journeys -type f -name '*.rs' "
             "-exec rustfmt --edition 2024 --check {} +",
             ci_job,
         )
@@ -1386,7 +1431,7 @@ class CandidateBundleTests(unittest.TestCase):
             "target": None,
         }
 
-        def run_once(fail_test):
+        def run_once(fail_test, coverage=False):
             commands = []
             snapshots = []
 
@@ -1478,7 +1523,9 @@ class CandidateBundleTests(unittest.TestCase):
                     with self.assertRaises(candidate_proof.ProofError):
                         candidate_proof.execute(Path("/real-checkout"), bundle.root)
                     return commands, snapshots
-                summary = candidate_proof.execute(Path("/real-checkout"), bundle.root)
+                summary = candidate_proof.execute(
+                    Path("/real-checkout"), bundle.root, coverage=coverage
+                )
                 self.assertEqual(summary["consumedPackages"], [package.name])
                 return commands, snapshots
 
@@ -1516,6 +1563,19 @@ class CandidateBundleTests(unittest.TestCase):
         self.assertLess(updated + 1, first_matrix)
         failed_commands, _ = run_once(fail_test=True)
         self.assertTrue(any(args[:2] == ("cargo", "test") for args, _ in failed_commands))
+        coverage_commands, _ = run_once(fail_test=False, coverage=True)
+        llvm_cov = [
+            args
+            for args, _cwd in coverage_commands
+            if args[:2] == ("cargo", "llvm-cov")
+        ]
+        self.assertEqual(2, len(llvm_cov))
+        self.assertIn("reference-device-agent-core", llvm_cov[0])
+        self.assertIn(candidate_proof.REFERENCE_DEVICE_AGENT, llvm_cov[0])
+        self.assertIn(candidate_proof.T2_JOURNEY, llvm_cov[1])
+        for command in llvm_cov:
+            self.assertIn("--fail-under-lines", command)
+            self.assertIn("80", command)
 
     def test_candidate_metadata_command_is_locked_and_offline(self):
         with mock.patch.object(candidate_proof, "run_capture", return_value=b"{}") as capture:

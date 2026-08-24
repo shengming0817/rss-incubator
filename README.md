@@ -73,7 +73,7 @@ the environment's External/T2-only acceptance boundary.
 ```sh
 python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 cargo fmt --all -- --check
-find apps crates -type f -name '*.rs' -exec rustfmt --edition 2024 --check {} +
+find apps crates journeys -type f -name '*.rs' -exec rustfmt --edition 2024 --check {} +
 cargo check --workspace --all-targets --locked
 cargo test --workspace --all-targets --locked
 cargo test --workspace --doc --locked
@@ -107,7 +107,8 @@ entrypoint:
 python3 scripts/candidate-proof.py --bundle /absolute/path/to/rss-candidate-bundle
 ```
 
-Add `--coverage` to enforce the affected reference-agent package line threshold. Add
+Add `--coverage` to enforce independent 80% line thresholds for the affected reference-agent
+packages and the external T2 journey. Add
 `--binary-output-directory /absolute/nonexistent/directory` to perform a release build and
 atomically preserve `rotation-control`, `reference-device-agent`, and a checksum-bearing
 `consumer-manifest.json` after all locked/offline proof gates pass. Temporary snapshot sources and

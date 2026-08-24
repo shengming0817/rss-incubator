@@ -50,7 +50,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Check candidate formatting
-        run: find apps crates -type f -name '*.rs' -exec rustfmt --edition 2024 --check {} +
+        run: find apps crates journeys -type f -name '*.rs' -exec rustfmt --edition 2024 --check {} +
 
       - name: Check workspace
         run: cargo check --workspace --all-targets --locked

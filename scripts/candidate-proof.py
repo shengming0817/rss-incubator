@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import io
 import json
@@ -48,6 +50,9 @@ REFERENCE_DEVICE_AGENT_MANIFEST = Path("apps/reference-device-agent/Cargo.toml")
 REFERENCE_DEVICE_AGENT_CLIENT_PATH = "../../crates/rss-device-security-client"
 T2_JOURNEY_MANIFEST = Path("journeys/secure-device-rotation/Cargo.toml")
 T2_JOURNEY_CLIENT_PATH = "../../crates/rss-device-security-client"
+AT_FDCWD = -100
+RENAME_NOREPLACE = 1
+RENAME_EXCL = 0x00000004
 
 
 class ProofError(RuntimeError):
@@ -822,8 +827,8 @@ def command_env(temp_root: Path):
             "CARGO_TERM_COLOR": "always",
             "CARGO_INCREMENTAL": "0",
             "CARGO_HTTP_MULTIPLEXING": "false",
-            "CARGO_HTTP_TIMEOUT": "120",
-            "CARGO_NET_RETRY": "10",
+            "CARGO_HTTP_TIMEOUT": "30",
+            "CARGO_NET_RETRY": "3",
         }
     )
     return env
@@ -1119,6 +1124,46 @@ def require_lower_hex(value: str, length: int, field: str):
         raise ProofError(f"{field} must be lowercase hexadecimal")
 
 
+def publish_directory_noreplace(source: Path, destination: Path):
+    """Atomically publishes one directory without replacing any destination."""
+    library = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    if sys.platform == "darwin":
+        rename = library.renamex_np
+        rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        rename.restype = ctypes.c_int
+        result = rename(source_bytes, destination_bytes, RENAME_EXCL)
+    elif sys.platform.startswith("linux"):
+        try:
+            rename = library.renameat2
+        except AttributeError as error:
+            raise ProofError("atomic no-replace directory publication is unavailable") from error
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        result = rename(
+            AT_FDCWD,
+            source_bytes,
+            AT_FDCWD,
+            destination_bytes,
+            RENAME_NOREPLACE,
+        )
+    else:
+        raise ProofError("atomic no-replace directory publication is unsupported")
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise ProofError("--binary-output-directory was created concurrently")
+    raise OSError(error_number, os.strerror(error_number), destination)
+
+
 def preserve_release_binaries(
     source_directory: Path,
     destination: Path,
@@ -1192,9 +1237,7 @@ def preserve_release_binaries(
             os.fsync(directory_descriptor)
         finally:
             os.close(directory_descriptor)
-        if destination.exists() or destination.is_symlink():
-            raise ProofError("--binary-output-directory was created concurrently")
-        os.rename(staging, destination)
+        publish_directory_noreplace(staging, destination)
         return manifest
     except OSError as error:
         raise ProofError("cannot preserve candidate release binaries") from error
@@ -1295,26 +1338,32 @@ def execute(
             "candidate workspace doctest",
         )
         if coverage:
-            run_visible(
-                [
-                    "cargo",
-                    "llvm-cov",
-                    "--package",
-                    "reference-device-agent-core",
-                    "--package",
-                    REFERENCE_DEVICE_AGENT,
-                    "--all-targets",
-                    "--locked",
-                    "--offline",
-                    "--ignore-filename-regex",
-                    UNAFFECTED_COVERAGE_PATHS,
-                    "--fail-under-lines",
-                    "80",
-                ],
-                snapshot,
-                env,
-                "affected package coverage",
-            )
+            for packages, label in (
+                (("reference-device-agent-core", REFERENCE_DEVICE_AGENT), "agent coverage"),
+                ((T2_JOURNEY,), "external T2 journey coverage"),
+            ):
+                package_arguments = [
+                    argument
+                    for package in packages
+                    for argument in ("--package", package)
+                ]
+                run_visible(
+                    [
+                        "cargo",
+                        "llvm-cov",
+                        *package_arguments,
+                        "--all-targets",
+                        "--locked",
+                        "--offline",
+                        "--ignore-filename-regex",
+                        UNAFFECTED_COVERAGE_PATHS,
+                        "--fail-under-lines",
+                        "80",
+                    ],
+                    snapshot,
+                    env,
+                    label,
+                )
         lock_sha = hashlib.sha256((snapshot / "Cargo.lock").read_bytes()).hexdigest()
         incubator_revision = run_capture(
             ["/usr/bin/git", "rev-parse", "HEAD"],

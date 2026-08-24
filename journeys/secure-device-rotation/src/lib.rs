@@ -10,8 +10,8 @@ use rotation_model::{
     CommandAcknowledgementOutcome, CommandRejectionReason, CredentialReport, RotationAccepted,
 };
 use rss_device_security_client::{
-    ConditionReason, ConditionStatus, ConditionType, DiagnosticKind, PolicyResponse,
-    StatusProjection,
+    ActiveCommandState, ConditionReason, ConditionStatus, ConditionType, DiagnosticKind,
+    PolicyResponse, StatusProjection,
 };
 
 /// Closed failures for the disposable external-consumer trace.
@@ -72,17 +72,23 @@ pub fn verify_positive_trace(
     if acknowledgement.outcome() != CommandAcknowledgementOutcome::Received {
         return Err(JourneyError::ExpectedReceivedAck);
     }
-    if is_ready(status_after_ack) {
+    if has_ready_true(status_after_ack) {
         return Err(JourneyError::ReadyBeforeReceipt);
     }
     let generation = accepted.accepted_generation();
+    let Some(active_command) = status_after_ack.active_command() else {
+        return Err(JourneyError::LineageMismatch);
+    };
     if acknowledgement.coordinates() != accepted.coordinates()
         || report.coordinates() != accepted.coordinates()
         || receipt.coordinates() != accepted.coordinates()
         || acknowledgement.desired_generation() != generation
         || report.observed_generation() != generation
         || report.fence_epoch() != acknowledgement.fence_epoch()
+        || report.device_sequence().get() <= acknowledgement.device_sequence().get()
         || status_after_ack.desired_generation() != Some(generation.get())
+        || active_command.state() != ActiveCommandState::Received
+        || active_command.fence_epoch() != acknowledgement.fence_epoch().get()
         || status_after_ack
             .authorization_receipt_id()
             .map(|value| value.to_string())
@@ -110,7 +116,7 @@ pub fn verify_positive_trace(
     {
         return Err(JourneyError::EventIdentityCollision);
     }
-    if !is_ready(final_status) {
+    if !has_matching_ready(final_status) {
         return Err(JourneyError::MissingReadyObservation);
     }
     Ok(())
@@ -153,16 +159,24 @@ pub fn verify_revoked_no_advance(
     {
         return Err(JourneyError::ExpectedRevokedRejection);
     }
-    if is_ready(status) {
+    if has_ready_true(status) {
         return Err(JourneyError::ReadyAfterRevocation);
     }
-    if status.observed_generation() >= acknowledgement.desired_generation().get() {
+    if status.desired_generation() != Some(acknowledgement.desired_generation().get())
+        || status.observed_generation() >= acknowledgement.desired_generation().get()
+    {
         return Err(JourneyError::LineageMismatch);
     }
     Ok(())
 }
 
-fn is_ready(status: &StatusProjection) -> bool {
+fn has_ready_true(status: &StatusProjection) -> bool {
+    status.conditions().iter().any(|condition| {
+        condition.type_() == ConditionType::Ready && condition.status() == ConditionStatus::True
+    })
+}
+
+fn has_matching_ready(status: &StatusProjection) -> bool {
     status.conditions().iter().any(|condition| {
         condition.type_() == ConditionType::Ready
             && condition.status() == ConditionStatus::True
