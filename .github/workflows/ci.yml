@@ -46,52 +46,11 @@ jobs:
       - name: Test repository policy scripts
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
+      - name: Test Cargo graph policy
+        run: bash scripts/test-candidate-graph-policy.sh
+
       - name: Check formatting
         run: cargo fmt --all -- --check
-
-  reference-environment:
-    name: reference-environment
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    steps:
-      - name: Checkout incubator revision
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Verify Docker runtime
-        run: |
-          set -euo pipefail
-          docker version
-          docker compose version
-
-      - name: Install pinned Rust toolchain
-        run: |
-          set -euo pipefail
-          rustup toolchain install "$RUST_VERSION" --profile minimal
-          rustup default "$RUST_VERSION"
-          rustc --version --verbose
-          cargo --version --verbose
-
-      - name: Run disposable reference environment journey
-        timeout-minutes: 18
-        env:
-          REFERENCE_PROJECT: rss-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        run: python3 scripts/reference-environment.py --project "$REFERENCE_PROJECT" smoke
-
-      - name: Collect redacted scoped logs after failure
-        timeout-minutes: 1
-        if: ${{ failure() || cancelled() }}
-        env:
-          REFERENCE_PROJECT: rss-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        run: python3 scripts/reference-environment.py --project "$REFERENCE_PROJECT" logs
-
-      - name: Remove scoped runtime state
-        timeout-minutes: 2
-        if: ${{ always() }}
-        env:
-          REFERENCE_PROJECT: rss-ci-${{ github.run_id }}-${{ github.run_attempt }}
-        run: python3 scripts/reference-environment.py --project "$REFERENCE_PROJECT" down
 
   candidate-consumption:
     name: candidate-consumption
@@ -251,34 +210,36 @@ jobs:
           metadata="$RUNNER_TEMP/rss-candidate-metadata.json"
           consumed="$RUNNER_TEMP/rss-consumed-packages.json"
           cargo metadata --format-version 1 --locked --offline > "$metadata"
-          jq -e --slurpfile bundle "$BUNDLE_MANIFEST" '
-            .workspace_members as $workspace |
-            [
-              .packages[] |
-              select(.id as $id | ($workspace | index($id) | not)) |
-              select(.name | startswith("rss-")) |
-              . as $package |
-              select(
-                $package.source != "registry+https://rss-candidate.invalid/index" or
-                ($bundle[0].packages |
-                  map(select(.name == $package.name and .version == $package.version)) |
-                  length != 1)
-              )
-            ] | length == 0
-          ' "$metadata" >/dev/null
-          jq -c --slurpfile bundle "$BUNDLE_MANIFEST" '
-            .workspace_members as $workspace |
-            [
-              .packages[] |
-              select(.id as $id | ($workspace | index($id) | not)) |
-              select(.name | startswith("rss-")) |
-              select(.source == "registry+https://rss-candidate.invalid/index") |
-              select(.name as $name | $bundle[0].packages | any(.name == $name)) |
-              .name
-            ] | unique | sort
-          ' "$metadata" > "$consumed"
-          [[ "$(jq 'length' "$consumed")" -gt 0 ]]
+          jq -ce --slurpfile bundle "$BUNDLE_MANIFEST" \
+            -f .github/candidate-graph-policy.jq \
+            "$metadata" > "$consumed"
           echo "consumed=$consumed" >> "$GITHUB_OUTPUT"
+
+      - name: Verify Docker runtime
+        run: |
+          set -euo pipefail
+          docker version
+          docker compose version
+
+      - name: Run disposable reference environment journey
+        timeout-minutes: 18
+        env:
+          REFERENCE_PROJECT: rss-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        run: python3 scripts/reference-environment.py --project "$REFERENCE_PROJECT" smoke
+
+      - name: Collect redacted scoped logs after failure
+        timeout-minutes: 1
+        if: ${{ failure() || cancelled() }}
+        env:
+          REFERENCE_PROJECT: rss-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        run: python3 scripts/reference-environment.py --project "$REFERENCE_PROJECT" logs
+
+      - name: Remove scoped runtime state
+        timeout-minutes: 2
+        if: ${{ always() }}
+        env:
+          REFERENCE_PROJECT: rss-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        run: python3 scripts/reference-environment.py --project "$REFERENCE_PROJECT" down
 
       - name: Run locked offline candidate workspace matrix
         run: |
@@ -317,7 +278,6 @@ jobs:
             --release --locked --offline
 
       - name: Publish canonical first-green receipt
-        id: receipt
         env:
           ARTIFACT_DIGEST: ${{ steps.artifact.outputs.digest }}
           ARTIFACT_NAME: ${{ steps.artifact.outputs.name }}
@@ -392,12 +352,6 @@ jobs:
               }
             ')"
           /usr/bin/git diff --exit-code
-          {
-            echo 'receipt<<RSS_FIRST_GREEN_RECEIPT'
-            echo "$receipt"
-            echo 'RSS_FIRST_GREEN_RECEIPT'
-          } >> "$GITHUB_OUTPUT"
-
           {
             echo '## rss-incubator canonical candidate first-green'
             echo

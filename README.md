@@ -61,7 +61,8 @@ fallback graph or local source path.
 
 The disposable Secure Device Rotation provider environment has one lifecycle entrypoint. It creates
 all credentials under the ignored `deploy/.state/<project>` directory and binds published ports to
-loopback only:
+loopback only. The canonical candidate job invokes it after configuring the pinned Cargo transport;
+a direct local invocation requires that same transport environment:
 
 ```sh
 python3 scripts/reference-environment.py smoke
@@ -99,9 +100,10 @@ recompute archive checksums, or read archive VCS metadata.
 Every RSS dependency is declared with an exact version and the stable `rss-candidate` registry.
 The CI job maps that logical source to the downloaded runner-local registry, executes
 `cargo fetch --locked`, and then runs metadata, check, test, doctest, clippy, and coverage locked and
-offline. Cargo's resolved graph must show every non-workspace `rss-*` package at the producer-declared
-version and the one logical registry source. The committed root lock and checkout must remain byte
-unchanged throughout the job.
+offline. Cargo's resolved graph must match the producer manifest's complete name/version exact-set
+at the one logical registry source. A producer package shadowed by a workspace/path source and every
+undeclared external `rss-*` package fail closed; incubator-owned workspace packages remain outside
+the producer set. The committed root lock and checkout must remain byte unchanged throughout the job.
 
 The `CI` workflow reads its successful RSS candidate-bundle identity from the reviewed
 `.github/rss-candidate.json` pin on pull requests and pushes. A manual dispatch may repeat that exact
