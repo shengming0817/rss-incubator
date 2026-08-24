@@ -403,6 +403,17 @@ def activate_candidate_workspace_members(repository: Path):
     activated = workspace_member_manifests(repository)
     if not all(candidate in activated for candidate in candidate_manifests):
         raise ProofError("candidate workspace members were not atomically activated")
+    return candidate_manifests
+
+
+def is_local_device_security_client_dependency(repository: Path, manifest_path: Path, name, specification):
+    if name != DEVICE_SECURITY_CLIENT or not isinstance(specification, dict):
+        return False
+    dependency_path = specification.get("path")
+    if not isinstance(dependency_path, str):
+        return False
+    resolved = (manifest_path.parent / dependency_path / "Cargo.toml").resolve()
+    return resolved == (repository / DEVICE_SECURITY_CLIENT_MANIFEST).resolve()
 
 
 def manifest_rss_dependencies(repository: Path, bundle_names: set[str]):
@@ -423,6 +434,10 @@ def manifest_rss_dependencies(repository: Path, bundle_names: set[str]):
                     if isinstance(specification, dict)
                     else alias
                 )
+                if is_local_device_security_client_dependency(
+                    repository, manifest_path, declared_name, specification
+                ):
+                    continue
                 if not is_rss_package_name(declared_name):
                     continue
                 canonical = canonical_package_name(declared_name)
@@ -513,6 +528,11 @@ def validate_manifest_dependency_sources(metadata, bundle_names: set[str]):
                     if isinstance(specification, dict)
                     else alias
                 )
+                repository = Path(metadata.get("workspace_root", "."))
+                if is_local_device_security_client_dependency(
+                    repository, manifest_path, declared_name, specification
+                ):
+                    continue
                 if not is_rss_package_name(declared_name):
                     continue
                 canonical = canonical_package_name(declared_name)
@@ -534,6 +554,8 @@ def direct_rss_dependencies(metadata, bundle_names: set[str]):
         for dependency in package.get("dependencies", []):
             name = dependency.get("name")
             if not is_rss_package_name(name):
+                continue
+            if name == DEVICE_SECURITY_CLIENT and dependency.get("source") is None:
                 continue
             canonical = canonical_package_name(name)
             source = dependency.get("source")
@@ -775,7 +797,9 @@ def prepare_candidate_lock(repository: Path, env, baseline_registry_identities):
     )
 
 
-def validate_non_rss_lock_delta(metadata, baseline_identities, candidate_identities):
+def validate_non_rss_lock_delta(
+    metadata, baseline_identities, candidate_identities, candidate_manifest_paths=()
+):
     missing = baseline_identities - candidate_identities
     if missing:
         names = sorted(identity[0] for identity in missing)
@@ -799,11 +823,21 @@ def validate_non_rss_lock_delta(metadata, baseline_identities, candidate_identit
             raise ProofError("candidate metadata resolve graph is malformed")
         adjacency[node_id] = dependencies
 
+    candidate_manifests = {
+        str(Path(path).resolve()) for path in candidate_manifest_paths
+    }
     roots = {
         package_id
         for package_id, package in packages.items()
-        if is_rss_package_name(package.get("name"))
-        and package.get("source") == CANDIDATE_SOURCE
+        if (
+            is_rss_package_name(package.get("name"))
+            and package.get("source") == CANDIDATE_SOURCE
+        )
+        or (
+            package.get("source") is None
+            and isinstance(package.get("manifest_path"), str)
+            and str(Path(package["manifest_path"]).resolve()) in candidate_manifests
+        )
     }
     reachable = set(roots)
     pending = list(roots)
@@ -913,7 +947,7 @@ def execute(repository: Path, bundle_root: Path):
         initialize_registry(registry)
         env = command_env(temp_root)
 
-        activate_candidate_workspace_members(snapshot)
+        candidate_manifests = activate_candidate_workspace_members(snapshot)
         dependencies = manifest_rss_dependencies(
             snapshot, {package.name for package in bundle.packages}
         )
@@ -946,6 +980,7 @@ def execute(repository: Path, bundle_root: Path):
             metadata,
             baseline_registry_identities,
             locked_registry_identities(snapshot / "Cargo.lock", include_rss=False),
+            candidate_manifests,
         )
         consumed = validate_resolution(
             snapshot, bundle, metadata, CANDIDATE_SOURCE

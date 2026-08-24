@@ -1,7 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["apps/rotation-*", "crates/*"]
 exclude = [
+    "apps/rotation-control",
     "crates/platform-authoring-smoke",
     "crates/rss-device-security-client",
 ]

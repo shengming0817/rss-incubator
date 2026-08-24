@@ -173,11 +173,12 @@ class CandidateBundleTests(unittest.TestCase):
         self.assertEqual(
             excluded_members,
             {
+                "apps/rotation-control",
                 "crates/platform-authoring-smoke",
                 "crates/rss-device-security-client",
             },
         )
-        self.assertTrue(excluded_members < repository_members)
+        self.assertTrue(excluded_members - {"apps/rotation-control"} < repository_members)
         for command in (
             "cargo check --workspace --all-targets --locked",
             "cargo test --workspace --all-targets --locked",
@@ -186,12 +187,14 @@ class CandidateBundleTests(unittest.TestCase):
         ):
             self.assertIn(command, ci_job)
         self.assertIn(
-            "find crates -type f -name '*.rs' "
+            "find apps crates -type f -name '*.rs' "
             "-exec rustfmt --edition 2024 --check {} +",
             ci_job,
         )
-        self.assertIn("if: ${{ github.event_name == 'workflow_dispatch' }}", candidate_job)
+        self.assertNotIn("if: ${{ github.event_name == 'workflow_dispatch' }}", candidate_job)
         self.assertIn("needs: ci", candidate_job)
+        self.assertIn("github.event.pull_request.head.sha || github.sha", candidate_job)
+        self.assertIn(".incubatorRevision == $incubator_revision", candidate_job)
         self.assertEqual(workflow.count("python3 scripts/candidate-proof.py"), 1)
         self.assertIn("python3 scripts/candidate-proof.py", candidate_job)
 
@@ -440,6 +443,43 @@ class CandidateBundleTests(unittest.TestCase):
                 ),
                 identities,
             )
+
+    def test_canonical_local_device_security_client_edge_is_not_an_rss_source_edge(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            app = repository / "apps/rotation-control"
+            client = repository / candidate_proof.DEVICE_SECURITY_CLIENT_MANIFEST
+            app.mkdir(parents=True)
+            client.parent.mkdir(parents=True)
+            (repository / "Cargo.toml").write_text(
+                '[workspace]\nmembers = ["apps/*", "crates/*"]\n', encoding="utf-8"
+            )
+            (app / "Cargo.toml").write_text(
+                '[package]\nname = "rotation-control"\nversion = "0.0.0"\n'
+                '[dependencies]\nrss-device-security-client = '
+                '{ path = "../../crates/rss-device-security-client" }\n',
+                encoding="utf-8",
+            )
+            client.write_text(
+                '[package]\nname = "rss-device-security-client"\nversion = "0.0.0"\n'
+                '[dependencies]\nrss-device-security-contracts = "=0.1.0"\n',
+                encoding="utf-8",
+            )
+            dependencies = candidate_proof.manifest_rss_dependencies(
+                repository, {candidate_proof.DEVICE_SECURITY_CONTRACT}
+            )
+            self.assertEqual(len(dependencies), 1)
+            self.assertEqual(dependencies[0][0]["name"], candidate_proof.DEVICE_SECURITY_CLIENT)
+
+            (app / "Cargo.toml").write_text(
+                '[package]\nname = "rotation-control"\nversion = "0.0.0"\n'
+                '[dependencies]\nrss-device-security-client = { path = "../../impostor" }\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(candidate_proof.ProofError, "outside the Release Surface"):
+                candidate_proof.manifest_rss_dependencies(
+                    repository, {candidate_proof.DEVICE_SECURITY_CONTRACT}
+                )
 
     def test_device_security_client_has_one_exact_unaliased_normal_rss_edge(self):
         repository = Path("/snapshot")
@@ -743,9 +783,13 @@ class CandidateBundleTests(unittest.TestCase):
         crates_io = "registry+https://github.com/rust-lang/crates.io-index"
         baseline_identity = ("baseline", "1.0.0", crates_io, "a" * 64)
         required_identity = ("required", "2.0.0", crates_io, "b" * 64)
+        app_identity = ("app-only", "2.1.0", crates_io, "e" * 64)
         unrelated_identity = ("unrelated", "3.0.0", crates_io, "c" * 64)
         rss_id = "registry+https://rss-candidate.invalid/index#rss-platform@0.3.0"
+        app_id = "path+file:///snapshot/apps/rotation-control#0.0.0"
+        app_manifest = "/snapshot/apps/rotation-control/Cargo.toml"
         required_id = "registry+https://github.com/rust-lang/crates.io-index#required@2.0.0"
+        app_dependency_id = "registry+https://github.com/rust-lang/crates.io-index#app-only@2.1.0"
         unrelated_id = "registry+https://github.com/rust-lang/crates.io-index#unrelated@3.0.0"
         metadata = {
             "packages": [
@@ -757,10 +801,24 @@ class CandidateBundleTests(unittest.TestCase):
                     "checksum": "d" * 64,
                 },
                 {
+                    "id": app_id,
+                    "name": "rotation-control",
+                    "version": "0.0.0",
+                    "source": None,
+                    "manifest_path": app_manifest,
+                },
+                {
                     "id": required_id,
                     "name": required_identity[0],
                     "version": required_identity[1],
                     "source": required_identity[2],
+                    "checksum": None,
+                },
+                {
+                    "id": app_dependency_id,
+                    "name": app_identity[0],
+                    "version": app_identity[1],
+                    "source": app_identity[2],
                     "checksum": None,
                 },
                 {
@@ -774,7 +832,9 @@ class CandidateBundleTests(unittest.TestCase):
             "resolve": {
                 "nodes": [
                     {"id": rss_id, "dependencies": [required_id]},
+                    {"id": app_id, "dependencies": [app_dependency_id]},
                     {"id": required_id, "dependencies": []},
+                    {"id": app_dependency_id, "dependencies": []},
                     {"id": unrelated_id, "dependencies": []},
                 ]
             },
@@ -782,7 +842,10 @@ class CandidateBundleTests(unittest.TestCase):
         baseline = {baseline_identity}
 
         candidate_proof.validate_non_rss_lock_delta(
-            metadata, baseline, baseline | {required_identity}
+            metadata,
+            baseline,
+            baseline | {required_identity, app_identity},
+            [Path(app_manifest)],
         )
         with self.assertRaisesRegex(
             candidate_proof.ProofError, "outside the candidate dependency graph"
@@ -790,7 +853,8 @@ class CandidateBundleTests(unittest.TestCase):
             candidate_proof.validate_non_rss_lock_delta(
                 metadata,
                 baseline,
-                baseline | {required_identity, unrelated_identity},
+                baseline | {required_identity, app_identity, unrelated_identity},
+                [Path(app_manifest)],
             )
 
     def test_non_rss_lock_delta_requires_a_well_formed_resolve_graph(self):
