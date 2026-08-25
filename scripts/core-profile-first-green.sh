@@ -147,6 +147,12 @@ docker run --rm --network "$network" \
 
 docker exec -i "$pg" psql -v ON_ERROR_STOP=1 -U postgres -d rss \
   -v tenant="$TENANT" -v user_id="$USER_ID" -v sid="$SID" -v issued="$NOW" <<'SQL'
+BEGIN;
+SET CONSTRAINTS ALL DEFERRED;
+INSERT INTO credentials
+  (tenant_id, user_id, login, password_hash, version, failure_count, created_at)
+VALUES (:'tenant'::uuid, :'user_id'::uuid, 'core-inventory-reader',
+        'not-used-by-conformance', 1, 0, now());
 INSERT INTO account_security_states
   (tenant_id, user_id, status, authn_epoch, version, status_changed_at, updated_at)
 VALUES (:'tenant'::uuid, :'user_id'::uuid, 'active', 0, 1, now(), now());
@@ -160,6 +166,7 @@ SELECT * FROM rss_record_role_revision(
   :'user_id'::uuid, 'user');
 INSERT INTO role_bindings (tenant_id, role_id, subject)
 VALUES (:'tenant'::uuid, 'core-inventory-reader', :'user_id');
+COMMIT;
 SQL
 
 docker exec -i "$pg" psql -v ON_ERROR_STOP=1 -U postgres -d rss \
