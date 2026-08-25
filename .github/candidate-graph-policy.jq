@@ -4,7 +4,7 @@ def coordinates:
 def canonical_name:
   gsub("_"; "-");
 
-def forbidden_rotation_dependency:
+def forbidden_rotation_package:
   (.name | canonical_name) as $name |
   ($name | startswith("rss-")) or
   ([
@@ -18,7 +18,7 @@ def forbidden_rotation_dependency:
     "serde-json",
     "vault"
   ] | index($name) != null) or
-  (.path != null) or
+  (.source == null) or
   ((.source // "") | startswith("git+"));
 
 ($bundle[0].packages |
@@ -39,6 +39,12 @@ def forbidden_rotation_dependency:
 ([.packages[] |
   select(.name == "rotation-model") |
   select(.id as $id | $workspace | index($id) != null)]) as $rotation_models |
+([.resolve.nodes[]? |
+  select(.id == $rotation_models[0].id)]) as $rotation_nodes |
+([$rotation_nodes[0].deps[]?.pkg]) as $rotation_dependency_ids |
+(.packages as $packages |
+  [$rotation_dependency_ids[] as $dependency_id |
+    $packages[] | select(.id == $dependency_id)]) as $rotation_dependencies |
 if $consumed != $expected then
   error("resolved producer package exact-set or source differs")
 elif ($unexpected_external | length) != 0 then
@@ -47,7 +53,11 @@ elif ($rotation_models | length) != 1 then
   error("resolved workspace must contain exactly one rotation-model package")
 elif $rotation_models[0].publish != [] then
   error("rotation-model must remain non-publishable")
-elif ($rotation_models[0].dependencies | any(forbidden_rotation_dependency)) then
+elif ($rotation_nodes | length) != 1 then
+  error("resolved graph must contain exactly one rotation-model node")
+elif ($rotation_dependencies | length) != ($rotation_dependency_ids | length) then
+  error("rotation-model dependency package lookup is incomplete")
+elif ($rotation_dependencies | any(forbidden_rotation_package)) then
   error("rotation-model contains RSS, transport, provider, path, or Git coupling")
 else
   $consumed

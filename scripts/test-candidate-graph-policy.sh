@@ -31,8 +31,19 @@ write_metadata() {
         publish: [],
         dependencies: [{name: "uuid", source: "registry+https://github.com/rust-lang/crates.io-index", path: null}]
       },
-      {id: "path+file:///workspace#rss-device-security-client@0.1.0", name: "rss-device-security-client", version: "0.1.0", source: null}
-    ]
+      {id: "path+file:///workspace#rss-device-security-client@0.1.0", name: "rss-device-security-client", version: "0.1.0", source: null},
+      {id: "registry+uuid", name: "uuid", version: "1.0.0", source: "registry+https://github.com/rust-lang/crates.io-index"}
+    ],
+    resolve: {
+      nodes: [
+        {
+          id: "path+file:///workspace#rotation-model@0.0.0",
+          deps: [{name: "uuid", pkg: "registry+uuid"}]
+        },
+        {id: "path+file:///workspace#rss-device-security-client@0.1.0", deps: []},
+        {id: "registry+uuid", deps: []}
+      ]
+    }
   }' > "$metadata"
 }
 
@@ -106,37 +117,76 @@ mv "$metadata.tmp" "$metadata"
 assert_rejected 'publishable rotation-model package'
 
 write_metadata
-jq '(.packages[] | select(.name == "rotation-model")).dependencies += [{
-  name: "rss_contract",
-  source: "registry+https://rss-candidate.invalid/index",
-  path: null
+jq '(.resolve.nodes[] | select(.id | contains("#rotation-model@"))).deps += [{
+  name: "rss_contract", pkg: "registry+contract"
 }]' "$metadata" > "$metadata.tmp"
 mv "$metadata.tmp" "$metadata"
 assert_rejected 'rotation-model RSS coupling'
 
 write_metadata
-jq '(.packages[] | select(.name == "rotation-model")).dependencies += [{
+jq '.packages += [{
+  id: "registry+reqwest",
   name: "reqwest",
-  source: "registry+https://github.com/rust-lang/crates.io-index",
-  path: null
+  version: "0.12.0",
+  source: "registry+https://github.com/rust-lang/crates.io-index"
+}] |
+(.resolve.nodes[] | select(.id | contains("#rotation-model@"))).deps += [{
+  name: "reqwest", pkg: "registry+reqwest"
 }]' "$metadata" > "$metadata.tmp"
 mv "$metadata.tmp" "$metadata"
 assert_rejected 'rotation-model transport coupling'
 
 write_metadata
-jq '(.packages[] | select(.name == "rotation-model")).dependencies += [{
-  name: "helper",
-  source: null,
-  path: "/workspace/helper"
+jq '.packages += [{
+  id: "registry+vault",
+  name: "vault",
+  version: "1.0.0",
+  source: "registry+https://github.com/rust-lang/crates.io-index"
+}] |
+(.resolve.nodes[] | select(.id | contains("#rotation-model@"))).deps += [{
+  name: "vault", pkg: "registry+vault"
 }]' "$metadata" > "$metadata.tmp"
 mv "$metadata.tmp" "$metadata"
-assert_rejected 'rotation-model path coupling'
+assert_rejected 'rotation-model provider coupling'
 
 write_metadata
 jq '(.packages[] | select(.name == "rotation-model")).dependencies += [{
   name: "helper",
-  source: "git+https://example.invalid/helper#deadbeef",
+  source: "registry+https://github.com/rust-lang/crates.io-index",
   path: null
+}] |
+.packages += [{
+  id: "path+file:///workspace/helper#0.1.0",
+  name: "helper",
+  version: "0.1.0",
+  source: null
+}] |
+(.resolve.nodes[] | select(.id | contains("#rotation-model@"))).deps += [{
+  name: "helper", pkg: "path+file:///workspace/helper#0.1.0"
 }]' "$metadata" > "$metadata.tmp"
 mv "$metadata.tmp" "$metadata"
-assert_rejected 'rotation-model Git coupling'
+assert_rejected 'rotation-model registry declaration patched to path'
+
+write_metadata
+jq '(.packages[] | select(.name == "rotation-model")).dependencies += [{
+  name: "helper",
+  source: "registry+https://github.com/rust-lang/crates.io-index",
+  path: null
+}] |
+.packages += [{
+  id: "git+https://example.invalid/helper#deadbeef",
+  name: "helper",
+  version: "0.1.0",
+  source: "git+https://example.invalid/helper#deadbeef"
+}] |
+(.resolve.nodes[] | select(.id | contains("#rotation-model@"))).deps += [{
+  name: "helper", pkg: "git+https://example.invalid/helper#deadbeef"
+}]' "$metadata" > "$metadata.tmp"
+mv "$metadata.tmp" "$metadata"
+assert_rejected 'rotation-model registry declaration patched to Git'
+
+write_metadata
+jq 'del(.resolve.nodes[] | select(.id | contains("#rotation-model@")))' \
+  "$metadata" > "$metadata.tmp"
+mv "$metadata.tmp" "$metadata"
+assert_rejected 'missing rotation-model resolve node'
