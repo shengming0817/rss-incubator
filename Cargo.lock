@@ -2361,7 +2361,7 @@ dependencies = [
 name = "rss-conformance"
 version = "0.1.0"
 source = "registry+https://rss-candidate.invalid/index"
-checksum = "8991cf6bd121c90ee93feef00aedcf19541f95ae15a31d3dc26135344f503572"
+checksum = "391d0e3142a505ee698d7c0a7226a1f15b05286ae7134935c1364158d74a1415"
 dependencies = [
  "thiserror 2.0.20",
 ]
@@ -2394,7 +2394,7 @@ dependencies = [
 name = "rss-contract"
 version = "0.1.0"
 source = "registry+https://rss-candidate.invalid/index"
-checksum = "94ea16295348631c87bbab2c5171c1ef16fb4a2d339d6e479fd1835e009ca0d7"
+checksum = "b11edf40095b3976bf714f6ce1bca1cdf207aa03b63f1fc485597092029e75e5"
 
 [[package]]
 name = "rss-device-security-client"
@@ -2410,7 +2410,7 @@ dependencies = [
 name = "rss-device-security-contracts"
 version = "0.1.0"
 source = "registry+https://rss-candidate.invalid/index"
-checksum = "64049a2a113986f85752e7da2abebdddf1f1d9fece614892a4ef859b49c0d859"
+checksum = "501fd63e6b21a3e822ff9fa38023b3de7f18e79c84a420da9d08444ec9d6fcbe"
 dependencies = [
  "regress",
  "rss-contract",
@@ -2422,7 +2422,7 @@ dependencies = [
 name = "rss-diag-context"
 version = "0.1.0"
 source = "registry+https://rss-candidate.invalid/index"
-checksum = "3f2c08963ed7b8af022c976a164ec7f78cff3eb4b6f477754148e3f1d13076d8"
+checksum = "2c627c70c3cc114f0f02a2d59cf42910c448c9650ee5ec362dc9a813428468c4"
 dependencies = [
  "thiserror 2.0.20",
  "tokio",
@@ -2432,7 +2432,7 @@ dependencies = [
 name = "rss-platform"
 version = "0.3.0"
 source = "registry+https://rss-candidate.invalid/index"
-checksum = "8abe702ecc7577a525066b812d1f7ea03970b7a345e684dc9d6ef13cbcb33c9b"
+checksum = "e74a60257d8af058b3c14277e99db2728e3d7a404865fc9f63fcc84088d0896d"
 dependencies = [
  "rss-contract",
  "rss-request-context",
@@ -2442,7 +2442,7 @@ dependencies = [
 name = "rss-request-context"
 version = "0.1.0"
 source = "registry+https://rss-candidate.invalid/index"
-checksum = "070362dce38f2a1a96dd99c9ba9f02cf850354f2f1f8ed241ce5cd110f717c0a"
+checksum = "35850020451ebc77c9789b2fc9416dab6766a9241f9689b84b621679250b5ac8"
 dependencies = [
  "uuid",
 ]
@@ -2451,7 +2451,7 @@ dependencies = [
 name = "rss-trace-context"
 version = "0.1.0"
 source = "registry+https://rss-candidate.invalid/index"
-checksum = "76dea49525d831420bb8b2d19598abe94b1af9bd4a80e84c7253702cef62052c"
+checksum = "c99dd40d169878cef50751052f9e26f27b96ca6f3b41e4593002afa8c5ec8174"
 dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
