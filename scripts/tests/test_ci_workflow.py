@@ -25,6 +25,7 @@ class CandidateWorkflowSecurityTests(unittest.TestCase):
     def test_manifest_policy_and_local_transport_are_shared_carriers(self):
         self.assertIn("candidate-manifest-policy.jq", self.workflow)
         self.assertIn("scripts/prepare-candidate-transport.sh", self.workflow)
+        self.assertIn("scripts/verify-core-candidate-migration-image.sh", self.workflow)
         self.assertIn(
             "scripts/prepare-candidate-transport.sh",
             (ROOT / "README.md").read_text(encoding="utf-8"),

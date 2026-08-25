@@ -1,13 +1,26 @@
-def exact_keys($expected):
-  type == "object" and ((keys | sort) == ($expected | sort));
+def sorted_nonempty_set:
+  length > 0 and . == (sort | unique);
 
-exact_keys(["schemaVersion", "rssRevision", "packages"]) and
-.schemaVersion == 1 and
+.schemaVersion == 2 and
 .rssRevision == $revision and
-(.packages | type == "array" and length > 0) and
+(.artifactSelector |
+  .workflow == "candidate-bundle.yml" and
+  .artifactName == "rss-candidate-bundle-\($revision)-\(.runId)-\(.runAttempt)") and
 ([.packages[].name] | length == (unique | length)) and
-all(.packages[];
-  exact_keys(["name", "version", "checksum"]) and
-  (.name | test("^rss-[a-z0-9]+(-[a-z0-9]+)*$")) and
-  (.version | test("^[0-9A-Za-z.+-]+$")) and
-  (.checksum | test("^[0-9a-f]{64}$")))
+(.profiles | length == 1) and
+(.profiles[0] |
+  .state == "candidate" and
+  .profile == "core" and
+  .assembly == "runtime" and
+  (.closure |
+    . as $closure |
+    (.listeners | sorted_nonempty_set) and
+    (.routes | sorted_nonempty_set) and
+    (.providers | sorted_nonempty_set) and
+    (.workers | sorted_nonempty_set) and
+    (.probes | sorted_nonempty_set) and
+    (.forbiddenProviders | sorted_nonempty_set) and
+    all(["event-publisher", "event-subscriber", "dlx-archive-store"][];
+      . as $sentinel | $closure.forbiddenProviders | index($sentinel) != null) and
+    all($closure.providers[];
+      . != "event-publisher" and . != "event-subscriber" and . != "dlx-archive-store")))
