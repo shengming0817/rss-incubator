@@ -113,7 +113,7 @@ TARGET_USER_ID="33333333-3333-4333-8333-333333333333"
 docker network create "$network" >/dev/null
 docker run -d --name "$pg" --network "$network" --network-alias postgres \
   -e POSTGRES_PASSWORD=owner_pw -e POSTGRES_DB=rss \
-  -v "$work/postgres:/rss-tls:ro" postgres:18.4-bookworm@sha256:882236b897e39051d2368c5ccc6cda944904723506b2dfc97f2a8f5bc9afa382 \
+  -v "$work/postgres:/rss-tls:ro" postgres:16.15-bookworm@sha256:bb3e1a57e5407e0a5280b4211980a5e537f4abd234a87014ac979849a78dd825 \
   sh -ec 'cp /rss-tls/server.pem /tmp/pg-server.pem; cp /rss-tls/server-key.pem /tmp/pg-server-key.pem; cp /rss-tls/ca.pem /tmp/pg-ca.pem; chown postgres:postgres /tmp/pg-server* /tmp/pg-ca.pem; chmod 600 /tmp/pg-server-key.pem; exec /usr/local/bin/docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/tmp/pg-server.pem -c ssl_key_file=/tmp/pg-server-key.pem -c ssl_ca_file=/tmp/pg-ca.pem' >/dev/null
 for _ in $(seq 1 40); do
   docker exec "$pg" pg_isready -U postgres -d rss >/dev/null 2>&1 && break
