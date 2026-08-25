@@ -151,6 +151,16 @@ assert_rejected 'rotation-model provider coupling'
 
 write_metadata
 jq '(.packages[] | select(.name == "rotation-model")).dependencies += [{
+  name: "reqwest",
+  source: "registry+https://github.com/rust-lang/crates.io-index",
+  path: null,
+  optional: true
+}]' "$metadata" > "$metadata.tmp"
+mv "$metadata.tmp" "$metadata"
+assert_rejected 'rotation-model disabled optional transport coupling'
+
+write_metadata
+jq '(.packages[] | select(.name == "rotation-model")).dependencies += [{
   name: "helper",
   source: "registry+https://github.com/rust-lang/crates.io-index",
   path: null
