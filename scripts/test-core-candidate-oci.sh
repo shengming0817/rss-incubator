@@ -20,6 +20,15 @@ exit 64
 SH
 chmod +x "$test_root/bin/docker"
 
+cat > "$test_root/bin/skopeo" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $# -eq 3 && "$1" == copy && "$2" == oci-archive:* && "$3" == docker-archive:* ]]
+archive="${3#docker-archive:}"
+: > "$archive"
+SH
+chmod +x "$test_root/bin/skopeo"
+
 make_fixture() {
   local user="$1"
   local unsafe_kind="${2:-plain}"

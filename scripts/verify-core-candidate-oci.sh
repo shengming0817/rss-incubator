@@ -97,7 +97,13 @@ jq -e --arg entrypoint "$entrypoint" '
   .config.Entrypoint == [$entrypoint]
 ' "$config" >/dev/null || fail "image config must use the exact non-root entrypoint"
 
-docker image load --input "$archive" >/dev/null
+# Docker's classic image store does not ingest a standards-compliant OCI layout archive directly.
+# Convert the already digest-verified layout to Docker's local transport without a registry or
+# published tag; the content-addressed config identity remains the authoritative loaded image ID.
+command -v skopeo >/dev/null || fail "skopeo is required for offline OCI loading"
+docker_archive="$layout/docker-load.tar"
+skopeo copy "oci-archive:$archive" "docker-archive:$docker_archive" >/dev/null
+docker image load --input "$docker_archive" >/dev/null
 image_id="sha256:$config_hex"
 docker image inspect "$image_id" >/dev/null || fail "loaded image identity is unavailable"
 docker image inspect "$image_id" | jq -e --arg entrypoint "$entrypoint" '

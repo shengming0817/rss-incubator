@@ -252,6 +252,13 @@ jobs:
           name: rss-candidate-input
           path: ${{ runner.temp }}/rss-candidate-bundle
 
+      - name: Install offline OCI transport
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends skopeo
+          skopeo --version
+
       - name: Bind producer manifest and materialize Cargo transport
         id: transport
         env:
