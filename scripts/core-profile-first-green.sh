@@ -227,6 +227,7 @@ server_args=(
   -v "$work/redis/ca.pem:/run/rss/redis-ca.pem:ro"
   -v "$work/server-jwks.json:/run/rss/jwks.json:ro"
   -e RSS_RUNTIME_PLAN_KIND=core -e RSS_TOPOLOGY=durable-shared
+  -e RSS_RUNTIME_INSTANCE_ID=44444444-4444-4444-8444-444444444444
   -e RSS_LISTENER_ALLOW_PLAINTEXT=dev-container
   -e RSS_ADMIN_LISTEN_ADDR=0.0.0.0:8082 -e RSS_HEALTH_LISTEN_ADDR=0.0.0.0:8083
   -e RSS_PRIMARY_TOKEN_PROFILE=rss-access -e RSS_ADMIN_TOKEN_PROFILE=rss-access
