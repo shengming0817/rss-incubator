@@ -53,6 +53,9 @@ jobs:
       - name: Test candidate manifest policy
         run: bash scripts/test-candidate-manifest-policy.sh
 
+      - name: Test Core candidate OCI policy
+        run: bash scripts/test-core-candidate-oci.sh
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -156,10 +159,46 @@ jobs:
           run-id: ${{ steps.artifact.outputs.run-id }}
           github-token: ${{ secrets.RSS_ARTIFACTS_READ_TOKEN }}
 
-      - name: Validate closed candidate manifest
+      - name: Validate manifest with bundled public schema
+        env:
+          BUNDLE_ROOT: ${{ runner.temp }}/rss-candidate-bundle
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-input jsonschema==4.25.1
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          from jsonschema import Draft7Validator
+
+          bundle = pathlib.Path(os.environ["BUNDLE_ROOT"])
+          schema_path = bundle / "schemas/candidate-bundle-v2.schema.json"
+          manifest_path = bundle / "candidate-bundle.json"
+          for path in (schema_path, manifest_path):
+              if not path.is_file() or path.is_symlink():
+                  raise SystemExit(f"candidate bundle member is not a plain file: {path.name}")
+          with schema_path.open(encoding="utf-8") as source:
+              schema = json.load(source)
+          with manifest_path.open(encoding="utf-8") as source:
+              manifest = json.load(source)
+          Draft7Validator.check_schema(schema)
+          errors = sorted(Draft7Validator(schema).iter_errors(manifest), key=lambda item: list(item.path))
+          if errors:
+              for error in errors:
+                  location = "/".join(str(part) for part in error.path) or "<root>"
+                  print(f"candidate bundle schema violation at {location}: {error.message}", file=sys.stderr)
+              raise SystemExit(1)
+          PY
+
+      - name: Validate candidate cross-field policy
         env:
           GH_TOKEN: ${{ github.token }}
           RSS_EXPECTED_REVISION: ${{ steps.artifact.outputs.revision }}
+          RSS_EXPECTED_RUN_ID: ${{ steps.artifact.outputs.run-id }}
+          RSS_EXPECTED_RUN_ATTEMPT: ${{ steps.artifact.outputs.attempt }}
+          RSS_EXPECTED_ARTIFACT_NAME: ${{ steps.artifact.outputs.name }}
         run: |
           set -euo pipefail
           jq -e --arg revision "$RSS_EXPECTED_REVISION" \
@@ -168,6 +207,14 @@ jobs:
               "repos/$GITHUB_REPOSITORY/contents/.github/candidate-manifest-policy.jq" \
               -f "ref=${{ github.base_ref || github.sha }}") \
             "$RUNNER_TEMP/rss-candidate-bundle/candidate-bundle.json" >/dev/null
+          jq -e \
+            --argjson run_id "$RSS_EXPECTED_RUN_ID" \
+            --argjson run_attempt "$RSS_EXPECTED_RUN_ATTEMPT" \
+            --arg artifact_name "$RSS_EXPECTED_ARTIFACT_NAME" '
+              .artifactSelector.runId == $run_id and
+              .artifactSelector.runAttempt == $run_attempt and
+              .artifactSelector.artifactName == $artifact_name
+            ' "$RUNNER_TEMP/rss-candidate-bundle/candidate-bundle.json" >/dev/null
 
       - name: Export credential-free candidate bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -180,7 +227,7 @@ jobs:
     name: candidate-consumption
     needs: [ci, candidate-artifact]
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 50
     steps:
       - name: Checkout exact incubator revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -218,6 +265,14 @@ jobs:
           cat "$env_file" >> "$GITHUB_ENV"
           echo "manifest=$bundle/candidate-bundle.json" >> "$GITHUB_OUTPUT"
 
+      - name: Verify and load exact Core OCI candidate
+        run: |
+          set -euo pipefail
+          image_id="$(scripts/verify-core-candidate-image.sh "$RUNNER_TEMP/rss-candidate-bundle")"
+          echo "RSS_CORE_IMAGE_ID=$image_id" >> "$GITHUB_ENV"
+          migration_image_id="$(scripts/verify-core-candidate-migration-image.sh "$RUNNER_TEMP/rss-candidate-bundle")"
+          echo "RSS_CORE_MIGRATION_IMAGE_ID=$migration_image_id" >> "$GITHUB_ENV"
+
       - name: Fetch exact root lock
         run: |
           set -euo pipefail
@@ -243,6 +298,10 @@ jobs:
           set -euo pipefail
           docker version
           docker compose version
+
+      - name: Run real Core profile first-green
+        timeout-minutes: 12
+        run: scripts/core-profile-first-green.sh "$RUNNER_TEMP/rss-candidate-bundle"
 
       - name: Run disposable reference environment journey
         timeout-minutes: 18
@@ -351,6 +410,16 @@ jobs:
                   name: $artifact_name,
                   digest: $artifact_digest
                 },
+                officialProfile: {
+                  state: $bundle[0].profiles[0].state,
+                  profile: $bundle[0].profiles[0].profile,
+                  assembly: $bundle[0].profiles[0].assembly,
+                  configDigest: $bundle[0].profiles[0].configDigest,
+                  assemblyLockDigest: $bundle[0].profiles[0].assemblyLockDigest,
+                  runtimePlanFingerprint: $bundle[0].profiles[0].runtimePlanFingerprint,
+                  image: $bundle[0].profiles[0].image,
+                  closure: $bundle[0].profiles[0].closure
+                },
                 packages: [
                   $bundle[0].packages[] + {
                     archiveVcsRevision: $rss_revision,
@@ -361,6 +430,7 @@ jobs:
                 rootLockSha256: $root_lock_sha,
                 registryOnly: true,
                 matrix: {
+                  coreProfile: "passed",
                   check: "passed",
                   test: "passed",
                   doc: "passed",
