@@ -1,6 +1,9 @@
 def coordinates:
   map({name, version, source}) | sort_by(.name, .version, .source);
 
+def canonical_name:
+  gsub("_"; "-");
+
 ($bundle[0].packages |
   map({
     name,
@@ -13,7 +16,7 @@ def coordinates:
   select(.name as $name | $expected | any(.name == $name))] |
   coordinates) as $consumed |
 ([.packages[] |
-  select(.name | startswith("rss-")) |
+  select(.name | canonical_name | startswith("rss-")) |
   select(.name as $name | $expected | any(.name == $name) | not) |
   select(.id as $id | $workspace | index($id) | not)]) as $unexpected_external |
 if $consumed != $expected then

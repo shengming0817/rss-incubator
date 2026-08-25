@@ -62,9 +62,24 @@ fallback graph or local source path.
 The disposable Secure Device Rotation provider environment has one lifecycle entrypoint. It creates
 all credentials under the ignored `deploy/.state/<project>` directory and binds published ports to
 loopback only. The canonical candidate job invokes it after configuring the pinned Cargo transport;
-a direct local invocation requires that same transport environment:
+a direct local invocation requires that same transport environment. Download the exact committed
+candidate bundle, materialize its local Cargo source, then run the journey:
 
 ```sh
+transport_root="$(mktemp -d)/transport"
+bundle_root="${transport_root%/transport}/bundle"
+mkdir -p "$bundle_root"
+gh run download "$(jq -r .runId .github/rss-candidate.json)" \
+  --repo shengming0817/rss \
+  --name "$(jq -r .artifactName .github/rss-candidate.json)" \
+  --dir "$bundle_root"
+env_file="$(scripts/prepare-candidate-transport.sh \
+  "$bundle_root" "$(jq -r .rssRevision .github/rss-candidate.json)" "$transport_root")"
+set -a
+. "$env_file"
+set +a
+cargo fetch --locked
+export CARGO_NET_OFFLINE=true
 python3 scripts/reference-environment.py smoke
 ```
 
@@ -73,6 +88,8 @@ the environment's External/T2-only acceptance boundary.
 
 ```sh
 python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+bash scripts/test-candidate-manifest-policy.sh
+bash scripts/test-candidate-graph-policy.sh
 cargo fmt --all -- --check
 ```
 

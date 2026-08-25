@@ -58,6 +58,26 @@ mv "$metadata.tmp" "$metadata"
 assert_rejected 'undeclared external RSS package'
 
 write_metadata
+jq '.packages += [{
+  id: "git+https://invalid/rss_rogue",
+  name: "rss_rogue",
+  version: "0.1.0",
+  source: "git+https://invalid/rss_rogue"
+}]' "$metadata" > "$metadata.tmp"
+mv "$metadata.tmp" "$metadata"
+assert_rejected 'underscore undeclared external RSS package'
+
+write_metadata
+jq '.packages += [{
+  id: "git+https://invalid/rss_platform",
+  name: "rss_platform",
+  version: "0.1.0",
+  source: "git+https://invalid/rss_platform"
+}]' "$metadata" > "$metadata.tmp"
+mv "$metadata.tmp" "$metadata"
+assert_rejected 'underscore alias of declared RSS package'
+
+write_metadata
 jq '(.packages[] | select(.name == "rss-platform")).source =
   "registry+https://index.crates.io/"' "$metadata" > "$metadata.tmp"
 mv "$metadata.tmp" "$metadata"
