@@ -204,7 +204,7 @@ docker exec "$issuer" wget -qO- http://127.0.0.1:8000/jwks.json |
 for secret_path in key.pem token facts; do
   private_status="$(docker exec "$issuer" wget -S -O /dev/null \
     "http://127.0.0.1:8000/$secret_path" 2>&1 |
-    awk '/HTTP\// {code=$2} END {print code}')"
+    awk '/HTTP\// {code=$2} END {print code}')" || true
   [[ "$private_status" == 404 ]] || fail "OIDC private material was externally reachable"
 done
 docker exec "$redis" wget -qO- http://oidc:8000/jwks.json > "$work/server-jwks.json" ||
