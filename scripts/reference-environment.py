@@ -2583,10 +2583,12 @@ SELECT json_build_object(
                 "RSS_AGENT_BROKER_ASSERTION_PUBLIC_KEY": (
                     self.state / "mosquitto/assertion-public.txt"
                 ).read_text(encoding="utf-8").strip(),
-                # Candidate proofs build committed snapshots with identical package identities.
-                # Keep the live broker test isolated from those intentionally parallel artifacts.
-                "CARGO_TARGET_DIR": str(ROOT / "target/reference-agent-t2"),
             }
+        )
+        # Canonical candidate CI already provides a runner-temporary target. Keep a local fallback
+        # so the live broker test does not contend with an ordinary developer build.
+        environment.setdefault(
+            "CARGO_TARGET_DIR", str(ROOT / "target/reference-agent-t2")
         )
         run(
             [

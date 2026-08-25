@@ -31,8 +31,8 @@ The only allowed dependency direction is:
 rss-incubator -> immutable RSS Release Surface artifacts
 ```
 
-RSS dependencies must be released registry artifacts or exact immutable candidates bound to a
-version, checksum, and source revision by this repository's candidate proof. Path, Git, workspace,
+RSS dependencies must be released registry artifacts or exact immutable candidates whose producer
+run, version, checksum, and source revision are bound by this repository's canonical CI. Path, Git, workspace,
 submodule, vendored, internal, generated, provider-catalog, RuntimePlan, test-fixture, governance,
 and T3-harness dependencies are forbidden.
 
@@ -99,7 +99,7 @@ it does not query or claim durable server audit history.
 ## Release, rollback, and incubation exit
 
 The skeleton is version `0.0.0`, `publish = false`, and carries no public support, SemVer, image, or
-release commitment. Candidate upgrades use only the existing locked/offline artifact proof. A
+release commitment. Candidate upgrades use only the locked/offline Cargo consumption job. A
 failure blocks product release and returns the product pin or commit to the last known-green artifact;
 it never restores source coupling or duplicates RSS internals.
 
@@ -121,7 +121,7 @@ It may consume only stable RSS Release Surface artifacts.
 | Corrupt/legacy state is migrated or reset, or an orphan revision becomes current | Strict private `StateV1`, synced immutable revisions, atomic manifest rename, and fail-closed restart tests | Persistence/test Hard |
 | ACK, broker PUBACK, reconnect, report, and application receipt collapse into readiness | Durable blocked/ready outbox states, exact old-delivery settlement recovery, and explicit broker-confirm/reconnect transitions; no receipt or `Ready` API | State-machine Hard |
 | Outbox pressure drops or overwrites protocol facts | Fixed 128-entry durable outbox with reservation before state mutation | State-machine Hard |
-| Source coupling enters candidate consumption | Independent repository, committed root lock, existing candidate proof | Physical/Cargo Hard plus proof Medium |
+| Source coupling enters candidate consumption | Independent repository, exact registry manifests, committed root lock, and resolved-source CI | Physical/Cargo Hard plus CI Medium |
 | Product scope, owner, public-waist choice, and T3 prohibition drift | Accepted upstream ADR plus review of this scope document | Policy/review fact; not represented as machine enforcement |
 
 No Markdown scanner, shape-count gate, second registry, evidence database, runner, or release control

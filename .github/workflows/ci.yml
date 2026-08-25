@@ -1,14 +1,14 @@
 name: CI
 
 on:
-  pull_request:
+  pull_request_target:
     branches: [main]
   push:
     branches: [main]
   workflow_dispatch:
     inputs:
       rssRunId:
-        description: Optional exact RSS candidate-bundle run override; otherwise use the committed pin.
+        description: Exact committed RSS candidate-bundle run; overrides may only repeat the pin.
         required: false
         type: string
 
@@ -17,7 +17,7 @@ permissions:
 
 concurrency:
   group: rss-incubator-ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -33,6 +33,7 @@ jobs:
       - name: Checkout incubator revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
       - name: Install pinned Rust toolchain
@@ -43,50 +44,205 @@ jobs:
           rustc --version --verbose
           cargo --version --verbose
 
-      - name: Test candidate proof policy
+      - name: Test repository policy scripts
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
+      - name: Test Cargo graph policy
+        run: bash scripts/test-candidate-graph-policy.sh
+
+      - name: Test candidate manifest policy
+        run: bash scripts/test-candidate-manifest-policy.sh
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Check candidate formatting
-        run: find apps crates journeys -type f -name '*.rs' -exec rustfmt --edition 2024 --check {} +
-
-      - name: Check workspace
-        run: cargo check --workspace --all-targets --locked
-
-      - name: Test workspace
-        run: cargo test --workspace --all-targets --locked
-
-      - name: Test workspace documentation
-        run: cargo test --workspace --doc --locked
-
-      - name: Lint workspace
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
-  reference-environment:
-    name: reference-environment
+  candidate-artifact:
+    name: candidate-artifact
+    needs: ci
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 10
+    outputs:
+      attempt: ${{ steps.artifact.outputs.attempt }}
+      digest: ${{ steps.artifact.outputs.digest }}
+      name: ${{ steps.artifact.outputs.name }}
+      revision: ${{ steps.artifact.outputs.revision }}
+      run-id: ${{ steps.artifact.outputs.run-id }}
     steps:
-      - name: Checkout incubator revision
+      - name: Read candidate pin without checking out PR code
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INCUBATOR_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          gh api -X GET \
+            -H 'Accept: application/vnd.github.raw+json' \
+            "repos/$GITHUB_REPOSITORY/contents/.github/rss-candidate.json" \
+            -f "ref=$INCUBATOR_REVISION" \
+            > "$RUNNER_TEMP/rss-candidate-pin.json"
+
+      - name: Resolve immutable RSS candidate artifact
+        id: artifact
+        env:
+          GH_TOKEN: ${{ secrets.RSS_ARTIFACTS_READ_TOKEN }}
+          RSS_RUN_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && inputs.rssRunId || '' }}
+        run: |
+          set -euo pipefail
+          pin="$(jq -ce '
+            if ((keys | sort) == (["artifactDigest","artifactName","rssRevision","runAttempt","runId","schemaVersion"] | sort)) and
+               .schemaVersion == 1 and
+               (.runId | type == "number") and
+               (.runAttempt | type == "number") and
+               (.rssRevision | test("^[0-9a-f]{40}$")) and
+               (.artifactName | type == "string") and
+               (.artifactDigest | test("^sha256:[0-9a-f]{64}$"))
+            then . else error("candidate pin is malformed") end
+          ' "$RUNNER_TEMP/rss-candidate-pin.json")"
+          run_id="$(jq -er '.runId' <<< "$pin")"
+          if [[ -n "$RSS_RUN_OVERRIDE" ]]; then
+            [[ "$RSS_RUN_OVERRIDE" =~ ^[1-9][0-9]*$ ]] || {
+              echo "rssRunId must be a positive integer" >&2
+              exit 1
+            }
+            [[ "$RSS_RUN_OVERRIDE" == "$run_id" ]] || {
+              echo "rssRunId must equal the committed candidate pin" >&2
+              exit 1
+            }
+          fi
+          run_json="$(gh api "repos/shengming0817/rss/actions/runs/$run_id")"
+          jq -e --arg revision "$(jq -r '.rssRevision' <<< "$pin")" '
+            .path == ".github/workflows/candidate-bundle.yml" and
+            .event == "workflow_dispatch" and
+            .status == "completed" and
+            .conclusion == "success" and
+            .head_sha == $revision
+          ' <<< "$run_json" >/dev/null
+          revision="$(jq -r '.head_sha' <<< "$run_json")"
+          attempt="$(jq -r '.run_attempt' <<< "$run_json")"
+          artifact_name="rss-candidate-bundle-$revision-$run_id-$attempt"
+          artifacts="$(gh api "repos/shengming0817/rss/actions/runs/$run_id/artifacts")"
+          artifact="$(jq -c --arg name "$artifact_name" '
+            if .total_count != 1 then error("producer run artifact exact-set differs")
+            else [.artifacts[] | select(.name == $name and .expired == false)] |
+              if length == 1 then .[0] else error("candidate artifact identity differs") end
+            end
+          ' <<< "$artifacts")"
+          digest="$(jq -r '.digest' <<< "$artifact")"
+          jq -e \
+            --argjson run_id "$run_id" \
+            --argjson attempt "$attempt" \
+            --arg revision "$revision" \
+            --arg name "$artifact_name" \
+            --arg digest "$digest" \
+            '.runId == $run_id and
+             .runAttempt == $attempt and
+             .rssRevision == $revision and
+             .artifactName == $name and
+             .artifactDigest == $digest' \
+            <<< "$pin" >/dev/null
+          {
+            echo "name=$artifact_name"
+            echo "revision=$revision"
+            echo "attempt=$attempt"
+            echo "digest=$digest"
+            echo "run-id=$run_id"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download exact RSS candidate artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: ${{ runner.temp }}/rss-candidate-bundle
+          repository: shengming0817/rss
+          run-id: ${{ steps.artifact.outputs.run-id }}
+          github-token: ${{ secrets.RSS_ARTIFACTS_READ_TOKEN }}
+
+      - name: Validate closed candidate manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RSS_EXPECTED_REVISION: ${{ steps.artifact.outputs.revision }}
+        run: |
+          set -euo pipefail
+          jq -e --arg revision "$RSS_EXPECTED_REVISION" \
+            -f <(gh api -X GET \
+              -H 'Accept: application/vnd.github.raw+json' \
+              "repos/$GITHUB_REPOSITORY/contents/.github/candidate-manifest-policy.jq" \
+              -f "ref=${{ github.base_ref || github.sha }}") \
+            "$RUNNER_TEMP/rss-candidate-bundle/candidate-bundle.json" >/dev/null
+
+      - name: Export credential-free candidate bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rss-candidate-input
+          path: ${{ runner.temp }}/rss-candidate-bundle
+          retention-days: 1
+
+  candidate-consumption:
+    name: candidate-consumption
+    needs: [ci, candidate-artifact]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact incubator revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy --component llvm-tools-preview
+          rustup default "$RUST_VERSION"
+
+      - name: Install pinned coverage driver
+        uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a
+        with:
+          tool: cargo-llvm-cov@0.8.7
+
+      - name: Import credential-free candidate bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rss-candidate-input
+          path: ${{ runner.temp }}/rss-candidate-bundle
+
+      - name: Bind producer manifest and materialize Cargo transport
+        id: transport
+        env:
+          RSS_EXPECTED_REVISION: ${{ needs.candidate-artifact.outputs.revision }}
+        run: |
+          set -euo pipefail
+          bundle="$RUNNER_TEMP/rss-candidate-bundle"
+          env_file="$(scripts/prepare-candidate-transport.sh \
+            "$bundle" "$RSS_EXPECTED_REVISION" \
+            "$RUNNER_TEMP/rss-candidate-transport")"
+          cat "$env_file" >> "$GITHUB_ENV"
+          echo "manifest=$bundle/candidate-bundle.json" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch exact root lock
+        run: |
+          set -euo pipefail
+          cargo fetch --locked
+          echo 'CARGO_NET_OFFLINE=true' >> "$GITHUB_ENV"
+
+      - name: Prove registry-only resolved graph
+        id: graph
+        env:
+          BUNDLE_MANIFEST: ${{ steps.transport.outputs.manifest }}
+        run: |
+          set -euo pipefail
+          metadata="$RUNNER_TEMP/rss-candidate-metadata.json"
+          consumed="$RUNNER_TEMP/rss-consumed-packages.json"
+          cargo metadata --format-version 1 --locked --offline > "$metadata"
+          jq -ce --slurpfile bundle "$BUNDLE_MANIFEST" \
+            -f .github/candidate-graph-policy.jq \
+            "$metadata" > "$consumed"
+          echo "consumed=$consumed" >> "$GITHUB_OUTPUT"
 
       - name: Verify Docker runtime
         run: |
           set -euo pipefail
           docker version
           docker compose version
-
-      - name: Install pinned Rust toolchain
-        run: |
-          set -euo pipefail
-          rustup toolchain install "$RUST_VERSION" --profile minimal
-          rustup default "$RUST_VERSION"
-          rustc --version --verbose
-          cargo --version --verbose
 
       - name: Run disposable reference environment journey
         timeout-minutes: 18
@@ -108,176 +264,121 @@ jobs:
           REFERENCE_PROJECT: rss-ci-${{ github.run_id }}-${{ github.run_attempt }}
         run: python3 scripts/reference-environment.py --project "$REFERENCE_PROJECT" down
 
-  candidate-proof:
-    name: candidate-proof
-    needs: ci
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    steps:
-      - name: Checkout incubator revision
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-
-      - name: Install pinned Rust toolchain
+      - name: Run locked offline candidate workspace matrix
         run: |
           set -euo pipefail
-          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy --component llvm-tools-preview
-          rustup default "$RUST_VERSION"
+          cargo fmt --all -- --check
+          cargo check --workspace --all-targets --locked --offline
+          cargo test --workspace --all-targets --locked --offline
+          cargo test --workspace --doc --locked --offline
+          cargo clippy --workspace --all-targets --locked --offline -- -D warnings
 
-      - name: Install pinned coverage driver
-        uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a
-        with:
-          tool: cargo-llvm-cov@0.8.7
-
-      - name: Resolve immutable RSS candidate artifact
-        id: artifact
-        env:
-          GH_TOKEN: ${{ secrets.RSS_ARTIFACTS_READ_TOKEN }}
-          RSS_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.rssRunId || '' }}
+      - name: Enforce affected coverage
         run: |
           set -euo pipefail
-          pin="$(jq -ce '
-            if .schemaVersion == 1 and
-               (.runId | type == "number") and
-               (.runAttempt | type == "number") and
-               (.rssRevision | test("^[0-9a-f]{40}$")) and
-               (.artifactName | type == "string") and
-               (.artifactDigest | test("^sha256:[0-9a-f]{64}$"))
-            then . else error("candidate pin is malformed") end
-          ' .github/rss-candidate.json)"
-          if [[ -z "$RSS_RUN_ID" ]]; then
-            RSS_RUN_ID="$(jq -er '.runId' <<< "$pin")"
-            pin_mode=true
-          else
-            pin_mode=false
-          fi
-          [[ "$RSS_RUN_ID" =~ ^[1-9][0-9]*$ ]]
-          run_json="$(gh api "repos/shengming0817/rss/actions/runs/$RSS_RUN_ID")"
-          jq -e '
-            .path == ".github/workflows/candidate-bundle.yml" and
-            .event == "workflow_dispatch" and
-            .status == "completed" and
-            .conclusion == "success" and
-            (.head_sha | test("^[0-9a-f]{40}$"))
-          ' <<< "$run_json" >/dev/null
-          revision="$(jq -r '.head_sha' <<< "$run_json")"
-          attempt="$(jq -r '.run_attempt' <<< "$run_json")"
-          artifact_name="rss-candidate-bundle-$revision-$RSS_RUN_ID-$attempt"
-          artifacts="$(gh api "repos/shengming0817/rss/actions/runs/$RSS_RUN_ID/artifacts")"
-          artifact="$(jq -c --arg name "$artifact_name" '
-            if .total_count != 1 then error("producer run artifact exact-set differs")
-            else [.artifacts[] | select(.name == $name and .expired == false)] |
-              if length == 1 then .[0] else error("candidate artifact identity differs") end
-            end
-          ' <<< "$artifacts")"
-          digest="$(jq -r '.digest' <<< "$artifact")"
-          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          if [[ "$pin_mode" == true ]]; then
-            jq -e \
-              --argjson run_id "$RSS_RUN_ID" \
-              --argjson attempt "$attempt" \
-              --arg revision "$revision" \
-              --arg name "$artifact_name" \
-              --arg digest "$digest" \
-              '.runId == $run_id and
-               .runAttempt == $attempt and
-               .rssRevision == $revision and
-               .artifactName == $name and
-               .artifactDigest == $digest' \
-              <<< "$pin" >/dev/null
-          fi
-          {
-            echo "name=$artifact_name"
-            echo "revision=$revision"
-            echo "attempt=$attempt"
-            echo "digest=$digest"
-            echo "run-id=$RSS_RUN_ID"
-          } >> "$GITHUB_OUTPUT"
+          cargo llvm-cov \
+            --package platform-authoring-smoke \
+            --all-targets --locked --offline \
+            --fail-under-lines 80
+          cargo llvm-cov \
+            --package reference-device-agent-core \
+            --package reference-device-agent \
+            --all-targets --locked --offline \
+            --ignore-filename-regex '(^|/)(crates/(rotation-model|rss-device-security-client)|tests/fixtures)/' \
+            --fail-under-lines 80
+          cargo llvm-cov \
+            --package secure-device-rotation-t2-journey \
+            --all-targets --locked --offline \
+            --ignore-filename-regex '(^|/)(crates/(rotation-model|rss-device-security-client)|tests/fixtures)/' \
+            --fail-under-lines 80
 
-      - name: Download exact RSS candidate artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: ${{ steps.artifact.outputs.name }}
-          path: ${{ runner.temp }}/rss-candidate-bundle
-          repository: shengming0817/rss
-          run-id: ${{ steps.artifact.outputs.run-id }}
-          github-token: ${{ secrets.RSS_ARTIFACTS_READ_TOKEN }}
+      - name: Build release consumers
+        run: |
+          set -euo pipefail
+          cargo build \
+            --package reference-device-agent \
+            --package rotation-control \
+            --release --locked --offline
 
-      - name: Prove locked offline candidate consumption
-        id: proof
+      - name: Publish canonical first-green receipt
         env:
+          ARTIFACT_DIGEST: ${{ needs.candidate-artifact.outputs.digest }}
+          ARTIFACT_NAME: ${{ needs.candidate-artifact.outputs.name }}
+          BUNDLE_MANIFEST: ${{ steps.transport.outputs.manifest }}
+          CONSUMED_PACKAGES: ${{ steps.graph.outputs.consumed }}
           INCUBATOR_EXPECTED_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
-          RSS_EXPECTED_REVISION: ${{ steps.artifact.outputs.revision }}
+          RSS_EXPECTED_REVISION: ${{ needs.candidate-artifact.outputs.revision }}
+          RSS_RUN_ATTEMPT: ${{ needs.candidate-artifact.outputs.attempt }}
+          RSS_RUN_ID: ${{ needs.candidate-artifact.outputs.run-id }}
         run: |
           set -euo pipefail
-          proof_log="$RUNNER_TEMP/candidate-proof.log"
-          consumer_directory="$RUNNER_TEMP/device-security-consumers"
-          [[ ! -e "$consumer_directory" ]]
-          python3 scripts/candidate-proof.py \
-            --bundle "$RUNNER_TEMP/rss-candidate-bundle" \
-            --binary-output-directory "$consumer_directory" \
-            --coverage | tee "$proof_log"
-          summary="$(tail -n 1 "$proof_log")"
-          consumer_manifest="$(cat "$consumer_directory/consumer-manifest.json")"
-          jq -e --arg revision "$RSS_EXPECTED_REVISION" \
-            --arg incubator_revision "$INCUBATOR_EXPECTED_REVISION" \
-            '.schemaVersion == 1 and
-             .rssRevision == $revision and
-             .incubatorRevision == $incubator_revision and
-             ([.packages[].name] | sort) == (.consumedPackages | sort) and
-             ([.consumerBinaries[].name] | sort) ==
-               ["reference-device-agent","rotation-control"]' \
-            <<< "$summary" >/dev/null
-          jq -e \
-            --arg revision "$RSS_EXPECTED_REVISION" \
-            --arg incubator_revision "$INCUBATOR_EXPECTED_REVISION" \
-            --arg lock "$(jq -r '.candidateLockSha256' <<< "$summary")" \
-            '.schemaVersion == 1 and
-             .rssRevision == $revision and
-             .incubatorRevision == $incubator_revision and
-             .candidateLockSha256 == $lock and
-             .contract.name == "rss-device-security-contracts" and
-             ([.binaries[].name] | sort) ==
-               ["reference-device-agent","rotation-control"] and
-             ([.binaries[].sha256] | all(test("^[0-9a-f]{64}$")))' \
-            <<< "$consumer_manifest" >/dev/null
+          actual_incubator_revision="$(/usr/bin/git rev-parse HEAD)"
+          [[ "$actual_incubator_revision" == "$INCUBATOR_EXPECTED_REVISION" ]]
+          [[ "$(sha256sum Cargo.lock | awk '{print $1}')" == "$ROOT_LOCK_SHA256" ]]
+          agent_sha="$(sha256sum "$CARGO_TARGET_DIR/release/reference-device-agent" | awk '{print $1}')"
+          control_sha="$(sha256sum "$CARGO_TARGET_DIR/release/rotation-control" | awk '{print $1}')"
+          receipt="$(jq -cn \
+            --arg rss_revision "$RSS_EXPECTED_REVISION" \
+            --arg incubator_revision "$actual_incubator_revision" \
+            --argjson rss_run_id "$RSS_RUN_ID" \
+            --argjson rss_run_attempt "$RSS_RUN_ATTEMPT" \
+            --arg producer_url "https://github.com/shengming0817/rss/actions/runs/$RSS_RUN_ID/attempts/$RSS_RUN_ATTEMPT" \
+            --argjson consumer_run_id "$GITHUB_RUN_ID" \
+            --argjson consumer_run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg consumer_url "https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT" \
+            --arg artifact_name "$ARTIFACT_NAME" \
+            --arg artifact_digest "$ARTIFACT_DIGEST" \
+            --arg root_lock_sha "$ROOT_LOCK_SHA256" \
+            --arg agent_sha "$agent_sha" \
+            --arg control_sha "$control_sha" \
+            --slurpfile bundle "$BUNDLE_MANIFEST" \
+            --slurpfile consumed "$CONSUMED_PACKAGES" '
+              {
+                schemaVersion: 2,
+                rssRevision: $rss_revision,
+                incubatorRevision: $incubator_revision,
+                producerRun: {
+                  id: $rss_run_id,
+                  attempt: $rss_run_attempt,
+                  url: $producer_url
+                },
+                consumerRun: {
+                  id: $consumer_run_id,
+                  attempt: $consumer_run_attempt,
+                  url: $consumer_url
+                },
+                artifact: {
+                  name: $artifact_name,
+                  digest: $artifact_digest
+                },
+                packages: [
+                  $bundle[0].packages[] + {
+                    archiveVcsRevision: $rss_revision,
+                    archiveVcsProvenBy: $producer_url
+                  }
+                ],
+                consumedPackages: $consumed[0],
+                rootLockSha256: $root_lock_sha,
+                registryOnly: true,
+                matrix: {
+                  check: "passed",
+                  test: "passed",
+                  doc: "passed",
+                  clippy: "passed",
+                  locked: true,
+                  offline: true
+                },
+                consumerBinaries: [
+                  {name: "reference-device-agent", sha256: $agent_sha},
+                  {name: "rotation-control", sha256: $control_sha}
+                ]
+              }
+            ')"
+          /usr/bin/git diff --exit-code
           {
-            echo 'summary<<RSS_CANDIDATE_SUMMARY'
-            echo "$summary"
-            echo 'RSS_CANDIDATE_SUMMARY'
-            echo 'consumer_manifest<<RSS_CONSUMER_MANIFEST'
-            echo "$consumer_manifest"
-            echo 'RSS_CONSUMER_MANIFEST'
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Publish first-green summary
-        env:
-          RSS_ARTIFACT_DIGEST: ${{ steps.artifact.outputs.digest }}
-          RSS_PROOF_SUMMARY: ${{ steps.proof.outputs.summary }}
-          RSS_CONSUMER_MANIFEST: ${{ steps.proof.outputs.consumer_manifest }}
-        run: |
-          set -euo pipefail
-          {
-            echo '## rss-incubator candidate first-green'
+            echo '## rss-incubator canonical candidate first-green'
             echo
-            echo "- RSS producer run: https://github.com/shengming0817/rss/actions/runs/${{ steps.artifact.outputs.run-id }}/attempts/${{ steps.artifact.outputs.attempt }}"
-            echo "- Incubator candidate run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}"
-            echo "- RSS revision: \`$(jq -r '.rssRevision' <<< "$RSS_PROOF_SUMMARY")\`"
-            echo "- Incubator revision: \`$(jq -r '.incubatorRevision' <<< "$RSS_PROOF_SUMMARY")\`"
-            echo "- Artifact identity: \`${{ steps.artifact.outputs.name }}\`"
-            echo "- Artifact digest: \`$RSS_ARTIFACT_DIGEST\`"
-            echo "- Candidate lock SHA-256: \`$(jq -r '.candidateLockSha256' <<< "$RSS_PROOF_SUMMARY")\`"
-            echo "- Device-security contract: \`$(jq -r '.contract.name + "@" + .contract.version' <<< "$RSS_CONSUMER_MANIFEST")\` — checksum \`$(jq -r '.contract.checksum' <<< "$RSS_CONSUMER_MANIFEST")\`"
-            echo '- Registry-only resolution: verified'
-            echo '- Candidate matrix: `cargo check`, `cargo test`, `cargo test --doc`, and `cargo clippy` passed with `--locked --offline`'
-            echo '- Affected line coverage: at least 80% for the reference agent app and core'
-            echo '- External T2 journey: public acceptance/ACK/report/receipt/status lineage, stale-fact forbidden, and revoked no-advance passed'
-            echo '- Ephemeral consumer binaries:'
-            jq -r '.binaries[] | "  - `\(.name)` — SHA-256 `\(.sha256)`"' <<< "$RSS_CONSUMER_MANIFEST"
-            echo '- Release Surface packages:'
-            jq -r '.rssRevision as $revision | .packages[] | "  - `\(.name)@\(.version)` — checksum `\(.checksum)` — archive VCS `\($revision)`"' <<< "$RSS_PROOF_SUMMARY"
-            echo '- Consumed RSS packages:'
-            jq -r '.consumedPackages[] | "  - `\(.)`"' <<< "$RSS_PROOF_SUMMARY"
+            echo '```json'
+            jq . <<< "$receipt"
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

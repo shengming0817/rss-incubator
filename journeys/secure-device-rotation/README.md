@@ -1,9 +1,8 @@
 # Secure Device Rotation External T2 Journey
 
-Azure PBI #2123 owns this candidate-only external consumer proof. The candidate workflow activates
-this package only inside a committed-HEAD temporary snapshot, rewrites the exact
-`rss-device-security-contracts` dependency to the validated local candidate registry, and runs the
-journey with Cargo locked and offline.
+Azure PBI #2123 owns this external consumer journey. It is a permanent member of the single Cargo
+workspace and declares an exact `rss-candidate` registry dependency. The canonical candidate job
+runs it from the committed root lock with Cargo locked and offline.
 
 The positive test consumes canonical policy acceptance, command ACK, credential report, application
 receipt, and status DTOs through `rss-device-security-client`. It requires one authorization
@@ -22,5 +21,5 @@ Two focused negatives remain:
 This is a reusable test whose runtime is disposable, not a deployed environment. It does not start
 an RSS image, inspect RSS source or storage, derive authorization, infer Ready, query durable audit,
 or claim server-side no-write, persistence, deployment readiness, production acceptance, or T3.
-Consumer binaries, the candidate registry, credentials, logs, receipts, and temporary locks are not
-committed or uploaded.
+Consumer binaries, the candidate registry, credentials, logs, and receipt intermediates remain
+runner-temporary and are not committed or uploaded.

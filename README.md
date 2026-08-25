@@ -29,10 +29,9 @@ journey retain separate implementation owners.
 The rotation product does not absorb `rss-consumer-smoke`. The observability smoke remains an
 independent compatibility proof and supplies no identity, authorization, or device-state authority.
 
-`fixtures/rss-conformance-consumer` is a committed candidate-only template. It is intentionally not
-a normal workspace member and its manifest contains no resolvable released dependency. Candidate
-proof materializes it only inside the committed-HEAD temporary snapshot, injects the exact
-file-registry `rss-conformance` version, and runs all five provider-neutral LocalTx behaviors.
+`fixtures/rss-conformance-consumer` is a non-publishable workspace member with one exact
+`rss-candidate` registry dependency. Its tests run all five provider-neutral LocalTx behaviors
+through the same root lock and canonical candidate-consumption job as every other product consumer.
 
 ## Ownership
 
@@ -44,26 +43,43 @@ file-registry `rss-conformance` version, and runs all five provider-neutral Loca
 ## Dependency boundary
 
 Products may consume RSS only through immutable released artifacts, or through an exact candidate
-version whose checksum and source revision are pinned by an incubator-owned proof. RSS dependencies
+version whose producer run, digest, checksum, and source revision are pinned by incubator CI. RSS dependencies
 must not use path, Git, workspace, submodule, vendored, internal, generated, provider-catalog, runtime
 plan, test-fixture, or governance surfaces.
 
-A candidate proof establishes only this repository's product-consumption seam. It does not establish
-RSS release correctness, RC status, maturity, or publish approval. The ADR-026 ownership cutover is
-complete: this repository owns the consumer proof and RSS retains the Release Surface artifact proof.
+A candidate-consumption result establishes only this repository's product seam. RSS alone owns
+Release Surface selection, `.crate`/index/checksum/VCS correctness, and package proof. Incubator
+binds that immutable producer result and lets Cargo validate the packages it actually resolves; it
+does not reopen archives or implement a second package-format validator.
 
 ## Local policy verification
 
-The committed root `Cargo.lock` is the single dependency resolution for this workspace. Before the
-Platform and device-security candidate packages are published, the regular workspace excludes the
-candidate consumers; the candidate proof derives and atomically re-enrolls all exclusions only in its isolated
-snapshot. A fresh clone and the pull-request/push lane run:
+The committed root `Cargo.lock` is the single dependency resolution for every normal and candidate
+workspace member. Cargo resolves that workspace as one graph, so Rust build and test commands require
+the exact pinned candidate transport; only the canonical CI job materializes it. There is no smaller
+fallback graph or local source path.
 
 The disposable Secure Device Rotation provider environment has one lifecycle entrypoint. It creates
 all credentials under the ignored `deploy/.state/<project>` directory and binds published ports to
-loopback only:
+loopback only. The canonical candidate job invokes it after configuring the pinned Cargo transport;
+a direct local invocation requires that same transport environment. Download the exact committed
+candidate bundle, materialize its local Cargo source, then run the journey:
 
 ```sh
+transport_root="$(mktemp -d)/transport"
+bundle_root="${transport_root%/transport}/bundle"
+mkdir -p "$bundle_root"
+gh run download "$(jq -r .runId .github/rss-candidate.json)" \
+  --repo shengming0817/rss \
+  --name "$(jq -r .artifactName .github/rss-candidate.json)" \
+  --dir "$bundle_root"
+env_file="$(scripts/prepare-candidate-transport.sh \
+  "$bundle_root" "$(jq -r .rssRevision .github/rss-candidate.json)" "$transport_root")"
+set -a
+. "$env_file"
+set +a
+cargo fetch --locked
+export CARGO_NET_OFFLINE=true
 python3 scripts/reference-environment.py smoke
 ```
 
@@ -72,17 +88,13 @@ the environment's External/T2-only acceptance boundary.
 
 ```sh
 python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+bash scripts/test-candidate-manifest-policy.sh
+bash scripts/test-candidate-graph-policy.sh
 cargo fmt --all -- --check
-find apps crates journeys -type f -name '*.rs' -exec rustfmt --edition 2024 --check {} +
-cargo check --workspace --all-targets --locked
-cargo test --workspace --all-targets --locked
-cargo test --workspace --doc --locked
-cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-The complete workspace matrix requires an exact candidate bundle and runs only through the closed
-proof entrypoint described below. After the prerequisite job checks formatting on the real checkout,
-the proof executes the equivalent of the following inside its temporary snapshot:
+The complete workspace matrix requires the exact pinned candidate bundle and runs only in the
+canonical GitHub Actions candidate-consumption job:
 
 ```text
 cargo check --workspace --all-targets --locked
@@ -91,61 +103,41 @@ cargo test --workspace --doc --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-GitHub Actions runs the policy, formatting, check, test, documentation, and lint gates for the
-regular workspace on every pull request and push to `main`. It then uses the configured immutable
-RSS candidate run to activate the excluded consumers only in a temporary snapshot and delegates the
-complete workspace metadata,
-build, test, and lint execution to the isolated candidate-proof job.
+GitHub Actions first runs repository policy and formatting gates. It then downloads the configured
+immutable RSS candidate artifact, materializes only its runner-local Cargo transport, and runs
+metadata, build, test, lint, coverage, journey, and release-binary gates over the complete workspace.
 
-## Candidate artifact proof
+## Candidate artifact consumption
 
-RSS owns candidate archive correctness and exports a short-lived bundle only after its existing
-Release Surface `package-proof` succeeds. This repository consumes that bundle with one closed
-entrypoint:
+RSS exports a short-lived bundle only after its Release Surface `package-proof` succeeds. Incubator
+reads the producer manifest to bind the successful run, revision, artifact identity, digest, and
+package coordinates. It does not inspect `.crate` contents, reconstruct registry index entries,
+recompute archive checksums, or read archive VCS metadata.
 
-```sh
-python3 scripts/candidate-proof.py --bundle /absolute/path/to/rss-candidate-bundle
-```
-
-Add `--coverage` to enforce independent 80% line thresholds for the affected reference-agent
-packages and the external T2 journey. Add
-`--binary-output-directory /absolute/nonexistent/directory` to perform a release build and
-atomically preserve `rotation-control`, `reference-device-agent`, and a checksum-bearing
-`consumer-manifest.json` after all locked/offline proof gates pass. Temporary snapshot sources and
-locks are still discarded.
-
-The bundle carries the complete RSS Release Surface exact-set. Before Cargo resolution, the proof
-statically discovers the subset directly consumed by this workspace, enforces the device-security
-client's single exact RSS edge, rewrites only a committed-HEAD temporary snapshot, and then runs
-Cargo fmt, metadata, check, test, doctest, and clippy with
-`--locked --offline`. It rejects checksum or
-archive-VCS drift, missing or extra registry entries, path/Git/workspace RSS dependencies, internal
-RSS packages, and any change to the real checkout. The committed root `Cargo.lock` remains the
-released baseline; the candidate lock exists only for the proof lifetime.
-
-On a fresh runner, the proof starts from the committed baseline lock and preserves every existing
-non-RSS registry identity. Any newly required non-RSS identity must be proven reachable from an RSS
-candidate package or an excluded candidate member atomically activated for this proof in Cargo's
-resolved dependency graph; unrelated lock additions fail closed. A
-stable logical candidate source is mapped to the already-validated local registry, so temporary
-filesystem paths never enter the candidate lock. The candidate metadata/build/test/lint matrix is
-explicitly locked and offline; the real checkout and committed baseline lock remain unchanged.
+Every RSS dependency is declared with an exact version and the stable `rss-candidate` registry.
+The CI job maps that logical source to the downloaded runner-local registry, executes
+`cargo fetch --locked`, and then runs metadata, check, test, doctest, clippy, and coverage locked and
+offline. Cargo's resolved graph must match the producer manifest's complete name/version exact-set
+at the one logical registry source. A producer package shadowed by a workspace/path source and every
+undeclared external `rss-*` package fail closed; incubator-owned workspace packages remain outside
+the producer set. The committed root lock and checkout must remain byte unchanged throughout the job.
 
 The `CI` workflow reads its successful RSS candidate-bundle identity from the reviewed
-`.github/rss-candidate.json` pin on pull requests and pushes; maintainers may supply one exact run
-override from a manual dispatch. It never resolves a mutable latest-successful run.
+`.github/rss-candidate.json` pin on pull requests and pushes. A manual dispatch may repeat that exact
+run ID but cannot select another run; the workflow never resolves a mutable latest-successful run.
 `RSS_ARTIFACTS_READ_TOKEN` is a fine-grained Actions secret with read-only access to the RSS
 repository's workflow artifacts. The workflow derives the RSS revision, run attempt, artifact name,
-and digest from that immutable run. The job summary publishes both canonical run URLs, both commits,
-artifact identity and digest, the dynamic package exact-set with checksums and verified archive VCS,
-the consumed set, candidate-lock digest, registry-only result, and locked/offline matrix result.
+and digest from that immutable run. After all gates pass, the job summary publishes one breaking
+schema-v2 receipt containing both canonical run URLs and commits, artifact identity, producer-proven
+package coordinates and archive VCS revision, the Cargo-consumed exact-set, root-lock digest,
+registry-only result, locked/offline matrix, and release-binary checksums.
 
-A green candidate proof also runs the
+A green candidate-consumption job also runs the
 [Secure Device Rotation external T2 journey](journeys/secure-device-rotation/README.md) against the
 exact public contracts candidate and builds both consumer binaries. The binaries, candidate
 registry, manifest, logs, and test state remain runner-temporary and are not uploaded or committed.
 
-A green candidate proof establishes only this repository's product-consumption seam. It does not
+A green candidate-consumption job establishes only this repository's product seam. It does not
 establish RSS release correctness, RC status, package maturity, publish approval, an official
 profile, production acceptance, or T3 evidence. Results are linked from the owning issue or pull
 request; they are not committed as receipts or copied into a second registry.

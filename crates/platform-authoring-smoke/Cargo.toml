@@ -6,9 +6,9 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-rss-contract = "=0.1.0"
-rss-platform = "=0.3.0"
-rss-request-context = "=0.1.0"
+rss-contract = { version = "=0.1.0", registry = "rss-candidate" }
+rss-platform = { version = "=0.3.0", registry = "rss-candidate" }
+rss-request-context = { version = "=0.1.0", registry = "rss-candidate" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

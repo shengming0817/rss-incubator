@@ -16,8 +16,8 @@ internal or T3 surfaces.
 
 ## Dependency and architecture rules
 
-- Consume RSS only as a released registry artifact or an immutable, exact-version candidate pinned
-  with checksum and source revision by an incubator-owned proof.
+- Consume RSS only as a released registry artifact or an immutable, exact-version candidate bound
+  to the RSS producer's package proof and public candidate manifest.
 - Do not add RSS path, Git, workspace, submodule, vendored, internal, generated, provider-catalog,
   runtime-plan, test-fixture, or governance dependencies.
 - Do not copy RSS domains, adapters, assembly, provider/SPI surfaces, selectors, fixtures, `xtask`
@@ -27,11 +27,14 @@ internal or T3 surfaces.
 
 ## Verification
 
-Run the workspace commands below before requesting review:
+Run repository-owned checks before requesting review:
 
 ```sh
 cargo fmt --all -- --check
-cargo check --workspace --all-targets --locked
-cargo test --workspace --all-targets --locked
-cargo clippy --workspace --all-targets --locked -- -D warnings
+python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+bash scripts/test-candidate-graph-policy.sh
 ```
+
+The canonical candidate-consumption job is the only full matrix. It binds the immutable producer
+artifact, materializes the temporary registry transport, and then runs locked/offline check, test,
+doc, clippy, coverage, release builds, and the external T2 journey over the complete workspace.

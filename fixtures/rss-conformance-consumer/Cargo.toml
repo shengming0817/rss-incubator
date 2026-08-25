@@ -1,11 +1,12 @@
 [package]
 name = "rss-conformance-candidate-fixture"
 version = "0.0.0"
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
 publish = false
 
 [dependencies]
-rss-conformance = { version = "=__RSS_CONFORMANCE_VERSION__", registry = "rss-candidate" }
+rss-conformance = { version = "=0.1.0", registry = "rss-candidate" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }
