@@ -211,6 +211,7 @@ docker exec "$redis" wget -qO- http://oidc:8000/jwks.json > "$work/server-jwks.j
   fail "cross-container JWKS fetch failed"
 jq -e '.keys | length == 1' "$work/server-jwks.json" >/dev/null ||
   fail "cross-container JWKS payload was invalid"
+printf '%s\n' 'Core first-green stage: dependencies-ready'
 
 cat > "$work/serving-secrets.json" <<'JSON'
 {"auditChainKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","pgPassword":"rss_app_pw","pgReadPassword":"rss_app_read_pw","redisUrl":"rediss://redis:6379"}
@@ -251,6 +252,7 @@ for _ in $(seq 1 45); do
   sleep 1
 done
 curl -fsS http://127.0.0.1:18083/health/v1/readyz >/dev/null
+printf '%s\n' 'Core first-green stage: server-ready'
 
 token="$(cat "$work/issuer-private/token")"
 inventory="$work/inventory.json"
@@ -268,6 +270,7 @@ jq -e --slurpfile bundle "$manifest" '
   ([.data.listeners[].id] | sort) == $bundle[0].profiles[0].closure.listeners and
   ([.data.providerPosture[].id] | sort) == $bundle[0].profiles[0].closure.providers
 ' "$inventory" >/dev/null
+printf '%s\n' 'Core first-green stage: exact-inventory'
 
 status="$(curl -sS -o "$work/denied.json" -w '%{http_code}' \
   -H "Authorization: Bearer $token" \
@@ -281,6 +284,7 @@ status="$(curl -sS -o /dev/null -w '%{http_code}' \
 audit_count="$(docker exec "$pg" psql -Atq -U postgres -d rss -c \
   "SELECT count(*) FROM auth_audit_events WHERE principal_id='$USER_ID' AND principal_kind='user' AND principal_tenant='$TENANT'::uuid AND resource_kind='audit_entries' AND resource_id='$TARGET_TENANT' AND action='audit:list-cross-tenant' AND outcome='failure' AND failure_reason='forbidden'")"
 [[ "$audit_count" == 1 ]] || fail "Audit LocalTx did not commit exactly one denial event"
+printf '%s\n' 'Core first-green stage: auth-and-audit'
 docker exec -i "$pg" psql -v ON_ERROR_STOP=1 -Atq -U postgres -d rss <<SQL | paste -sd, | grep -qx '1,0'
 BEGIN;
 SET LOCAL ROLE rss_app;
@@ -293,9 +297,11 @@ SET LOCAL rss.tenant_id = '$TENANT';
 SELECT count(*) FROM account_security_states WHERE tenant_id='$TARGET_TENANT'::uuid;
 ROLLBACK;
 SQL
+printf '%s\n' 'Core first-green stage: rls-isolation'
 
 docker stop "$server" >/dev/null
 docker rm "$server" >/dev/null
+printf '%s\n' 'Core first-green stage: eventing-negative'
 if timeout 20s docker run --name "$extra" \
   "${server_args[@]:2}" -e RSS_AMQP_CA_CERT_PEM_PATH=/run/rss/forbidden-amqp.pem \
   "$RSS_CORE_IMAGE_ID"; then
