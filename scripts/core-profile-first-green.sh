@@ -193,17 +193,24 @@ for _ in $(seq 1 20); do
   docker exec "$redis" redis-cli --tls --cacert /rss-tls/ca.pem PING 2>/dev/null | grep -qx PONG && break
   sleep 1
 done
-docker exec "$redis" redis-cli --tls --cacert /rss-tls/ca.pem PING | grep -qx PONG
+docker exec "$redis" redis-cli --tls --cacert /rss-tls/ca.pem PING | grep -qx PONG ||
+  fail "Redis TLS readiness proof failed"
 for _ in $(seq 1 20); do
   docker exec "$issuer" wget -qO- http://127.0.0.1:8000/jwks.json >/dev/null 2>&1 && break
   sleep 1
 done
-docker exec "$issuer" wget -qO- http://127.0.0.1:8000/jwks.json | jq -e '.keys | length == 1' >/dev/null
+docker exec "$issuer" wget -qO- http://127.0.0.1:8000/jwks.json |
+  jq -e '.keys | length == 1' >/dev/null || fail "OIDC public JWKS proof failed"
 for secret_path in key.pem token facts; do
-  [[ "$(docker exec "$issuer" wget -S -O /dev/null "http://127.0.0.1:8000/$secret_path" 2>&1 | awk '/HTTP\// {code=$2} END {print code}')" == 404 ]]
+  private_status="$(docker exec "$issuer" wget -S -O /dev/null \
+    "http://127.0.0.1:8000/$secret_path" 2>&1 |
+    awk '/HTTP\// {code=$2} END {print code}')"
+  [[ "$private_status" == 404 ]] || fail "OIDC private material was externally reachable"
 done
-docker exec "$redis" wget -qO- http://oidc:8000/jwks.json > "$work/server-jwks.json"
-jq -e '.keys | length == 1' "$work/server-jwks.json" >/dev/null
+docker exec "$redis" wget -qO- http://oidc:8000/jwks.json > "$work/server-jwks.json" ||
+  fail "cross-container JWKS fetch failed"
+jq -e '.keys | length == 1' "$work/server-jwks.json" >/dev/null ||
+  fail "cross-container JWKS payload was invalid"
 
 cat > "$work/serving-secrets.json" <<'JSON'
 {"auditChainKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","pgPassword":"rss_app_pw","pgReadPassword":"rss_app_read_pw","redisUrl":"rediss://redis:6379"}
