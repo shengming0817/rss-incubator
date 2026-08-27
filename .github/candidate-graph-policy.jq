@@ -4,6 +4,23 @@ def coordinates:
 def canonical_name:
   gsub("_"; "-");
 
+def dependency_closure($nodes; $root_id):
+  {visited: [], frontier: [$root_id]}
+  | until(
+      (.frontier | length) == 0;
+      .visited as $visited
+      | .frontier as $frontier
+      | (($visited + $frontier) | unique) as $next_visited
+      | ([
+          $nodes[]
+          | select(.id as $id | $frontier | index($id) != null)
+          | .deps[]?.pkg
+          | select(. as $id | $next_visited | index($id) == null)
+        ] | unique) as $next_frontier
+      | {visited: $next_visited, frontier: $next_frontier}
+    )
+  | .visited;
+
 def forbidden_rotation_name:
   (.name | canonical_name) as $name |
   ($name | startswith("rss-")) or
@@ -48,9 +65,11 @@ def forbidden_rotation_package:
   select(.name == "rotation-model") |
   select(.id as $id | $workspace | index($id) != null)]) as $rotation_models |
 ($rotation_models[0].dependencies // []) as $rotation_declarations |
-([.resolve.nodes[]? |
+(.resolve.nodes // []) as $resolve_nodes |
+([$resolve_nodes[] |
   select(.id == $rotation_models[0].id)]) as $rotation_nodes |
-([$rotation_nodes[0].deps[]?.pkg]) as $rotation_dependency_ids |
+(dependency_closure($resolve_nodes; $rotation_models[0].id) -
+  [$rotation_models[0].id]) as $rotation_dependency_ids |
 (.packages as $packages |
   [$rotation_dependency_ids[] as $dependency_id |
     $packages[] | select(.id == $dependency_id)]) as $rotation_dependencies |
@@ -66,6 +85,10 @@ elif ($rotation_declarations | any(forbidden_rotation_declaration)) then
   error("rotation-model declares RSS, transport, provider, path, or Git coupling")
 elif ($rotation_nodes | length) != 1 then
   error("resolved graph must contain exactly one rotation-model node")
+elif any($rotation_dependency_ids[];
+  . as $dependency_id |
+  ([$resolve_nodes[] | select(.id == $dependency_id)] | length) != 1) then
+  error("rotation-model dependency node lookup is incomplete")
 elif ($rotation_dependencies | length) != ($rotation_dependency_ids | length) then
   error("rotation-model dependency package lookup is incomplete")
 elif ($rotation_dependencies | any(forbidden_rotation_package)) then
