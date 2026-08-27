@@ -4,6 +4,11 @@ This directory owns one disposable External/T2 fixture containing digest-pinned 
 Mosquitto, and PostgreSQL providers. It is not a production deployment, freshness or authorization
 authority, T3 evidence, or an RSS service/image fixture.
 
+The Python lifecycle entrypoint is intentionally retained as standard-library-only development
+orchestration. Docker Compose owns topology, health-driven startup, and scoped teardown; provider
+native interfaces own configuration and verification. The script adds only the RSS-specific PKI,
+identity, authorization, drift-repair, and negative-proof flow and is not shipped with any product.
+
 ## Lifecycle
 
 Run all commands from the repository root. The project name is the deletion namespace and accepts

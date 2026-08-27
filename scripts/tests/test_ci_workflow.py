@@ -26,6 +26,10 @@ class CandidateWorkflowSecurityTests(unittest.TestCase):
         self.assertIn("candidate-manifest-policy.jq", self.workflow)
         self.assertIn("scripts/prepare-candidate-transport.sh", self.workflow)
         self.assertIn(
+            "cargo metadata --format-version 1 --all-features --locked --offline",
+            self.workflow,
+        )
+        self.assertIn(
             "scripts/prepare-candidate-transport.sh",
             (ROOT / "README.md").read_text(encoding="utf-8"),
         )

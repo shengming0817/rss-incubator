@@ -232,7 +232,7 @@ jobs:
           set -euo pipefail
           metadata="$RUNNER_TEMP/rss-candidate-metadata.json"
           consumed="$RUNNER_TEMP/rss-consumed-packages.json"
-          cargo metadata --format-version 1 --locked --offline > "$metadata"
+          cargo metadata --format-version 1 --all-features --locked --offline > "$metadata"
           jq -ce --slurpfile bundle "$BUNDLE_MANIFEST" \
             -f .github/candidate-graph-policy.jq \
             "$metadata" > "$consumed"

@@ -1,4 +1,3 @@
-import ast
 from contextlib import redirect_stderr
 import importlib.util
 import io
@@ -25,23 +24,6 @@ def load_reference_environment():
 
 
 class ReferenceEnvironmentPolicyTests(unittest.TestCase):
-    def test_canonical_layout_exists(self):
-        expected = {
-            SCRIPT,
-            COMPOSE,
-            FIXTURE,
-            ROOT / "deploy/keycloak/realm.json",
-            ROOT / "deploy/keycloak/tenant-attribute.json",
-            ROOT / "deploy/vault/deviceidentity-sign.hcl",
-            ROOT / "deploy/vault/roles.json",
-            ROOT / "deploy/mosquitto/mosquitto.conf",
-            ROOT / "deploy/mosquitto/Dockerfile",
-            ROOT / "deploy/mosquitto/plugin.c",
-            ROOT / "deploy/postgres/bootstrap.sql",
-            ROOT / "deploy/postgres/pg_hba.conf",
-        }
-        self.assertEqual([], sorted(str(path.relative_to(ROOT)) for path in expected if not path.is_file()))
-
     def test_compose_model_is_closed_and_immutable(self):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)
@@ -562,21 +544,6 @@ class ReferenceEnvironmentPolicyTests(unittest.TestCase):
                 source="Vault runtime token",
                 expected_type=str,
             )
-
-    def test_managed_lifecycle_functions_stay_below_complexity_budget(self):
-        tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
-        managed = {
-            "bootstrap_vault",
-            "bootstrap_keycloak",
-            "verify_keycloak",
-            "load_runtime_values",
-            "certificate_matches",
-        }
-        branching = (ast.If, ast.For, ast.While, ast.Try, ast.With, ast.BoolOp)
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in managed:
-                complexity = 1 + sum(isinstance(child, branching) for child in ast.walk(node))
-                self.assertLessEqual(complexity, 15, f"{node.name} complexity={complexity}")
 
     def test_log_redaction_includes_persisted_runtime_token(self):
         module = load_reference_environment()

@@ -65,6 +65,12 @@ loopback only. The canonical candidate job invokes it after configuring the pinn
 a direct local invocation requires that same transport environment. Download the exact committed
 candidate bundle, materialize its local Cargo source, then run the journey:
 
+`scripts/reference-environment.py` is the repository's intentional Python capability owner. It is a
+standard-library-only development orchestrator around Docker Compose, OpenSSL, and provider-native
+interfaces; it is not product/runtime code or a candidate-package proof owner. Candidate identity,
+source, and resolved-graph correctness remain owned by the producer manifest, Cargo, and the jq
+policies below rather than by a second Python or Rust validator.
+
 ```sh
 transport_root="$(mktemp -d)/transport"
 bundle_root="${transport_root%/transport}/bundle"

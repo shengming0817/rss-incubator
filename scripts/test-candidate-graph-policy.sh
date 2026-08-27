@@ -16,12 +16,34 @@ jq -n '{packages: [
 
 write_metadata() {
   jq -n --arg source "$candidate_source" '{
-    workspace_members: ["path+file:///workspace#rss-device-security-client@0.1.0"],
+    workspace_members: [
+      "path+file:///workspace#rotation-model@0.0.0",
+      "path+file:///workspace#rss-device-security-client@0.1.0"
+    ],
     packages: [
       {id: "registry+contract", name: "rss-contract", version: "0.1.0", source: $source},
       {id: "registry+platform", name: "rss-platform", version: "0.1.0", source: $source},
-      {id: "path+file:///workspace#rss-device-security-client@0.1.0", name: "rss-device-security-client", version: "0.1.0", source: null}
-    ]
+      {
+        id: "path+file:///workspace#rotation-model@0.0.0",
+        name: "rotation-model",
+        version: "0.0.0",
+        source: null,
+        publish: [],
+        dependencies: [{name: "uuid", source: "registry+https://github.com/rust-lang/crates.io-index", path: null}]
+      },
+      {id: "path+file:///workspace#rss-device-security-client@0.1.0", name: "rss-device-security-client", version: "0.1.0", source: null},
+      {id: "registry+uuid", name: "uuid", version: "1.0.0", source: "registry+https://github.com/rust-lang/crates.io-index"}
+    ],
+    resolve: {
+      nodes: [
+        {
+          id: "path+file:///workspace#rotation-model@0.0.0",
+          deps: [{name: "uuid", pkg: "registry+uuid"}]
+        },
+        {id: "path+file:///workspace#rss-device-security-client@0.1.0", deps: []},
+        {id: "registry+uuid", deps: []}
+      ]
+    }
   }' > "$metadata"
 }
 
@@ -30,6 +52,47 @@ assert_rejected() {
     echo "candidate graph policy accepted invalid case: $1" >&2
     exit 1
   fi
+}
+
+write_transitive_metadata() {
+  write_metadata
+  jq '(.packages[] | select(.name == "rotation-model")).dependencies += [{
+    name: "helper",
+    source: "registry+https://github.com/rust-lang/crates.io-index",
+    path: null
+  }] |
+  .packages += [{
+    id: "registry+helper",
+    name: "helper",
+    version: "1.0.0",
+    source: "registry+https://github.com/rust-lang/crates.io-index"
+  }] |
+  (.resolve.nodes[] | select(.id | contains("#rotation-model@"))).deps += [{
+    name: "helper", pkg: "registry+helper"
+  }] |
+  .resolve.nodes += [{id: "registry+helper", deps: []}]' \
+    "$metadata" > "$metadata.tmp"
+  mv "$metadata.tmp" "$metadata"
+}
+
+add_transitive_package() {
+  local package_id="$1"
+  local package_name="$2"
+  local package_source="$3"
+
+  jq --arg id "$package_id" --arg name "$package_name" --arg source "$package_source" '
+    .packages += [{
+      id: $id,
+      name: $name,
+      version: "1.0.0",
+      source: (if $source == "" then null else $source end)
+    }] |
+    (.resolve.nodes[] | select(.id == "registry+helper")).deps += [{
+      name: $name, pkg: $id
+    }] |
+    .resolve.nodes += [{id: $id, deps: []}]' \
+    "$metadata" > "$metadata.tmp"
+  mv "$metadata.tmp" "$metadata"
 }
 
 write_metadata
@@ -82,3 +145,156 @@ jq '(.packages[] | select(.name == "rss-platform")).source =
   "registry+https://index.crates.io/"' "$metadata" > "$metadata.tmp"
 mv "$metadata.tmp" "$metadata"
 assert_rejected 'wrong registry source'
+
+write_metadata
+jq 'del(.packages[] | select(.name == "rotation-model"))' "$metadata" > "$metadata.tmp"
+mv "$metadata.tmp" "$metadata"
+assert_rejected 'missing rotation-model workspace package'
+
+write_metadata
+jq '(.packages[] | select(.name == "rotation-model")).publish = null' \
+  "$metadata" > "$metadata.tmp"
+mv "$metadata.tmp" "$metadata"
+assert_rejected 'publishable rotation-model package'
+
+write_metadata
+jq '(.resolve.nodes[] | select(.id | contains("#rotation-model@"))).deps += [{
+  name: "rss_contract", pkg: "registry+contract"
+}]' "$metadata" > "$metadata.tmp"
+mv "$metadata.tmp" "$metadata"
+assert_rejected 'rotation-model RSS coupling'
+
+write_metadata
+jq '.packages += [{
+  id: "registry+reqwest",
+  name: "reqwest",
+  version: "0.12.0",
+  source: "registry+https://github.com/rust-lang/crates.io-index"
+}] |
+(.resolve.nodes[] | select(.id | contains("#rotation-model@"))).deps += [{
+  name: "reqwest", pkg: "registry+reqwest"
+}]' "$metadata" > "$metadata.tmp"
+mv "$metadata.tmp" "$metadata"
+assert_rejected 'rotation-model transport coupling'
+
+write_transitive_metadata
+add_transitive_package \
+  'registry+time' \
+  'time' \
+  'registry+https://github.com/rust-lang/crates.io-index'
+jq -e --slurpfile bundle "$manifest" -f "$policy" "$metadata" >/dev/null
+
+write_transitive_metadata
+jq '(.resolve.nodes[] | select(.id == "registry+helper")).deps += [{
+  name: "rotation_model", pkg: "path+file:///workspace#rotation-model@0.0.0"
+}]' "$metadata" > "$metadata.tmp"
+mv "$metadata.tmp" "$metadata"
+jq -e --slurpfile bundle "$manifest" -f "$policy" "$metadata" >/dev/null
+
+write_transitive_metadata
+jq 'del(.resolve.nodes[] | select(.id == "registry+helper"))' \
+  "$metadata" > "$metadata.tmp"
+mv "$metadata.tmp" "$metadata"
+assert_rejected 'incomplete transitive resolve node lookup'
+
+write_transitive_metadata
+add_transitive_package \
+  'registry+reqwest' \
+  'reqwest' \
+  'registry+https://github.com/rust-lang/crates.io-index'
+assert_rejected 'rotation-model transitive transport coupling'
+
+write_transitive_metadata
+add_transitive_package \
+  'registry+vault' \
+  'vault' \
+  'registry+https://github.com/rust-lang/crates.io-index'
+assert_rejected 'rotation-model transitive provider coupling'
+
+write_transitive_metadata
+jq '(.resolve.nodes[] | select(.id == "registry+helper")).deps += [{
+  name: "rss_contract", pkg: "registry+contract"
+}] |
+.resolve.nodes += [{id: "registry+contract", deps: []}]' \
+  "$metadata" > "$metadata.tmp"
+mv "$metadata.tmp" "$metadata"
+assert_rejected 'rotation-model transitive RSS coupling'
+
+write_transitive_metadata
+add_transitive_package \
+  'path+file:///workspace/transitive#1.0.0' \
+  'transitive' \
+  ''
+assert_rejected 'rotation-model transitive path coupling'
+
+write_transitive_metadata
+add_transitive_package \
+  'git+https://example.invalid/transitive#deadbeef' \
+  'transitive' \
+  'git+https://example.invalid/transitive#deadbeef'
+assert_rejected 'rotation-model transitive Git coupling'
+
+write_metadata
+jq '.packages += [{
+  id: "registry+vault",
+  name: "vault",
+  version: "1.0.0",
+  source: "registry+https://github.com/rust-lang/crates.io-index"
+}] |
+(.resolve.nodes[] | select(.id | contains("#rotation-model@"))).deps += [{
+  name: "vault", pkg: "registry+vault"
+}]' "$metadata" > "$metadata.tmp"
+mv "$metadata.tmp" "$metadata"
+assert_rejected 'rotation-model provider coupling'
+
+write_metadata
+jq '(.packages[] | select(.name == "rotation-model")).dependencies += [{
+  name: "reqwest",
+  source: "registry+https://github.com/rust-lang/crates.io-index",
+  path: null,
+  optional: true
+}]' "$metadata" > "$metadata.tmp"
+mv "$metadata.tmp" "$metadata"
+assert_rejected 'rotation-model disabled optional transport coupling'
+
+write_metadata
+jq '(.packages[] | select(.name == "rotation-model")).dependencies += [{
+  name: "helper",
+  source: "registry+https://github.com/rust-lang/crates.io-index",
+  path: null
+}] |
+.packages += [{
+  id: "path+file:///workspace/helper#0.1.0",
+  name: "helper",
+  version: "0.1.0",
+  source: null
+}] |
+(.resolve.nodes[] | select(.id | contains("#rotation-model@"))).deps += [{
+  name: "helper", pkg: "path+file:///workspace/helper#0.1.0"
+}]' "$metadata" > "$metadata.tmp"
+mv "$metadata.tmp" "$metadata"
+assert_rejected 'rotation-model registry declaration patched to path'
+
+write_metadata
+jq '(.packages[] | select(.name == "rotation-model")).dependencies += [{
+  name: "helper",
+  source: "registry+https://github.com/rust-lang/crates.io-index",
+  path: null
+}] |
+.packages += [{
+  id: "git+https://example.invalid/helper#deadbeef",
+  name: "helper",
+  version: "0.1.0",
+  source: "git+https://example.invalid/helper#deadbeef"
+}] |
+(.resolve.nodes[] | select(.id | contains("#rotation-model@"))).deps += [{
+  name: "helper", pkg: "git+https://example.invalid/helper#deadbeef"
+}]' "$metadata" > "$metadata.tmp"
+mv "$metadata.tmp" "$metadata"
+assert_rejected 'rotation-model registry declaration patched to Git'
+
+write_metadata
+jq 'del(.resolve.nodes[] | select(.id | contains("#rotation-model@")))' \
+  "$metadata" > "$metadata.tmp"
+mv "$metadata.tmp" "$metadata"
+assert_rejected 'missing rotation-model resolve node'
